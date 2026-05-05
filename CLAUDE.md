@@ -900,6 +900,20 @@ Before tagging a new host release:
 7. **Commit, tag, push**: `git tag v0.X.0 && git push --tags`
 8. **Release notes**: Add notes to the GitHub release via `gh release edit`
 
+## graphify
+
+This project has a graphify knowledge graph at `graphify-out/` (AST extraction of `src/` — 2694 nodes, 7805 edges).
+
+Rules:
+- **Before any grep or file search — mandatory gate**: classify the question first. If it is a navigation question (where is X defined?), a relationship question (what calls Y?), or a call-chain question (what does changing W cascade into?) — use graphify BEFORE grep. No exceptions.
+- **Grep is only permitted** when: (a) graphify has already been consulted and could not answer, or (b) you already know the exact file and line and are confirming a specific string.
+- **Code navigation**: `graphify query "<question>"` (BFS, broad context) · `graphify path "<A>" "<B>"` (shortest path) · `graphify explain "<concept>"` (definition + connections).
+- **Impact analysis**: `graphify query "<question>" --dfs` for dependency chains.
+- **After code changes**: graph auto-updates via git post-commit hook (AST only — free, no LLM).
+- **Docs** are NOT in the graph — see the Documentation section and `docs/plans/` for design rationale.
+
+Graph lives at: `~/schwung/graphify-out/graph.json`
+
 ## Dependencies
 
 - QuickJS: libs/quickjs/

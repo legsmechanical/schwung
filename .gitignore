@@ -17,6 +17,11 @@ docs/.DS_Store
 build/cache/
 /.cache/
 
+# Graphify outputs (keep key files, ignore cache and html)
+graphify-out/cache/
+graphify-out/graph.html
+graphify-out/.graphify_python
+
 # Binary files that shouldn't be committed
 *.wav
 *.asd
