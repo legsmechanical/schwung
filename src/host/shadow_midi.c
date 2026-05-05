@@ -4,11 +4,78 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include "shadow_midi.h"
 #include "shadow_chain_mgmt.h"
 #include "shadow_led_queue.h"
 
 static void shadow_chain_transpose_reset(void);
+
+/* ============================================================================
+ * Pad latency instrumentation
+ *
+ * Measures round-trip time from shadow_forward_midi (pad note-on written to
+ * JS SHM) to shadow_drain_ui_midi_dsp (JS response arrives in midi_dsp_shm).
+ *
+ * Trigger dump: touch /data/UserData/schwung/pad_latency_dump
+ * Results:      /data/UserData/schwung/pad_latency_stats.txt
+ * ============================================================================ */
+
+#define PAD_LAT_RING 256
+
+static uint64_t pad_lat_t0_ns;   /* 0 = no pending measurement */
+static uint32_t pad_lat_ring[PAD_LAT_RING];  /* delta in microseconds */
+static int      pad_lat_head;
+static int      pad_lat_count;
+
+static uint64_t pad_lat_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void pad_lat_dump(void)
+{
+    if (pad_lat_count == 0) return;
+    FILE *f = fopen("/data/UserData/schwung/pad_latency_stats.txt", "w");
+    if (!f) return;
+
+    /* Histogram buckets in ms: <1, 1-2, 2-3, 3-4, 4-6, >6 */
+    int buckets[6] = {0};
+    uint32_t sum = 0, min_us = UINT32_MAX, max_us = 0;
+    int n = pad_lat_count < PAD_LAT_RING ? pad_lat_count : PAD_LAT_RING;
+    int start = pad_lat_count >= PAD_LAT_RING ? pad_lat_head : 0;
+
+    for (int i = 0; i < n; i++) {
+        uint32_t us = pad_lat_ring[(start + i) % PAD_LAT_RING];
+        sum += us;
+        if (us < min_us) min_us = us;
+        if (us > max_us) max_us = us;
+        int ms = (int)(us / 1000);
+        if      (ms < 1) buckets[0]++;
+        else if (ms < 2) buckets[1]++;
+        else if (ms < 3) buckets[2]++;
+        else if (ms < 4) buckets[3]++;
+        else if (ms < 6) buckets[4]++;
+        else             buckets[5]++;
+    }
+
+    fprintf(f, "pad_latency_stats: %d samples\n", n);
+    fprintf(f, "min=%uus  max=%uus  avg=%uus\n", min_us, max_us, n ? sum/n : 0);
+    fprintf(f, "<1ms:  %d (%.0f%%)\n", buckets[0], 100.0*buckets[0]/n);
+    fprintf(f, "1-2ms: %d (%.0f%%)\n", buckets[1], 100.0*buckets[1]/n);
+    fprintf(f, "2-3ms: %d (%.0f%%)\n", buckets[2], 100.0*buckets[2]/n);
+    fprintf(f, "3-4ms: %d (%.0f%%)\n", buckets[3], 100.0*buckets[3]/n);
+    fprintf(f, "4-6ms: %d (%.0f%%)\n", buckets[4], 100.0*buckets[4]/n);
+    fprintf(f, ">6ms:  %d (%.0f%%)\n", buckets[5], 100.0*buckets[5]/n);
+    fprintf(f, "\nframe estimate (3ms/frame):\n");
+    fprintf(f, "same frame (post-ioctl):  %d (%.0f%%)\n",
+            buckets[0]+buckets[1]+buckets[2], 100.0*(buckets[0]+buckets[1]+buckets[2])/n);
+    fprintf(f, "next frame:               %d (%.0f%%)\n",
+            buckets[3]+buckets[4]+buckets[5], 100.0*(buckets[3]+buckets[4]+buckets[5])/n);
+    fclose(f);
+}
 
 /* ============================================================================
  * Host callbacks (set by midi_routing_init)
@@ -587,6 +654,15 @@ void shadow_drain_ui_midi_dsp(void)
     if (!midi_dsp_shm) return;
     if (midi_dsp_shm->ready == last_ready) return;
 
+    /* T1: JS wrote a response — record latency if a pad press is pending */
+    if (pad_lat_t0_ns) {
+        uint32_t delta_us = (uint32_t)((pad_lat_now_ns() - pad_lat_t0_ns) / 1000);
+        pad_lat_ring[pad_lat_head % PAD_LAT_RING] = delta_us;
+        pad_lat_head++;
+        if (pad_lat_count < PAD_LAT_RING) pad_lat_count++;
+        pad_lat_t0_ns = 0;
+    }
+
     last_ready = midi_dsp_shm->ready;
 
     /* Snapshot buffer before resetting to avoid race with JS writer.
@@ -868,6 +944,23 @@ void shadow_forward_midi(void)
             }
         }
         has_midi = 1;
+
+        /* T0: record timestamp when a cable-0 pad note-on reaches JS SHM */
+        if (cable == 0x00) {
+            uint8_t type = src[i + 1] & 0xF0;
+            uint8_t note = src[i + 2];
+            uint8_t vel  = src[i + 3];
+            if (type == 0x90 && vel > 0 && note >= 68 && note <= 99)
+                pad_lat_t0_ns = pad_lat_now_ns();
+        }
+    }
+
+    /* Check for dump request at same cadence as other flag-file checks */
+    if (!cache_initialized || (cache_counter % 200 == 1)) {
+        if (access("/data/UserData/schwung/pad_latency_dump", F_OK) == 0) {
+            pad_lat_dump();
+            unlink("/data/UserData/schwung/pad_latency_dump");
+        }
     }
 
     if (has_midi) {
