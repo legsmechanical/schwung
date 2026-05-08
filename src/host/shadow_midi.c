@@ -512,7 +512,9 @@ void shadow_drain_midi_inject(void)
     const int DEFER_FRAMES = 2;
     static int defer_counter = 0;
     uint8_t *midi_in_scan = host_shadow_mailbox + MIDI_IN_OFFSET;
-    int hw_cable_active = (midi_in_scan[0] != 0) ? 1 : 0;
+    int hw_cable_active = 0;
+    for (int j = 0; j < MIDI_IN_MAX_BYTES; j += MIDI_IN_EVT_STRIDE)
+        if (midi_in_scan[j] != 0) { hw_cable_active = 1; break; }
     if (hw_cable_active) {
         defer_counter = 0;
         return;
