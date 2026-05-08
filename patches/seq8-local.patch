@@ -1,0 +1,338 @@
+diff --git a/src/host/shadow_constants.h b/src/host/shadow_constants.h
+index db44f1df..38f0107f 100644
+--- a/src/host/shadow_constants.h
++++ b/src/host/shadow_constants.h
+@@ -246,6 +246,7 @@ typedef struct schwung_ext_midi_remap_t {
+ } schwung_ext_midi_remap_t;          /* 64 bytes total */
+ 
+ #define EXT_MIDI_REMAP_PASSTHROUGH 0xFF
++#define EXT_MIDI_REMAP_BLOCK       0xFE  /* block note-ons from Move; shadow_ui still sees original */
+ #define EXT_MIDI_REMAP_VERSION     1
+ 
+ /*
+diff --git a/src/host/shadow_midi.c b/src/host/shadow_midi.c
+index e5963000..484d6a53 100644
+--- a/src/host/shadow_midi.c
++++ b/src/host/shadow_midi.c
+@@ -4,12 +4,79 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <time.h>
+ #include "shadow_midi.h"
+ #include "shadow_chain_mgmt.h"
+ #include "shadow_led_queue.h"
+ 
+ static void shadow_chain_transpose_reset(void);
+ 
++/* ============================================================================
++ * Pad latency instrumentation
++ *
++ * Measures round-trip time from shadow_forward_midi (pad note-on written to
++ * JS SHM) to shadow_drain_ui_midi_dsp (JS response arrives in midi_dsp_shm).
++ *
++ * Trigger dump: touch /data/UserData/schwung/pad_latency_dump
++ * Results:      /data/UserData/schwung/pad_latency_stats.txt
++ * ============================================================================ */
++
++#define PAD_LAT_RING 256
++
++static uint64_t pad_lat_t0_ns;   /* 0 = no pending measurement */
++static uint32_t pad_lat_ring[PAD_LAT_RING];  /* delta in microseconds */
++static int      pad_lat_head;
++static int      pad_lat_count;
++
++static uint64_t pad_lat_now_ns(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
++
++static void pad_lat_dump(void)
++{
++    if (pad_lat_count == 0) return;
++    FILE *f = fopen("/data/UserData/schwung/pad_latency_stats.txt", "w");
++    if (!f) return;
++
++    /* Histogram buckets in ms: <1, 1-2, 2-3, 3-4, 4-6, >6 */
++    int buckets[6] = {0};
++    uint32_t sum = 0, min_us = UINT32_MAX, max_us = 0;
++    int n = pad_lat_count < PAD_LAT_RING ? pad_lat_count : PAD_LAT_RING;
++    int start = pad_lat_count >= PAD_LAT_RING ? pad_lat_head : 0;
++
++    for (int i = 0; i < n; i++) {
++        uint32_t us = pad_lat_ring[(start + i) % PAD_LAT_RING];
++        sum += us;
++        if (us < min_us) min_us = us;
++        if (us > max_us) max_us = us;
++        int ms = (int)(us / 1000);
++        if      (ms < 1) buckets[0]++;
++        else if (ms < 2) buckets[1]++;
++        else if (ms < 3) buckets[2]++;
++        else if (ms < 4) buckets[3]++;
++        else if (ms < 6) buckets[4]++;
++        else             buckets[5]++;
++    }
++
++    fprintf(f, "pad_latency_stats: %d samples\n", n);
++    fprintf(f, "min=%uus  max=%uus  avg=%uus\n", min_us, max_us, n ? sum/n : 0);
++    fprintf(f, "<1ms:  %d (%.0f%%)\n", buckets[0], 100.0*buckets[0]/n);
++    fprintf(f, "1-2ms: %d (%.0f%%)\n", buckets[1], 100.0*buckets[1]/n);
++    fprintf(f, "2-3ms: %d (%.0f%%)\n", buckets[2], 100.0*buckets[2]/n);
++    fprintf(f, "3-4ms: %d (%.0f%%)\n", buckets[3], 100.0*buckets[3]/n);
++    fprintf(f, "4-6ms: %d (%.0f%%)\n", buckets[4], 100.0*buckets[4]/n);
++    fprintf(f, ">6ms:  %d (%.0f%%)\n", buckets[5], 100.0*buckets[5]/n);
++    fprintf(f, "\nframe estimate (3ms/frame):\n");
++    fprintf(f, "same frame (post-ioctl):  %d (%.0f%%)\n",
++            buckets[0]+buckets[1]+buckets[2], 100.0*(buckets[0]+buckets[1]+buckets[2])/n);
++    fprintf(f, "next frame:               %d (%.0f%%)\n",
++            buckets[3]+buckets[4]+buckets[5], 100.0*(buckets[3]+buckets[4]+buckets[5])/n);
++    fclose(f);
++}
++
+ /* ============================================================================
+  * Host callbacks (set by midi_routing_init)
+  * ============================================================================ */
+@@ -409,31 +476,44 @@ void shadow_drain_midi_inject(void)
+ 
+     if (!inject_shm) return;
+ 
+-    /* Defer cable-2 injection when there's cable-0 hardware activity in the
+-     * SAME tick. Injecting concurrently with a live pad event appears to
+-     * race Move's firmware (observed: SIGABRT deep in Move's stack after
+-     * ~1s of arp tick-path injections). The note-path injections (chord)
+-     * escape this because they fire only AFTER Move has echoed the pad on
+-     * cable-2 MIDI_OUT — at which point cable-0 MIDI_IN has been consumed.
+-     * Tick-path injections (arp, generator-style FX) run every SPI cycle
+-     * independently, so they need an explicit gate.
++    /* Hold inject drain for a few frames after overtake mode exits to prevent
++     * DSP-generated note packets from racing Move's MIDI_IN read during the
++     * transition from shadow to native mode.  The overtake exit injects 4
++     * cleanup packets (shift/back/jog/vol releases) that drain cleanly, but
++     * the DSP audio callback queues additional note events (e.g. drum hits on
++     * ROUTE_MOVE) in the same window — those arrive 1-2 frames later and land
++     * while Move's firmware is mid-transition, causing SIGABRT deep in Move's
++     * stack.  Three frames (~9 ms) gives the firmware time to settle; packets
++     * are not lost — they accumulate in inject_shm and drain after the hold. */
++    {
++        static int prev_overtake_hold = 0;
++        static int exit_hold = 0;
++        shadow_control_t *sc = host_shadow_control ? *host_shadow_control : NULL;
++        int cur_overtake = sc ? (int)sc->overtake_mode : 0;
++        if (prev_overtake_hold != 0 && cur_overtake == 0)
++            exit_hold = 2;
++        prev_overtake_hold = cur_overtake;
++        if (exit_hold > 0) {
++            exit_hold--;
++            return;
++        }
++    }
++
++    /* Defer inject when MIDI_IN has ANY hardware events this tick.
++     * All cables share Move's firmware MIDI read path — injecting concurrently
++     * with hardware events on ANY cable races Move's internal processing and
++     * causes SIGABRT. Originally the guard only checked cable-0 and cable-2,
++     * but empirically: the SIGABRT occurs with inject at offset 24 (3 existing
++     * events at offsets 0/8/16 on cables other than 0 or 2) — confirming the
++     * guard must be cable-agnostic.
+      *
+-     * Rule: if MIDI_IN has any cable-0 events this tick, reset the defer
+-     * counter and hold the SHM contents. Otherwise, drain only once the
+-     * counter has climbed to 2 (≈6ms at 2.9ms/tick). Pattern is from
+-     * chord-mode-native (shadow_chord.c CHORD_DEFER_FRAMES). */
++     * Rule: if MIDI_IN has any non-zero event at all, reset the defer counter.
++     * Otherwise, drain once the counter has climbed to 2 (≈6ms). */
+     const int DEFER_FRAMES = 2;
+     static int defer_counter = 0;
+     uint8_t *midi_in_scan = host_shadow_mailbox + MIDI_IN_OFFSET;
+-    int cable0_active = 0;
+-    for (int j = 0; j < MIDI_IN_MAX_BYTES; j += MIDI_IN_EVT_STRIDE) {
+-        if (midi_in_scan[j] == 0) break;      /* end-of-events */
+-        if ((midi_in_scan[j] >> 4) == 0) {    /* cable 0 */
+-            cable0_active = 1;
+-            break;
+-        }
+-    }
+-    if (cable0_active) {
++    int hw_cable_active = (midi_in_scan[0] != 0) ? 1 : 0;
++    if (hw_cable_active) {
+         defer_counter = 0;
+         return;
+     }
+@@ -468,11 +548,18 @@ void shadow_drain_midi_inject(void)
+     int consumed_bytes = 0;
+     for (int i = 0; i < copy_len && injected < 16; i += 4) {
+         /* Find empty 8-byte slot (byte 0 == 0 means no cable/CIN, unused) */
++        int saw_existing = 0;
+         while (hw_offset < MIDI_IN_MAX_BYTES) {
+             if (midi_in[hw_offset] == 0) break;
++            saw_existing = 1;
+             hw_offset += MIDI_IN_EVT_STRIDE;
+         }
+         if (hw_offset >= MIDI_IN_MAX_BYTES) break;  /* Buffer full */
++        /* If we had to skip over pre-existing events to find an empty slot,
++         * bail out and carry remaining packets to the next frame. Injecting
++         * alongside hardware events in MIDI_IN races Move's read path and
++         * causes SIGABRT (empirical: crash always at non-zero offset). */
++        if (saw_existing) break;
+ 
+         /* Write 4-byte USB-MIDI packet + zero the 4-byte timestamp.
+          * Cable nibble in local_buf[i] is preserved — callers choose cable:
+@@ -563,6 +650,15 @@ void shadow_drain_ui_midi_dsp(void)
+     if (!midi_dsp_shm) return;
+     if (midi_dsp_shm->ready == last_ready) return;
+ 
++    /* T1: JS wrote a response — record latency if a pad press is pending */
++    if (pad_lat_t0_ns) {
++        uint32_t delta_us = (uint32_t)((pad_lat_now_ns() - pad_lat_t0_ns) / 1000);
++        pad_lat_ring[pad_lat_head % PAD_LAT_RING] = delta_us;
++        pad_lat_head++;
++        if (pad_lat_count < PAD_LAT_RING) pad_lat_count++;
++        pad_lat_t0_ns = 0;
++    }
++
+     last_ready = midi_dsp_shm->ready;
+ 
+     /* Snapshot buffer before resetting to avoid race with JS writer.
+@@ -844,6 +940,23 @@ void shadow_forward_midi(void)
+             }
+         }
+         has_midi = 1;
++
++        /* T0: record timestamp when a cable-0 pad note-on reaches JS SHM */
++        if (cable == 0x00) {
++            uint8_t type = src[i + 1] & 0xF0;
++            uint8_t note = src[i + 2];
++            uint8_t vel  = src[i + 3];
++            if (type == 0x90 && vel > 0 && note >= 68 && note <= 99)
++                pad_lat_t0_ns = pad_lat_now_ns();
++        }
++    }
++
++    /* Check for dump request at same cadence as other flag-file checks */
++    if (!cache_initialized || (cache_counter % 200 == 1)) {
++        if (access("/data/UserData/schwung/pad_latency_dump", F_OK) == 0) {
++            pad_lat_dump();
++            unlink("/data/UserData/schwung/pad_latency_dump");
++        }
+     }
+ 
+     if (has_midi) {
+diff --git a/src/schwung_shim.c b/src/schwung_shim.c
+index e5777a34..21405fce 100644
+--- a/src/schwung_shim.c
++++ b/src/schwung_shim.c
+@@ -5181,34 +5181,56 @@ static void shim_remap_cable2_channels(uint8_t *shadow) {
+     if (any_thru_slot_active()) return;  /* MPE escape hatch */
+     if (!hardware_mmap_addr) return;
+ 
+-    /* Mutate both hw (so Move sees remapped channels on this frame) and
+-     * shadow (so next frame's pre-transfer readers — cable-2 echo filter,
+-     * shadow_forward_external_cc_to_out — see consistent data). */
+-    uint8_t *targets[2] = { hardware_mmap_addr, shadow };
+-    for (int t = 0; t < 2; t++) {
+-        uint8_t *buf = targets[t];
+-        if (!buf) continue;
+-        buf += MIDI_IN_OFFSET;
+-        /* MIDI_IN events are 8 bytes (4 USB-MIDI + 4 timestamp). 4-byte
+-         * stride visits timestamps and rewrites their bytes when a
+-         * timestamp byte happens to look like cable-2 + a non-system
+-         * status — corrupts the contiguous event run that Move's MIDI_IN
+-         * parser scans (it terminates at the first zero slot). Sparse
+-         * buffer hides this; transport-running + external MIDI fills the
+-         * buffer and produces SIGABRT deep in Move's stack. */
+-        const int MIDI_IN_MAX_BYTES = 8 * 31;     /* 31 events × 8 bytes */
+-        for (int j = 0; j < MIDI_IN_MAX_BYTES; j += 8) {
+-            uint8_t header = buf[j];
+-            if (header == 0) break;               /* end-of-events */
+-            uint8_t cable = (header >> 4) & 0x0F;
+-            if (cable != 2) continue;             /* only cable-2 (external USB) */
+-            uint8_t status = buf[j + 1];
+-            if ((status & 0xF0) == 0xF0) continue; /* system messages — channelless */
+-            uint8_t in_ch = status & 0x0F;
+-            uint8_t mapped = ext_midi_remap_shm->remap[in_ch];
+-            if (mapped == EXT_MIDI_REMAP_PASSTHROUGH || mapped >= 16) continue;
+-            buf[j + 1] = (status & 0xF0) | (mapped & 0x0F);
++    /* MIDI_IN events are 8 bytes (4 USB-MIDI + 4 timestamp); stride at 8.
++     * 4-byte stride would hit timestamp bytes, corrupt the contiguous event
++     * run, and produce SIGABRT deep in Move's stack. */
++    uint8_t *hw_buf = hardware_mmap_addr + MIDI_IN_OFFSET;
++    uint8_t *sh_buf = shadow ? (shadow + MIDI_IN_OFFSET) : NULL;
++    const int MIDI_IN_MAX_BYTES = 8 * 31;     /* 31 events × 8 bytes */
++
++    for (int j = 0; j < MIDI_IN_MAX_BYTES; j += 8) {
++        uint8_t header = hw_buf[j];
++        if (header == 0) break;               /* end-of-events */
++        uint8_t cable = (header >> 4) & 0x0F;
++        if (cable != 2) continue;             /* only cable-2 (external USB) */
++        uint8_t status = hw_buf[j + 1];
++        if ((status & 0xF0) == 0xF0) continue; /* system messages — channelless */
++        uint8_t in_ch = status & 0x0F;
++        uint8_t mapped = ext_midi_remap_shm->remap[in_ch];
++
++        if (mapped == EXT_MIDI_REMAP_PASSTHROUGH) continue;
++
++        if (mapped == EXT_MIDI_REMAP_BLOCK) {
++            /* Forward ORIGINAL event to shadow_ui pre-mutation so SEQ8 sees the
++             * real note-on for Schwung routing. The post-transfer forwarding loop
++             * skips BLOCK channels to prevent a duplicate write. */
++            if (shadow_ui_midi_shm && shadow_control) {
++                for (int slot = 0; slot < MIDI_BUFFER_SIZE; slot += 4) {
++                    if (shadow_ui_midi_shm[slot] == 0) {
++                        shadow_ui_midi_shm[slot]     = header;
++                        shadow_ui_midi_shm[slot + 1] = status;
++                        shadow_ui_midi_shm[slot + 2] = hw_buf[j + 2];
++                        shadow_ui_midi_shm[slot + 3] = hw_buf[j + 3];
++                        shadow_control->midi_ready++;
++                        break;
++                    }
++                }
++            }
++            /* Block from Move: convert note-on to note-off (zero velocity).
++             * Note-offs, CCs, AT, PB are left unchanged — they cannot trigger
++             * a new voice and are harmless without a preceding note-on. */
++            if ((status & 0xF0) == 0x90 && hw_buf[j + 3] > 0) {
++                hw_buf[j + 3] = 0;
++                if (sh_buf) sh_buf[j + 3] = 0;
++            }
++            continue;
+         }
++
++        /* Normal channel remap: rewrite channel byte in both hw and shadow so
++         * Move firmware and next-frame internal readers see consistent data. */
++        if (mapped >= 16) continue;  /* guard: treat unknown values as passthrough */
++        hw_buf[j + 1] = (status & 0xF0) | (mapped & 0x0F);
++        if (sh_buf) sh_buf[j + 1] = (status & 0xF0) | (mapped & 0x0F);
+     }
+ }
+ 
+@@ -6450,6 +6472,13 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+                     if (!is_ui_event) continue;  /* Skip non-UI events in menu mode */
+                 }
+ 
++                /* Skip cable-2 events on BLOCK channels — already forwarded with
++                 * original data inside shim_remap_cable2_channels. */
++                if (cable == 0x02 && ext_midi_remap_shm && ext_midi_remap_shm->enabled) {
++                    uint8_t in_ch2 = status & 0x0F;
++                    if (ext_midi_remap_shm->remap[in_ch2] == EXT_MIDI_REMAP_BLOCK) continue;
++                }
++
+                 /* Queue cable 2 note-on messages (external LED commands like M8)
+                  * for rate-limited forwarding to prevent buffer overflow */
+                 if (cable == 0x02 && type == 0x90) {
+diff --git a/src/shadow/shadow_ui.c b/src/shadow/shadow_ui.c
+index cd7b9a54..c1645b2b 100644
+--- a/src/shadow/shadow_ui.c
++++ b/src/shadow/shadow_ui.c
+@@ -839,7 +839,9 @@ static JSValue js_host_ext_midi_remap_set(JSContext *ctx, JSValueConst this_val,
+     if (JS_ToInt32(ctx, &in_ch, argv[0]) < 0) return JS_FALSE;
+     if (JS_ToInt32(ctx, &out_ch, argv[1]) < 0) return JS_FALSE;
+     if (in_ch < 0 || in_ch > 15) return JS_FALSE;
+-    uint8_t mapped = (out_ch < 0 || out_ch > 15) ? EXT_MIDI_REMAP_PASSTHROUGH : (uint8_t)out_ch;
++    uint8_t mapped = (out_ch == (int32_t)EXT_MIDI_REMAP_BLOCK) ? EXT_MIDI_REMAP_BLOCK :
++                     (out_ch < 0 || out_ch > 15) ? EXT_MIDI_REMAP_PASSTHROUGH :
++                     (uint8_t)out_ch;
+     ext_midi_remap->remap[in_ch] = mapped;
+     __sync_synchronize();
+     return JS_TRUE;
