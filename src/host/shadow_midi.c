@@ -499,31 +499,20 @@ void shadow_drain_midi_inject(void)
         }
     }
 
-    /* Defer cable-2 injection when there's cable-0 hardware activity in the
-     * SAME tick. Injecting concurrently with a live pad event appears to
-     * race Move's firmware (observed: SIGABRT deep in Move's stack after
-     * ~1s of arp tick-path injections). The note-path injections (chord)
-     * escape this because they fire only AFTER Move has echoed the pad on
-     * cable-2 MIDI_OUT — at which point cable-0 MIDI_IN has been consumed.
-     * Tick-path injections (arp, generator-style FX) run every SPI cycle
-     * independently, so they need an explicit gate.
+    /* Defer inject when MIDI_IN has ANY hardware events this tick.
+     * All cables share Move's firmware MIDI read path — injecting concurrently
+     * with hardware events on ANY cable races Move's internal processing and
+     * causes SIGABRT. Originally the guard only checked cable-0 and cable-2,
+     * but empirically: the SIGABRT occurs with inject at offset 24 (3 existing
+     * events at offsets 0/8/16 on cables other than 0 or 2) — confirming the
+     * guard must be cable-agnostic.
      *
-     * Rule: if MIDI_IN has any cable-0 events this tick, reset the defer
-     * counter and hold the SHM contents. Otherwise, drain only once the
-     * counter has climbed to 2 (≈6ms at 2.9ms/tick). Pattern is from
-     * chord-mode-native (shadow_chord.c CHORD_DEFER_FRAMES). */
+     * Rule: if MIDI_IN has any non-zero event at all, reset the defer counter.
+     * Otherwise, drain once the counter has climbed to 2 (≈6ms). */
     const int DEFER_FRAMES = 2;
     static int defer_counter = 0;
     uint8_t *midi_in_scan = host_shadow_mailbox + MIDI_IN_OFFSET;
-    int hw_cable_active = 0;
-    for (int j = 0; j < MIDI_IN_MAX_BYTES; j += MIDI_IN_EVT_STRIDE) {
-        if (midi_in_scan[j] == 0) break;
-        int cable = midi_in_scan[j] >> 4;
-        if (cable == 0 || cable == 2) {   /* cable 0 (pads/hw) or cable 2 (external MIDI) */
-            hw_cable_active = 1;
-            break;
-        }
-    }
+    int hw_cable_active = (midi_in_scan[0] != 0) ? 1 : 0;
     if (hw_cable_active) {
         defer_counter = 0;
         return;
