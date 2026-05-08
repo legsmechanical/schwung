@@ -548,11 +548,18 @@ void shadow_drain_midi_inject(void)
     int consumed_bytes = 0;
     for (int i = 0; i < copy_len && injected < 16; i += 4) {
         /* Find empty 8-byte slot (byte 0 == 0 means no cable/CIN, unused) */
+        int saw_existing = 0;
         while (hw_offset < MIDI_IN_MAX_BYTES) {
             if (midi_in[hw_offset] == 0) break;
+            saw_existing = 1;
             hw_offset += MIDI_IN_EVT_STRIDE;
         }
         if (hw_offset >= MIDI_IN_MAX_BYTES) break;  /* Buffer full */
+        /* If we had to skip over pre-existing events to find an empty slot,
+         * bail out and carry remaining packets to the next frame. Injecting
+         * alongside hardware events in MIDI_IN races Move's read path and
+         * causes SIGABRT (empirical: crash always at non-zero offset). */
+        if (saw_existing) break;
 
         /* Write 4-byte USB-MIDI packet + zero the 4-byte timestamp.
          * Cable nibble in local_buf[i] is preserved — callers choose cable:
