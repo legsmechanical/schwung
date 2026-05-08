@@ -5181,34 +5181,56 @@ static void shim_remap_cable2_channels(uint8_t *shadow) {
     if (any_thru_slot_active()) return;  /* MPE escape hatch */
     if (!hardware_mmap_addr) return;
 
-    /* Mutate both hw (so Move sees remapped channels on this frame) and
-     * shadow (so next frame's pre-transfer readers — cable-2 echo filter,
-     * shadow_forward_external_cc_to_out — see consistent data). */
-    uint8_t *targets[2] = { hardware_mmap_addr, shadow };
-    for (int t = 0; t < 2; t++) {
-        uint8_t *buf = targets[t];
-        if (!buf) continue;
-        buf += MIDI_IN_OFFSET;
-        /* MIDI_IN events are 8 bytes (4 USB-MIDI + 4 timestamp). 4-byte
-         * stride visits timestamps and rewrites their bytes when a
-         * timestamp byte happens to look like cable-2 + a non-system
-         * status — corrupts the contiguous event run that Move's MIDI_IN
-         * parser scans (it terminates at the first zero slot). Sparse
-         * buffer hides this; transport-running + external MIDI fills the
-         * buffer and produces SIGABRT deep in Move's stack. */
-        const int MIDI_IN_MAX_BYTES = 8 * 31;     /* 31 events × 8 bytes */
-        for (int j = 0; j < MIDI_IN_MAX_BYTES; j += 8) {
-            uint8_t header = buf[j];
-            if (header == 0) break;               /* end-of-events */
-            uint8_t cable = (header >> 4) & 0x0F;
-            if (cable != 2) continue;             /* only cable-2 (external USB) */
-            uint8_t status = buf[j + 1];
-            if ((status & 0xF0) == 0xF0) continue; /* system messages — channelless */
-            uint8_t in_ch = status & 0x0F;
-            uint8_t mapped = ext_midi_remap_shm->remap[in_ch];
-            if (mapped == EXT_MIDI_REMAP_PASSTHROUGH || mapped >= 16) continue;
-            buf[j + 1] = (status & 0xF0) | (mapped & 0x0F);
+    /* MIDI_IN events are 8 bytes (4 USB-MIDI + 4 timestamp); stride at 8.
+     * 4-byte stride would hit timestamp bytes, corrupt the contiguous event
+     * run, and produce SIGABRT deep in Move's stack. */
+    uint8_t *hw_buf = hardware_mmap_addr + MIDI_IN_OFFSET;
+    uint8_t *sh_buf = shadow ? (shadow + MIDI_IN_OFFSET) : NULL;
+    const int MIDI_IN_MAX_BYTES = 8 * 31;     /* 31 events × 8 bytes */
+
+    for (int j = 0; j < MIDI_IN_MAX_BYTES; j += 8) {
+        uint8_t header = hw_buf[j];
+        if (header == 0) break;               /* end-of-events */
+        uint8_t cable = (header >> 4) & 0x0F;
+        if (cable != 2) continue;             /* only cable-2 (external USB) */
+        uint8_t status = hw_buf[j + 1];
+        if ((status & 0xF0) == 0xF0) continue; /* system messages — channelless */
+        uint8_t in_ch = status & 0x0F;
+        uint8_t mapped = ext_midi_remap_shm->remap[in_ch];
+
+        if (mapped == EXT_MIDI_REMAP_PASSTHROUGH) continue;
+
+        if (mapped == EXT_MIDI_REMAP_BLOCK) {
+            /* Forward ORIGINAL event to shadow_ui pre-mutation so SEQ8 sees the
+             * real note-on for Schwung routing. The post-transfer forwarding loop
+             * skips BLOCK channels to prevent a duplicate write. */
+            if (shadow_ui_midi_shm && shadow_control) {
+                for (int slot = 0; slot < MIDI_BUFFER_SIZE; slot += 4) {
+                    if (shadow_ui_midi_shm[slot] == 0) {
+                        shadow_ui_midi_shm[slot]     = header;
+                        shadow_ui_midi_shm[slot + 1] = status;
+                        shadow_ui_midi_shm[slot + 2] = hw_buf[j + 2];
+                        shadow_ui_midi_shm[slot + 3] = hw_buf[j + 3];
+                        shadow_control->midi_ready++;
+                        break;
+                    }
+                }
+            }
+            /* Block from Move: convert note-on to note-off (zero velocity).
+             * Note-offs, CCs, AT, PB are left unchanged — they cannot trigger
+             * a new voice and are harmless without a preceding note-on. */
+            if ((status & 0xF0) == 0x90 && hw_buf[j + 3] > 0) {
+                hw_buf[j + 3] = 0;
+                if (sh_buf) sh_buf[j + 3] = 0;
+            }
+            continue;
         }
+
+        /* Normal channel remap: rewrite channel byte in both hw and shadow so
+         * Move firmware and next-frame internal readers see consistent data. */
+        if (mapped >= 16) continue;  /* guard: treat unknown values as passthrough */
+        hw_buf[j + 1] = (status & 0xF0) | (mapped & 0x0F);
+        if (sh_buf) sh_buf[j + 1] = (status & 0xF0) | (mapped & 0x0F);
     }
 }
 
@@ -6448,6 +6470,13 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                                       (d1 == 14 || d1 == 3 || d1 == 51 ||  /* jog, click, back */
                                        (d1 >= 40 && d1 <= 43)));           /* track buttons */
                     if (!is_ui_event) continue;  /* Skip non-UI events in menu mode */
+                }
+
+                /* Skip cable-2 events on BLOCK channels — already forwarded with
+                 * original data inside shim_remap_cable2_channels. */
+                if (cable == 0x02 && ext_midi_remap_shm && ext_midi_remap_shm->enabled) {
+                    uint8_t in_ch2 = status & 0x0F;
+                    if (ext_midi_remap_shm->remap[in_ch2] == EXT_MIDI_REMAP_BLOCK) continue;
                 }
 
                 /* Queue cable 2 note-on messages (external LED commands like M8)
