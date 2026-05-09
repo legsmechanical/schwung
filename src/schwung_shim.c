@@ -5201,28 +5201,10 @@ static void shim_remap_cable2_channels(uint8_t *shadow) {
         if (mapped == EXT_MIDI_REMAP_PASSTHROUGH) continue;
 
         if (mapped == EXT_MIDI_REMAP_BLOCK) {
-            /* Forward ORIGINAL event to shadow_ui pre-mutation so SEQ8 sees the
-             * real note-on for Schwung routing. The post-transfer forwarding loop
-             * skips BLOCK channels to prevent a duplicate write. */
-            if (shadow_ui_midi_shm && shadow_control) {
-                for (int slot = 0; slot < MIDI_BUFFER_SIZE; slot += 4) {
-                    if (shadow_ui_midi_shm[slot] == 0) {
-                        shadow_ui_midi_shm[slot]     = header;
-                        shadow_ui_midi_shm[slot + 1] = status;
-                        shadow_ui_midi_shm[slot + 2] = hw_buf[j + 2];
-                        shadow_ui_midi_shm[slot + 3] = hw_buf[j + 3];
-                        shadow_control->midi_ready++;
-                        break;
-                    }
-                }
-            }
-            /* Block from Move: convert note-on to note-off (zero velocity).
-             * Note-offs, CCs, AT, PB are left unchanged — they cannot trigger
-             * a new voice and are harmless without a preceding note-on. */
-            if ((status & 0xF0) == 0x90 && hw_buf[j + 3] > 0) {
-                hw_buf[j + 3] = 0;
-                if (sh_buf) sh_buf[j + 3] = 0;
-            }
+            /* Leave hardware_mmap_addr untouched — writing the MIDI_IN region
+             * of the hardware SPI mmap crashes Move's process.  The shadow
+             * buffer (sh_midi) is patched to a proper note-off after the
+             * sh_midi copy loop via shim_block_cable2_in_sh_midi(). */
             continue;
         }
 
@@ -5231,6 +5213,36 @@ static void shim_remap_cable2_channels(uint8_t *shadow) {
         if (mapped >= 16) continue;  /* guard: treat unknown values as passthrough */
         hw_buf[j + 1] = (status & 0xF0) | (mapped & 0x0F);
         if (sh_buf) sh_buf[j + 1] = (status & 0xF0) | (mapped & 0x0F);
+    }
+}
+
+/* Patch sh_midi (shadow buffer, 4-byte stride) to suppress BLOCK channels from
+ * reaching Move's firmware.  Called AFTER the sh_midi copy loop so the patch
+ * survives the overwrite.  Converts note-ons on BLOCK channels to proper
+ * note-offs (CIN 8 / status 0x80) rather than zeroing velocity, avoiding any
+ * firmware edge-case on velocity=0 note-ons.  hardware_mmap_addr is left
+ * untouched — writing MIDI_IN there crashes Move's process. */
+static void shim_block_cable2_in_sh_midi(uint8_t *sh_midi) {
+    if (!ext_midi_remap_feature_enabled) return;
+    if (!ext_midi_remap_shm || !ext_midi_remap_shm->enabled) return;
+    if (any_thru_slot_active()) return;
+    /* MIDI_IN events are 8 bytes (4 USB-MIDI + 4 timestamp). Must stride by 8
+     * so we only inspect the USB-MIDI header bytes and never accidentally
+     * interpret or corrupt timestamp bytes. */
+    const int MIDI_IN_MAX_BYTES = 8 * 31;
+    for (int j = 0; j < MIDI_IN_MAX_BYTES; j += 8) {
+        if (sh_midi[j] == 0) break;                    /* end of events */
+        uint8_t cable = (sh_midi[j] >> 4) & 0x0F;
+        if (cable != 2) continue;
+        uint8_t status = sh_midi[j + 1];
+        if ((status & 0xF0) != 0x90) continue;         /* note-on only */
+        if (sh_midi[j + 3] == 0) continue;             /* already velocity=0 */
+        uint8_t in_ch = status & 0x0F;
+        if (ext_midi_remap_shm->remap[in_ch] != EXT_MIDI_REMAP_BLOCK) continue;
+        /* Convert to proper note-off so Move ignores it cleanly */
+        sh_midi[j]     = (sh_midi[j] & 0xF0) | 0x08;  /* CIN 8 = note-off */
+        sh_midi[j + 1] = 0x80 | in_ch;                 /* note-off status */
+        sh_midi[j + 3] = 0x40;                         /* standard note-off vel */
     }
 }
 
@@ -5565,6 +5577,11 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
         /* Not in shadow mode - copy MIDI_IN directly */
         memcpy(sh_midi, hw_midi, MIDI_BUFFER_SIZE);
     }
+
+    /* Convert BLOCK-channel cable-2 note-ons to note-offs in shadow so Move
+     * ignores them.  Must run AFTER the sh_midi loop (which overwrites shadow
+     * from hw_midi) and only touches shadow — never hardware_mmap_addr. */
+    shim_block_cable2_in_sh_midi(sh_midi);
 
     /* === SHIFT+MENU SHORTCUT DETECTION AND BLOCKING (POST-IOCTL) ===
      * Scan hardware MIDI_IN for Shift+Menu, perform action, and block from reaching Move.
@@ -6472,12 +6489,10 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                     if (!is_ui_event) continue;  /* Skip non-UI events in menu mode */
                 }
 
-                /* Skip cable-2 events on BLOCK channels — already forwarded with
-                 * original data inside shim_remap_cable2_channels. */
-                if (cable == 0x02 && ext_midi_remap_shm && ext_midi_remap_shm->enabled) {
-                    uint8_t in_ch2 = status & 0x0F;
-                    if (ext_midi_remap_shm->remap[in_ch2] == EXT_MIDI_REMAP_BLOCK) continue;
-                }
+                /* BLOCK channels: hardware_mmap_addr is NOT modified (writing
+                 * MIDI_IN hardware crashes Move), so src here has the original
+                 * velocity.  Forward the note-on normally so SEQ8 can route it.
+                 * Move won't play it because sh_midi has the patched note-off. */
 
                 /* Queue cable 2 note-on messages (external LED commands like M8)
                  * for rate-limited forwarding to prevent buffer overflow */
