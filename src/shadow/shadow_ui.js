@@ -2508,6 +2508,14 @@ function clearModuleParamShims() {
 
 /* Load a module's UI for editing */
 function loadModuleUi(slot, componentKey, moduleId) {
+    /* CO-RUN refuse: loading a chain module's UI overwrites globalThis.tick
+     * (and onMidiMessageInternal), which silences the active tool. The caller
+     * (enterComponentEditFallback) falls back to the simple preset browser
+     * when this returns false — that path doesn't touch globals. */
+    if (coRunChainEditSlot >= 0) {
+        moduleUiLoadError = true;
+        return false;
+    }
     const uiPath = getModuleUiPath(moduleId);
     if (!uiPath) {
         moduleUiLoadError = true;
@@ -14704,8 +14712,12 @@ function dispatchCoRunDraw() {
         case VIEWS.CHAIN_SETTINGS:       drawChainSettings(); break;
         case VIEWS.SLOT_SETTINGS:        drawSlotSettings(); break;
         case VIEWS.COMPONENT_EDIT:
-            if (loadedModuleUi && loadedModuleUi.tick) loadedModuleUi.tick();
-            else drawComponentEdit();
+            /* In co-run, never invoke loadedModuleUi.tick(): the chain module's
+             * own UI module takes over shadow_ui's drawing/MIDI/IPC and starves
+             * the active tool. drawComponentEdit() is the simple preset-browser
+             * fallback that lets the user pick patches without the deep
+             * module-specific editor — still useful, and keeps dAVEBOx alive. */
+            drawComponentEdit();
             break;
         case VIEWS.HIERARCHY_EDITOR:     drawHierarchyEditor(); break;
         case VIEWS.KNOB_EDITOR:          drawKnobEditor(); break;
@@ -15903,8 +15915,9 @@ globalThis.onMidiMessageInternal = function(data) {
 
         /* Back button handling for suspend_keeps_js modules — Wave Editor convention.
          * Back alone: suspend (module parks in background, ticks continue).
-         * Shift+Back: full exit (unload module). */
-        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs) {
+         * Shift+Back: full exit (unload module).
+         * Skip while co-run is active: the chain editor claims Back. */
+        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && coRunChainEditSlot < 0) {
             if (hostShiftHeld) {
                 debugLog("HOST: Shift+Back → full exit (suspend_keeps_js module)");
                 if (toolOvertakeActive) exitToolOvertake();
@@ -15918,8 +15931,11 @@ globalThis.onMidiMessageInternal = function(data) {
 
         /* CO-RUN: intercept chain-editor navigation CCs (jog turn, jog click,
          * track buttons) BEFORE encoder accumulation or tool dispatch. Tool
-         * keeps everything else (pads, step buttons, knobs, transport, Back,
-         * Shift). */
+         * keeps everything else (pads, step buttons, knobs, transport, Shift).
+         * Back is conditionally intercepted: when the editor is in a sub-view
+         * (PATCHES, COMPONENT_*, KNOB_*, etc.) Back navigates up within the
+         * editor; when the editor is at CHAIN_EDIT (the top level) Back falls
+         * through to the tool so dAVEBOx can exit co-run. */
         if (coRunChainEditSlot >= 0 && (status & 0xF0) === 0xB0) {
             if (d1 === MoveMainKnob) {
                 const delta = decodeDelta(d2);
@@ -15929,6 +15945,29 @@ globalThis.onMidiMessageInternal = function(data) {
             }
             if (d1 === MoveMainButton && d2 > 0) {
                 runCoRunChainEdit(function() { handleSelect(); });
+                needsRedraw = true;
+                return;
+            }
+            /* Back: always claimed by the chain editor while co-run is on.
+             * Deeper views navigate up; CHAIN_EDIT is the top — eat the event
+             * so it doesn't reach the tool (handleBack at CHAIN_EDIT would
+             * call shadow_request_exit, which is also wrong). User exits co-run
+             * via Menu button instead. */
+            if (d1 === MoveBack && d2 > 0) {
+                if (coRunView !== VIEWS.CHAIN_EDIT) {
+                    runCoRunChainEdit(function() { handleBack(); });
+                    needsRedraw = true;
+                }
+                return;
+            }
+            /* Menu (CC 50): exit co-run entirely. shadow_clear_corun_chain_edit
+             * updates SHM; the tool reads it from its own poll and clears its
+             * mirror, restoring full OLED + jog ownership. */
+            if (d1 === 50 && d2 > 0) {
+                if (typeof shadow_set_corun_chain_edit === "function") {
+                    shadow_set_corun_chain_edit(-1);
+                }
+                coRunChainEditSlot = -1;
                 needsRedraw = true;
                 return;
             }
