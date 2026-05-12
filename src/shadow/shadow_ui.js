@@ -226,6 +226,20 @@ let overtakeJogDelta = 0;                             // Accumulated delta for j
 let coRunChainEditSlot = -1;
 let coRunView = -1;  // initialized to VIEWS.CHAIN_EDIT on first co-run entry
 
+/* Param-shim originals. When a chain module's UI is "loaded" (or when
+ * enterHierarchyEditor / setupModuleParamShims fires), the shadow_ui
+ * shims host_module_get_param / host_module_set_param so chain-editor
+ * queries route to the slot's DSP. That's correct for native chain
+ * editing — but during co-run, the active tool module ALSO calls those
+ * globals expecting to talk to ITS OWN DSP. Without a swap, the tool
+ * silently misroutes every IPC at the chain slot, which manifests as
+ * pads not emitting MIDI, transport not working, and audio glitches.
+ * setupModuleParamShims now caches the originals and we restore them
+ * around every tool callback (tick + onMidiMessageInternal). */
+let originalHostGetParam = null;
+let originalHostSetParam = null;
+let paramShimsInstalled = false;
+
 const CONFIG_PATH = "/data/UserData/schwung/shadow_chain_config.json";
 const PATCH_DIR = "/data/UserData/schwung/patches";
 const SLOT_STATE_DIR_DEFAULT = "/data/UserData/schwung/slot_state";
@@ -2461,6 +2475,13 @@ function getComponentParamPrefix(componentKey) {
 /* Set up shims for host_module_get_param and host_module_set_param
  * These route to the correct slot and component in shadow mode */
 function setupModuleParamShims(slot, componentKey) {
+    /* Cache the real host APIs on first install so co-run can swap them
+     * back around active-tool callbacks. */
+    if (!paramShimsInstalled) {
+        originalHostGetParam = globalThis.host_module_get_param;
+        originalHostSetParam = globalThis.host_module_set_param;
+        paramShimsInstalled = true;
+    }
     const prefix = getComponentParamPrefix(componentKey);
 
     globalThis.host_module_get_param = function(key) {
@@ -2498,12 +2519,42 @@ function setupModuleParamShims(slot, componentKey) {
 
 /* Clear the param shims */
 function clearModuleParamShims() {
-    delete globalThis.host_module_get_param;
-    delete globalThis.host_module_set_param;
+    /* Restore the real host APIs we cached on first shim install. */
+    if (paramShimsInstalled) {
+        if (originalHostGetParam) globalThis.host_module_get_param = originalHostGetParam;
+        else delete globalThis.host_module_get_param;
+        if (originalHostSetParam) globalThis.host_module_set_param = originalHostSetParam;
+        else delete globalThis.host_module_set_param;
+        paramShimsInstalled = false;
+    } else {
+        delete globalThis.host_module_get_param;
+        delete globalThis.host_module_set_param;
+    }
     delete globalThis.host_module_set_param_blocking;
     delete globalThis.host_exit_module;
     delete globalThis.host_swap_module;
     delete globalThis.host_open_file_in_tool;
+}
+
+/* Run a tool callback (tick / onMidiMessageInternal) with the real host
+ * APIs restored. While chain-editor shims are installed, every direct
+ * reference to globalThis.host_module_get_param / _set_param goes to
+ * the chain slot DSP — wrong for the active tool. This swap-and-restore
+ * keeps the tool talking to its own DSP. */
+function runToolCallback(fn) {
+    if (!paramShimsInstalled) {
+        return fn();
+    }
+    const shimGet = globalThis.host_module_get_param;
+    const shimSet = globalThis.host_module_set_param;
+    if (originalHostGetParam) globalThis.host_module_get_param = originalHostGetParam;
+    if (originalHostSetParam) globalThis.host_module_set_param = originalHostSetParam;
+    try {
+        return fn();
+    } finally {
+        globalThis.host_module_get_param = shimGet;
+        globalThis.host_module_set_param = shimSet;
+    }
 }
 
 /* Load a module's UI for editing */
@@ -15668,7 +15719,9 @@ globalThis.tick = function() {
                                 const d = overtakeKnobDelta[k];
                                 const ccVal = d > 0 ? Math.min(d, 63) : Math.max(128 + d, 65);
                                 try {
-                                    overtakeModuleCallbacks.onMidiMessageInternal([0xB0, KNOB_CC_START + k, ccVal]);
+                                    runToolCallback(function() {
+                                        overtakeModuleCallbacks.onMidiMessageInternal([0xB0, KNOB_CC_START + k, ccVal]);
+                                    });
                                 } catch (e) {
                                     debugLog("OVERTAKE flush knob exception: " + e);
                                     exitOvertakeMode();
@@ -15681,7 +15734,9 @@ globalThis.tick = function() {
                             const d = overtakeJogDelta;
                             const ccVal = d > 0 ? Math.min(d, 63) : Math.max(128 + d, 65);
                             try {
-                                overtakeModuleCallbacks.onMidiMessageInternal([0xB0, MoveMainKnob, ccVal]);
+                                runToolCallback(function() {
+                                    overtakeModuleCallbacks.onMidiMessageInternal([0xB0, MoveMainKnob, ccVal]);
+                                });
                             } catch (e) {
                                 debugLog("OVERTAKE flush jog exception: " + e);
                                 exitOvertakeMode();
@@ -15694,10 +15749,11 @@ globalThis.tick = function() {
                         overtakeJogDelta = 0;
                     }
 
-                    /* Call the overtake module's tick() function */
+                    /* Call the overtake module's tick() function with the
+                     * tool's real host APIs (see runToolCallback). */
                     if (overtakeModuleCallbacks && overtakeModuleCallbacks.tick) {
                         try {
-                            overtakeModuleCallbacks.tick();
+                            runToolCallback(function() { overtakeModuleCallbacks.tick(); });
                         } catch (e) {
                             debugLog("OVERTAKE tick() exception: " + e);
                             /* Exit overtake on tick error */
@@ -16004,10 +16060,11 @@ globalThis.onMidiMessageInternal = function(data) {
             }
         }
 
-        /* Route non-encoder MIDI to the overtake module immediately */
+        /* Route non-encoder MIDI to the overtake module immediately, with
+         * the tool's real host APIs swapped in. */
         if (overtakeModuleCallbacks.onMidiMessageInternal) {
             try {
-                overtakeModuleCallbacks.onMidiMessageInternal(data);
+                runToolCallback(function() { overtakeModuleCallbacks.onMidiMessageInternal(data); });
                 needsRedraw = true;
             } catch (e) {
                 debugLog("OVERTAKE onMidiMessageInternal exception: " + e);
