@@ -2878,6 +2878,7 @@ static void init_shadow_shm(void)
             shadow_control->ui_patch_index = 0;
             shadow_control->ui_request_id = 0;
             shadow_control->corun_chain_edit_slot = -1;  /* chain-edit co-run inactive at boot */
+            shadow_control->corun_move_native_track = -1;  /* Move-native co-run inactive at boot */
             /* Initialize TTS defaults */
             shadow_control->tts_enabled = 0;    /* Screen Reader off by default */
             shadow_control->tts_volume = 70;    /* 70% volume */
@@ -3349,6 +3350,15 @@ static void shadow_swap_display(void)
     }
     /* Let Move's PIN screen show through during challenge so PIN scanner can read it */
     if (shadow_control->pin_challenge_active == 1) {
+        display_phase = 0;
+        return;
+    }
+    /* Move-native co-run: yield OLED to Move firmware (preset browser /
+     * device-edit pages) while keeping shadow_display_mode = 1 so the MIDI
+     * filter at the sh_midi sync site stays active. Without this bypass we'd
+     * have to drop display_mode = 0 to expose Move's framebuffer, which would
+     * also disable the filter and let pads/transport leak through to Move. */
+    if (shadow_control->corun_move_native_track >= 0) {
         display_phase = 0;
         return;
     }
@@ -5778,6 +5788,34 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                     if (cin == 0x0B && type == 0xB0 && d1 < 128 && overtake_passthrough_ccs[d1]) {
                         filter = 0;
                     }
+                    /* Move-native co-run: while corun_move_native_track >= 0,
+                     * let Move firmware see the navigation surface it needs to
+                     * drive its preset browser / device-edit pages, while the
+                     * tool keeps the rest. Cable-0 only (handled by the outer
+                     * `if (cable == 0x00)`). Touch notes 0-9 (jog + knob cap)
+                     * also flow through so Move can detect engagement.
+                     *  - CC 3   = jog click
+                     *  - CC 14  = jog turn
+                     *  - CC 40-43 = track buttons
+                     *  - CC 49  = Shift
+                     *  - CC 51  = Back
+                     *  - CC 71-78 = device-edit knobs (8 knobs)
+                     *  - CC 79  = master knob (already in passthrough for dAVEBOx,
+                     *             listed here for clarity in case a tool doesn't
+                     *             include it in button_passthrough). */
+                    if (shadow_control->corun_move_native_track >= 0) {
+                        if (cin == 0x0B && type == 0xB0 &&
+                            (d1 == 3 || d1 == 14 || d1 == 49 || d1 == 51 ||
+                             d1 == CC_MASTER_KNOB ||
+                             (d1 >= 40 && d1 <= 43) ||
+                             (d1 >= 71 && d1 <= 78))) {
+                            filter = 0;
+                        }
+                        if ((cin == 0x09 || cin == 0x08) &&
+                            (type == 0x90 || type == 0x80) && d1 <= 9) {
+                            filter = 0;
+                        }
+                    }
                 } else if (overtake_mode == 1) {
                     filter = 1;
                     if (cin == 0x0B && type == 0xB0 && d1 == CC_MASTER_KNOB) {
@@ -6781,6 +6819,25 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                                       (d1 == 14 || d1 == 3 || d1 == 51 ||  /* jog, click, back */
                                        (d1 >= 40 && d1 <= 43)));           /* track buttons */
                     if (!is_ui_event) continue;  /* Skip non-UI events in menu mode */
+                }
+
+                /* Move-native co-run: suppress from the tool the same nav CCs
+                 * + touch notes that we let through to Move firmware above
+                 * (sh_midi filter). Cable-0 only — cable-2 external MIDI is
+                 * unaffected. Mirror of the let-through list at the sh_midi
+                 * filter site; keep them in sync. */
+                if (overtake_mode == 2 && cable == 0x00 &&
+                    shadow_control->corun_move_native_track >= 0) {
+                    if (type == 0xB0 &&
+                        (d1 == 3 || d1 == 14 || d1 == 49 || d1 == 51 ||
+                         d1 == CC_MASTER_KNOB ||
+                         (d1 >= 40 && d1 <= 43) ||
+                         (d1 >= 71 && d1 <= 78))) {
+                        continue;
+                    }
+                    if ((type == 0x90 || type == 0x80) && d1 <= 9) {
+                        continue;
+                    }
                 }
 
                 /* BLOCK channels: hardware_mmap_addr is NOT modified (writing

@@ -156,7 +156,8 @@ typedef struct shadow_control_t {
     volatile uint16_t skipback_seconds; /* Skipback rolling buffer length: 30/60/120/180/240/300 */
     volatile uint8_t resume_last_tool;  /* 1=JUMP_TO_TOOLS should resume the most-recently-suspended tool instead of opening the menu */
     volatile int8_t corun_chain_edit_slot; /* -1=off, 0-3=chain-edit co-runs with the active tool, owning OLED + jog + track buttons */
-    volatile uint8_t reserved[5];
+    volatile int8_t corun_move_native_track; /* -1=off, 0-3=Move firmware co-runs (OLED + jog + track buttons + knobs) for the active tool's track */
+    volatile uint8_t reserved[4];
 } shadow_control_t;
 
 /*

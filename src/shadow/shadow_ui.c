@@ -359,6 +359,32 @@ static JSValue js_shadow_get_corun_chain_edit(JSContext *ctx, JSValueConst this_
     return JS_NewInt32(ctx, (int)(int8_t)shadow_control->corun_chain_edit_slot);
 }
 
+/* shadow_set_corun_move_native(track) -> void
+ * Enables Move-native co-run: Move firmware renders to the OLED and consumes
+ * jog/jog-click/track-button/Shift/Back/knob/master-knob input + capacitive
+ * touch notes 0-9, while the active tool module keeps pads/step buttons/
+ * transport/Menu. Pass -1 to disable. Unlike chain-edit co-run, this is a
+ * pure shim-level split: Move firmware reads the shadow_mailbox MIDI_IN
+ * buffer directly (separate process), so there's no JS-side intercept and
+ * no host-API swap to manage.
+ */
+static JSValue js_shadow_set_corun_move_native(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (!shadow_control || argc < 1) return JS_UNDEFINED;
+    int track = -1;
+    if (JS_ToInt32(ctx, &track, argv[0])) return JS_UNDEFINED;
+    if (track < -1 || track >= SHADOW_UI_SLOTS) return JS_UNDEFINED;
+    shadow_control->corun_move_native_track = (int8_t)track;
+    return JS_UNDEFINED;
+}
+
+/* shadow_get_corun_move_native() -> int (-1=off, 0-3=co-run track) */
+static JSValue js_shadow_get_corun_move_native(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    if (!shadow_control) return JS_NewInt32(ctx, -1);
+    return JS_NewInt32(ctx, (int)(int8_t)shadow_control->corun_move_native_track);
+}
+
 /* shadow_get_selected_slot() -> int
  * Returns the track-selected slot (0-3) for playback/knobs.
  */
@@ -3128,6 +3154,8 @@ static void init_javascript(JSRuntime **prt, JSContext **pctx) {
     JS_SetPropertyStr(ctx, global_obj, "shadow_inbound_pad_midi_active", JS_NewCFunction(ctx, js_shadow_inbound_pad_midi_active, "shadow_inbound_pad_midi_active", 0));
     JS_SetPropertyStr(ctx, global_obj, "shadow_set_corun_chain_edit", JS_NewCFunction(ctx, js_shadow_set_corun_chain_edit, "shadow_set_corun_chain_edit", 1));
     JS_SetPropertyStr(ctx, global_obj, "shadow_get_corun_chain_edit", JS_NewCFunction(ctx, js_shadow_get_corun_chain_edit, "shadow_get_corun_chain_edit", 0));
+    JS_SetPropertyStr(ctx, global_obj, "shadow_set_corun_move_native", JS_NewCFunction(ctx, js_shadow_set_corun_move_native, "shadow_set_corun_move_native", 1));
+    JS_SetPropertyStr(ctx, global_obj, "shadow_get_corun_move_native", JS_NewCFunction(ctx, js_shadow_get_corun_move_native, "shadow_get_corun_move_native", 0));
     JS_SetPropertyStr(ctx, global_obj, "shadow_get_open_tool_cmd",
         JS_NewCFunction(ctx, js_shadow_get_open_tool_cmd, "shadow_get_open_tool_cmd", 0));
     JS_SetPropertyStr(ctx, global_obj, "shadow_get_selected_slot", JS_NewCFunction(ctx, js_shadow_get_selected_slot, "shadow_get_selected_slot", 0));
