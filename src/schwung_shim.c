@@ -2877,6 +2877,7 @@ static void init_shadow_shm(void)
             shadow_control->ui_flags = 0;
             shadow_control->ui_patch_index = 0;
             shadow_control->ui_request_id = 0;
+            shadow_control->corun_chain_edit_slot = -1;  /* chain-edit co-run inactive at boot */
             /* Initialize TTS defaults */
             shadow_control->tts_enabled = 0;    /* Screen Reader off by default */
             shadow_control->tts_volume = 70;    /* 70% volume */

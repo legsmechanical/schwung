@@ -218,6 +218,14 @@ const NUM_KNOBS = 8;
 let overtakeKnobDelta = [0, 0, 0, 0, 0, 0, 0, 0];  // Accumulated delta per knob (CC 71-78)
 let overtakeJogDelta = 0;                             // Accumulated delta for jog wheel (CC 14)
 
+/* Co-run mode: chain editor runs alongside an active tool module. Tool keeps
+ * pads/steps/knobs/transport; jog + jog-click + track buttons + OLED route to
+ * the chain editor. coRunView tracks the chain editor's own navigation state
+ * so deeper views (patch browser, component edit, etc.) work without touching
+ * the outer `view`, which stays at VIEWS.OVERTAKE_MODULE so the tool ticks. */
+let coRunChainEditSlot = -1;
+let coRunView = -1;  // initialized to VIEWS.CHAIN_EDIT on first co-run entry
+
 const CONFIG_PATH = "/data/UserData/schwung/shadow_chain_config.json";
 const PATCH_DIR = "/data/UserData/schwung/patches";
 const SLOT_STATE_DIR_DEFAULT = "/data/UserData/schwung/slot_state";
@@ -14663,6 +14671,59 @@ globalThis.shadow_save_state_now = function() {
     return true;
 };
 
+/* Co-run helpers — see coRunChainEditSlot / coRunView declarations near top.
+ *
+ * runCoRunChainEdit(fn): temporarily set the outer `view` to coRunView so any
+ * code that dispatches on view (handleJog/handleSelect/draws) lands in the
+ * chain-editor branch. Captures view-change side-effects back into coRunView
+ * so navigation into deeper views (patch browser, component edit, etc.)
+ * sticks across frames. Always restores the outer view to its prior value so
+ * the main tick's view-switch still routes to VIEWS.OVERTAKE_MODULE. */
+function runCoRunChainEdit(fn) {
+    const _saved = view;
+    view = coRunView;
+    try { fn(); } finally {
+        coRunView = view;
+        view = _saved;
+    }
+}
+
+/* dispatchCoRunDraw(): mirror of the chain-edit-reachable subtree of the
+ * main draw switch (~line 14800). Called from co-run with view already set
+ * to coRunView by runCoRunChainEdit. */
+function dispatchCoRunDraw() {
+    switch (view) {
+        case VIEWS.COMPONENT_EDIT:
+            if (loadedModuleUi && loadedModuleUi.tick) loadedModuleUi.tick();
+            else if (typeof drawComponentEdit === "function") drawComponentEdit();
+            else drawSlots();
+            break;
+        case VIEWS.KNOB_EDITOR:
+            if (typeof drawKnobEditor === "function") drawKnobEditor(); else drawSlots();
+            break;
+        case VIEWS.KNOB_PARAM_PICKER:
+            if (typeof drawKnobParamPicker === "function") drawKnobParamPicker(); else drawSlots();
+            break;
+        case VIEWS.DYNAMIC_PARAM_PICKER:
+            if (typeof drawDynamicParamPicker === "function") drawDynamicParamPicker(); else drawSlots();
+            break;
+        case VIEWS.LFO_EDIT:
+            if (typeof drawLfoEdit === "function") drawLfoEdit(); else drawSlots();
+            break;
+        case VIEWS.LFO_TARGET_COMPONENT:
+            if (typeof drawLfoTargetComponent === "function") drawLfoTargetComponent(); else drawSlots();
+            break;
+        case VIEWS.LFO_TARGET_PARAM:
+            if (typeof drawLfoTargetParam === "function") drawLfoTargetParam(); else drawSlots();
+            break;
+        default:
+            /* CHAIN_EDIT, SLOTS, CHAIN_SETTINGS, SLOT_SETTINGS, patch picker —
+             * drawSlots() dispatches by view internally for the chain-edit
+             * subtree. */
+            drawSlots();
+    }
+}
+
 globalThis.tick = function() {
     /* Background tick for JS-suspended overtake modules.
      * Each parked module's tick() keeps firing so it can emit MIDI or advance
@@ -15389,6 +15450,27 @@ globalThis.tick = function() {
     /* Flush deferred wav player file_path after DSP load */
     wavPlayerTick();
 
+    /* CO-RUN: sync chain-edit slot from SHM. Active tool module sets this via
+     * shadow_set_corun_chain_edit() to share OLED + jog + track buttons with
+     * the chain editor while keeping pads/steps/knobs/transport for itself. */
+    if (typeof shadow_get_corun_chain_edit === "function") {
+        const _new = shadow_get_corun_chain_edit();
+        if (_new !== coRunChainEditSlot) {
+            coRunChainEditSlot = _new;
+            if (_new >= 0) {
+                /* Entering co-run: prime the chain editor's state for slot N.
+                 * Mirrors enterChainEdit() but does NOT touch the outer view
+                 * (must stay VIEWS.OVERTAKE_MODULE so the tool keeps ticking). */
+                selectedSlot = _new;
+                if (typeof updateFocusedSlot === "function") updateFocusedSlot(_new);
+                selectedChainComponent = lastChainComponent[_new] || 0;
+                if (typeof loadChainConfigFromSlot === "function") loadChainConfigFromSlot(_new);
+                coRunView = VIEWS.CHAIN_EDIT;
+                needsRedraw = true;
+            }
+        }
+    }
+
     switch (view) {
         case VIEWS.SLOTS:
             drawSlots();
@@ -15605,6 +15687,15 @@ globalThis.tick = function() {
                         }
                     }
                     flushLedQueue();  /* Drain queued LED updates to SHM after module tick */
+
+                    /* CO-RUN: render chain editor over the tool's frame. By
+                     * contract, a tool that enables co-run agrees not to draw
+                     * to OLED while coRunChainEditSlot >= 0 — but even if it
+                     * does, drawSlots() (and chain-edit subtree draws) start
+                     * with clear_screen() so the editor's pixels win. */
+                    if (coRunChainEditSlot >= 0) {
+                        runCoRunChainEdit(dispatchCoRunDraw);
+                    }
                 }
             } catch (e) {
                 debugLog("OVERTAKE_MODULE case EXCEPTION: " + e);
@@ -15817,6 +15908,39 @@ globalThis.onMidiMessageInternal = function(data) {
                 suspendOvertakeMode();
             }
             return;
+        }
+
+        /* CO-RUN: intercept chain-editor navigation CCs (jog turn, jog click,
+         * track buttons) BEFORE encoder accumulation or tool dispatch. Tool
+         * keeps everything else (pads, step buttons, knobs, transport, Back,
+         * Shift). */
+        if (coRunChainEditSlot >= 0 && (status & 0xF0) === 0xB0) {
+            if (d1 === MoveMainKnob) {
+                const delta = decodeDelta(d2);
+                if (delta !== 0) runCoRunChainEdit(function() { handleJog(delta); });
+                needsRedraw = true;
+                return;
+            }
+            if (d1 === MoveMainButton && d2 > 0) {
+                runCoRunChainEdit(function() { handleSelect(); });
+                needsRedraw = true;
+                return;
+            }
+            /* Track buttons: CC 43=Track 1 (slot 0), CC 40=Track 4 (slot 3) */
+            if (d1 >= 40 && d1 <= 43 && d2 > 0) {
+                const _slot = 43 - d1;
+                if (_slot >= 0 && _slot < SHADOW_UI_SLOTS && _slot !== coRunChainEditSlot) {
+                    coRunChainEditSlot = _slot;
+                    selectedSlot = _slot;
+                    if (typeof updateFocusedSlot === "function") updateFocusedSlot(_slot);
+                    selectedChainComponent = lastChainComponent[_slot] || 0;
+                    if (typeof loadChainConfigFromSlot === "function") loadChainConfigFromSlot(_slot);
+                    coRunView = VIEWS.CHAIN_EDIT;
+                    if (typeof shadow_set_corun_chain_edit === "function") shadow_set_corun_chain_edit(_slot);
+                    needsRedraw = true;
+                }
+                return;
+            }
         }
 
         /* Accumulate encoder/jog CCs instead of forwarding immediately.
