@@ -16000,7 +16000,18 @@ globalThis.onMidiMessageInternal = function(data) {
                 return;
             }
             if (d1 === MoveMainButton && d2 > 0) {
-                runCoRunChainEdit(function() { handleSelect(); });
+                /* Mirror the non-overtake Shift+Click handler (line ~15259):
+                 * Shift+Click in CHAIN_EDIT → handleShiftSelect (enter
+                 * component edit). Plain Click → handleSelect. */
+                runCoRunChainEdit(function() {
+                    if (hostShiftHeld && view === VIEWS.CHAIN_EDIT && selectedChainComponent >= 0) {
+                        handleShiftSelect();
+                    } else if (hostShiftHeld && view === VIEWS.MASTER_FX && selectedMasterFxComponent >= 0 && selectedMasterFxComponent < 4) {
+                        enterMasterFxModuleSelect(selectedMasterFxComponent);
+                    } else {
+                        handleSelect();
+                    }
+                });
                 needsRedraw = true;
                 return;
             }
@@ -16014,6 +16025,15 @@ globalThis.onMidiMessageInternal = function(data) {
                     runCoRunChainEdit(function() { handleBack(); });
                     needsRedraw = true;
                 }
+                return;
+            }
+            /* Shift (CC 49): give it ONLY to the chain editor. hostShiftHeld
+             * was already updated earlier (line ~15091) before this branch, so
+             * the editor's isShiftHeld()-based code paths see the right state.
+             * Eating it here prevents the tool from reacting (e.g. dAVEBOx's
+             * own Shift+button shortcuts while you're navigating the editor). */
+            if (d1 === 49) {
+                needsRedraw = true;
                 return;
             }
             /* Menu (CC 50): exit co-run entirely. shadow_clear_corun_chain_edit
