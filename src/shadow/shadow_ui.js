@@ -14688,38 +14688,44 @@ function runCoRunChainEdit(fn) {
     }
 }
 
-/* dispatchCoRunDraw(): mirror of the chain-edit-reachable subtree of the
- * main draw switch (~line 14800). Called from co-run with view already set
- * to coRunView by runCoRunChainEdit. */
+/* dispatchCoRunDraw(): mirror of the chain-edit subtree of the main draw
+ * switch (~line 14874). Called from co-run with view already set to coRunView
+ * by runCoRunChainEdit. The chain editor's navigation lands on many views
+ * (PATCHES, COMPONENT_PARAMS, COMPONENT_SELECT, etc.), each with its own
+ * draw function. drawSlots() only renders the top-level slot LIST — we must
+ * dispatch every reachable view explicitly. */
 function dispatchCoRunDraw() {
     switch (view) {
+        case VIEWS.CHAIN_EDIT:           drawChainEdit(); break;
+        case VIEWS.PATCHES:              drawPatches(); break;
+        case VIEWS.PATCH_DETAIL:         drawPatchDetail(); break;
+        case VIEWS.COMPONENT_PARAMS:     drawComponentParams(); break;
+        case VIEWS.COMPONENT_SELECT:     drawComponentSelect(); break;
+        case VIEWS.CHAIN_SETTINGS:       drawChainSettings(); break;
+        case VIEWS.SLOT_SETTINGS:        drawSlotSettings(); break;
         case VIEWS.COMPONENT_EDIT:
             if (loadedModuleUi && loadedModuleUi.tick) loadedModuleUi.tick();
-            else if (typeof drawComponentEdit === "function") drawComponentEdit();
-            else drawSlots();
+            else drawComponentEdit();
             break;
-        case VIEWS.KNOB_EDITOR:
-            if (typeof drawKnobEditor === "function") drawKnobEditor(); else drawSlots();
+        case VIEWS.HIERARCHY_EDITOR:     drawHierarchyEditor(); break;
+        case VIEWS.KNOB_EDITOR:          drawKnobEditor(); break;
+        case VIEWS.KNOB_PARAM_PICKER:    drawKnobParamPicker(); break;
+        case VIEWS.DYNAMIC_PARAM_PICKER: drawDynamicParamPicker(); break;
+        case VIEWS.LFO_EDIT:             drawLfoEdit(); break;
+        case VIEWS.LFO_TARGET_COMPONENT: drawLfoTargetComponent(); break;
+        case VIEWS.LFO_TARGET_PARAM:     drawLfoTargetParam(); break;
+        case VIEWS.STORE_PICKER_CATEGORIES: drawStorePickerCategories(); break;
+        case VIEWS.STORE_PICKER_LIST:    drawStorePickerList(); break;
+        case VIEWS.STORE_PICKER_DETAIL:  drawStorePickerDetail(); break;
+        case VIEWS.STORE_PICKER_LOADING: drawStorePickerLoading(); break;
+        case VIEWS.STORE_PICKER_RESULT:  drawStorePickerResult(); break;
+        case VIEWS.STORE_PICKER_POST_INSTALL:
+            drawMessageOverlay('Install Complete', storePostInstallLines);
             break;
-        case VIEWS.KNOB_PARAM_PICKER:
-            if (typeof drawKnobParamPicker === "function") drawKnobParamPicker(); else drawSlots();
-            break;
-        case VIEWS.DYNAMIC_PARAM_PICKER:
-            if (typeof drawDynamicParamPicker === "function") drawDynamicParamPicker(); else drawSlots();
-            break;
-        case VIEWS.LFO_EDIT:
-            if (typeof drawLfoEdit === "function") drawLfoEdit(); else drawSlots();
-            break;
-        case VIEWS.LFO_TARGET_COMPONENT:
-            if (typeof drawLfoTargetComponent === "function") drawLfoTargetComponent(); else drawSlots();
-            break;
-        case VIEWS.LFO_TARGET_PARAM:
-            if (typeof drawLfoTargetParam === "function") drawLfoTargetParam(); else drawSlots();
-            break;
+        case VIEWS.FILEPATH_BROWSER:     drawFilepathBrowser(); break;
         default:
-            /* CHAIN_EDIT, SLOTS, CHAIN_SETTINGS, SLOT_SETTINGS, patch picker —
-             * drawSlots() dispatches by view internally for the chain-edit
-             * subtree. */
+            /* Unknown view in co-run — render slot list as a recoverable
+             * fallback so user can navigate back. */
             drawSlots();
     }
 }
