@@ -373,7 +373,11 @@ static JSValue js_shadow_set_corun_move_native(JSContext *ctx, JSValueConst this
     if (!shadow_control || argc < 1) return JS_UNDEFINED;
     int track = -1;
     if (JS_ToInt32(ctx, &track, argv[0])) return JS_UNDEFINED;
-    if (track < -1 || track >= SHADOW_UI_SLOTS) return JS_UNDEFINED;
+    /* Caller's track space (e.g. dAVEBOx 0-7), not Schwung chain slots; the
+     * shim only uses this value as a gate (>= 0 = co-run active). Bounded by
+     * int8_t storage; clamp by hand to a reasonable upper limit so a typo
+     * doesn't enable co-run on track 99. */
+    if (track < -1 || track > 7) return JS_UNDEFINED;
     shadow_control->corun_move_native_track = (int8_t)track;
     return JS_UNDEFINED;
 }
