@@ -1,4 +1,4 @@
-# Graph Report - schwung  (2026-05-30)
+# Graph Report - schwung  (2026-06-01)
 
 ## Corpus Check
 - 337 files · ~987,456 words
