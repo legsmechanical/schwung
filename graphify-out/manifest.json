@@ -252,7 +252,7 @@
     "hash": "796f0929a5965cb5bfef51593b62dbb8"
   },
   "/Users/josh/schwung/schwung-manager/remote_ui.go": {
-    "mtime": 1780098073.4553974,
+    "mtime": 1780098909.1293507,
     "hash": "99d9110e7af17a6de8113c883bc17bcf"
   },
   "/Users/josh/schwung/schwung-manager/self_heal.go": {
@@ -260,8 +260,8 @@
     "hash": "bb2d64d5b58e2fe07caf99ca387d68d9"
   },
   "/Users/josh/schwung/schwung-manager/main.go": {
-    "mtime": 1780098125.844997,
-    "hash": "a567d73a14c41adff28317da313f2640"
+    "mtime": 1780103029.2143114,
+    "hash": "2f9d15ff09258c106e0766d0b5d1d78a"
   },
   "/Users/josh/schwung/schwung-manager/middleware/security.go": {
     "mtime": 1778759503.011677,
@@ -272,7 +272,7 @@
     "hash": "ece3d975141cad1ce1681754f8fe8273"
   },
   "/Users/josh/schwung/schwung-manager/static/remote-ui.js": {
-    "mtime": 1780098073.5534256,
+    "mtime": 1780098909.2395957,
     "hash": "dfdaefcb42df9bb2ec7574d40fc0817c"
   },
   "/Users/josh/schwung/schwung-manager/static/htmx.min.js": {
@@ -280,16 +280,16 @@
     "hash": "2e713ba95db2e33981bb607ae5183305"
   },
   "/Users/josh/schwung/src/schwung_shim.c": {
-    "mtime": 1780098125.8495865,
-    "hash": "4c05b048b307a772cdcaeecbc5d3059d"
+    "mtime": 1780175391.6716266,
+    "hash": "2eae775509c5e1c577d66ec6c06a6347"
   },
   "/Users/josh/schwung/src/schwung_host.c": {
     "mtime": 1777930352.9179797,
     "hash": "0da84fbf6810ecb4d9076767548d93ee"
   },
   "/Users/josh/schwung/src/schwung-heal.c": {
-    "mtime": 1780098125.8475683,
-    "hash": "826ccf1cc924353927cea8bae4be3f8c"
+    "mtime": 1780103029.217148,
+    "hash": "e3057bbdd4aab2262962176910b81de6"
   },
   "/Users/josh/schwung/src/tools/jack_midi_connect.c": {
     "mtime": 1775587624.1373231,
@@ -300,8 +300,8 @@
     "hash": "1c99e1c42da04bdddfe6ab247c0a1207"
   },
   "/Users/josh/schwung/src/host/shadow_constants.h": {
-    "mtime": 1780098125.8459034,
-    "hash": "879b515cfc51f0067f9aaffb167fcd56"
+    "mtime": 1780175391.6638634,
+    "hash": "54c864271ba04bacf7e24bbd51549eb0"
   },
   "/Users/josh/schwung/src/host/unified_log.h": {
     "mtime": 1775587624.0876107,
@@ -324,7 +324,7 @@
     "hash": "aee5e3653de025b184811ee2ea314455"
   },
   "/Users/josh/schwung/src/host/shadow_overlay.h": {
-    "mtime": 1780098073.5617886,
+    "mtime": 1780098909.2480323,
     "hash": "4ee708bc10f4e33574d12d5149f69181"
   },
   "/Users/josh/schwung/src/host/shadow_dbus.c": {
@@ -336,7 +336,7 @@
     "hash": "1350c97a81ad6cbcecd3d202fe599711"
   },
   "/Users/josh/schwung/src/host/shadow_chain_mgmt.h": {
-    "mtime": 1780098073.5558946,
+    "mtime": 1780098909.2454543,
     "hash": "86ce16afe12b8aeb44d9d03078c2c79c"
   },
   "/Users/josh/schwung/src/host/menu_settings.mjs": {
@@ -420,11 +420,11 @@
     "hash": "02eff181348d909da0ae71756d4cd16e"
   },
   "/Users/josh/schwung/src/host/shadow_midi.c": {
-    "mtime": 1780098073.561046,
+    "mtime": 1780098909.2472665,
     "hash": "c8d366e04d0c2ce076a112d387074364"
   },
   "/Users/josh/schwung/src/host/shadow_overlay.c": {
-    "mtime": 1780098073.5614662,
+    "mtime": 1780098909.247755,
     "hash": "8f143936e3d9adb7fcfd8ce18619726a"
   },
   "/Users/josh/schwung/src/host/shadow_dbus.h": {
@@ -452,8 +452,8 @@
     "hash": "3a166ee47058eb20116834064df5633d"
   },
   "/Users/josh/schwung/src/host/shadow_led_queue.c": {
-    "mtime": 1780098125.846813,
-    "hash": "09731cf27bb79dfec75915fe44838b58"
+    "mtime": 1780175391.6647804,
+    "hash": "aef04b1ddea370b07fb3f8617d8a976d"
   },
   "/Users/josh/schwung/src/host/settings.c": {
     "mtime": 1775587624.0803041,
@@ -468,7 +468,7 @@
     "hash": "bd27b5f22f68a516acf3822b7e40725c"
   },
   "/Users/josh/schwung/src/host/shadow_chain_mgmt.c": {
-    "mtime": 1780098073.555464,
+    "mtime": 1780098909.2441435,
     "hash": "d8adc63aa3552b367b3b68f64ac1884b"
   },
   "/Users/josh/schwung/src/host/shadow_link_audio.c": {
@@ -568,16 +568,16 @@
     "hash": "c05fbe395ccdfe287632f0e1daba2838"
   },
   "/Users/josh/schwung/src/shadow/shadow_ui.c": {
-    "mtime": 1780098125.8508396,
-    "hash": "95a5e69603d14c57842909bc77d60733"
+    "mtime": 1780175391.6741295,
+    "hash": "3d373eceba3b81be8abaf56ac5175b4d"
   },
   "/Users/josh/schwung/src/shadow/shadow_ui_ctx.mjs": {
     "mtime": 1775587624.131971,
     "hash": "e3c74220770118cf3a27597d28ca50a0"
   },
   "/Users/josh/schwung/src/shadow/shadow_ui.js": {
-    "mtime": 1780098125.8546464,
-    "hash": "d0c3830dd3aa772ca977d6128c226ca2"
+    "mtime": 1780175391.6831694,
+    "hash": "45baa654e7427541a8f98ce1819fa08c"
   },
   "/Users/josh/schwung/src/shared/feedback_gate.mjs": {
     "mtime": 1777684773.562965,
@@ -656,7 +656,7 @@
     "hash": "6a5ef4d40b54be6efd26affdb17c4b29"
   },
   "/Users/josh/schwung/src/shared/menu_layout.mjs": {
-    "mtime": 1777684773.563389,
+    "mtime": 1780175391.6840944,
     "hash": "37b4599d4414fcfae0390c6ff0460014"
   },
   "/Users/josh/schwung/src/shared/sampler_overlay.mjs": {
@@ -1312,8 +1312,8 @@
     "hash": "483ad48df306f1c4cf05af3cad8468ec"
   },
   "/Users/josh/schwung/src/modules/chain/dsp/chain_host.c": {
-    "mtime": 1780098073.5640357,
-    "hash": "2c421e4c1ac2d1578c33189592e2c963"
+    "mtime": 1780175154.396177,
+    "hash": "ab510dc87882b53be0a154175ffd5c2b"
   },
   "/Users/josh/schwung/src/modules/controller/ui.js": {
     "mtime": 1775587624.118905,
@@ -1332,7 +1332,7 @@
     "hash": "6b09aeb8899372e6f479885b9922fa1d"
   },
   "/Users/josh/schwung/src/modules/midi_fx/velocity_scale/dsp/velocity_scale.c": {
-    "mtime": 1775587624.1203582,
+    "mtime": 1780175391.6662705,
     "hash": "a81852be215508f223346191d3cca20e"
   },
   "/Users/josh/schwung/src/modules/overtake/rnbo-runner/ui.js": {
@@ -1379,6 +1379,10 @@
     "mtime": 1775587624.1435862,
     "hash": "99b4401b9dfb11fd3a688b15b5ec0785"
   },
+  "/Users/josh/schwung/docs/CORUN.md": {
+    "mtime": 1780175391.1969635,
+    "hash": "d6ec99ef0310c26de3dfe461f5d83cfd"
+  },
   "/Users/josh/schwung/docs/ARCHITECTURE.md": {
     "mtime": 1777476521.6247795,
     "hash": "58079bf66f70c635a69074f14e014eb4"
@@ -1388,8 +1392,8 @@
     "hash": "ccb5a2c4758f70621002ace65321311f"
   },
   "/Users/josh/schwung/docs/API.md": {
-    "mtime": 1780098125.8420954,
-    "hash": "2f9504a0c8272eefc253fa8bb7beb4cd"
+    "mtime": 1780175391.1965792,
+    "hash": "aa5e0b4135d4ce4eac4acb55b2be8c98"
   },
   "/Users/josh/schwung/docs/SPI_PROTOCOL.md": {
     "mtime": 1777304756.8724754,
@@ -1408,8 +1412,8 @@
     "hash": "87761f34696f1912c064f0f9b432ff4e"
   },
   "/Users/josh/schwung/docs/MODULES.md": {
-    "mtime": 1780098125.8431818,
-    "hash": "fb1b47dd212c323b417c30c7914cbc26"
+    "mtime": 1780175391.1977267,
+    "hash": "f26c1ee021f3a591940e5f5b94aa6127"
   },
   "/Users/josh/schwung/docs/move-auth-api.md": {
     "mtime": 1775587623.64398,
@@ -1776,7 +1780,7 @@
     "hash": "5a1857980c481042b4fae12b8cbbefc4"
   },
   "/Users/josh/schwung/src/host/version.txt": {
-    "mtime": 1780098073.562331,
+    "mtime": 1780098909.248204,
     "hash": "a1bf0af76fb953bbaf045f86ebcf84c6"
   },
   "/Users/josh/schwung/src/modules/tools/config-test/default_system_prompt.txt": {
