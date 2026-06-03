@@ -298,15 +298,15 @@ export function handleSlotSettingsJog(delta) {
 /* ---- Select ------------------------------------------------------------- */
 
 export function handleSlotsSelect() {
-    const { selectedSlot, slots, enterChainEdit, enterMasterFxSettings, enterSendFxSettings } = ctx;
+    const { selectedSlot, slots, enterChainEdit, enterFxBusEditor } = ctx;
     if (selectedSlot < slots.length) {
         enterChainEdit(selectedSlot);
     } else if (selectedSlot === slots.length) {
-        enterMasterFxSettings();
+        enterFxBusEditor("master");
     } else if (selectedSlot === slots.length + 1) {
-        enterSendFxSettings(0);
+        enterFxBusEditor("sendA");
     } else if (selectedSlot === slots.length + 2) {
-        enterSendFxSettings(1);
+        enterFxBusEditor("sendB");
     }
 }
 
