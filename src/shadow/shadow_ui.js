@@ -171,6 +171,12 @@ import {
     enterMasterFxSettings as _enterMasterFxSettings
 } from './shadow_ui_master_fx.mjs';
 import {
+    enterSendFxSettings as _enterSendFxSettings,
+    drawSendFx as _drawSendFx,
+    handleSendFxJog, handleSendFxSelect,
+    handleSendFxBack, handleSendFxShiftSelect
+} from './shadow_ui_send_fx.mjs';
+import {
     scanForToolModules as _scanForToolModules,
     enterToolsMenu as _enterToolsMenu,
     drawToolsMenu as _drawToolsMenu,
@@ -312,7 +318,9 @@ const VIEWS = {
     LFO_EDIT: "lfoedit",                      // LFO sub-menu editor
     ANALYTICS_PROMPT: "analyticsprompt",       // First-run analytics opt-out prompt
     LFO_TARGET_COMPONENT: "lfotargetcomp",    // LFO target picker step 1: component
-    LFO_TARGET_PARAM: "lfotargetparam"        // LFO target picker step 2: parameter
+    LFO_TARGET_PARAM: "lfotargetparam",       // LFO target picker step 2: parameter
+    SEND_FX: "sendfx",                        // Send FX A/B editor
+    FX_BUS_PICKER: "fxbuspicker"              // Pick Master FX / Send A / Send B
 };
 
 /* Special action key for swap module option */
@@ -324,7 +332,9 @@ const CHAIN_COMPONENTS = [
     { key: "synth", label: "Synth", position: 1 },
     { key: "fx1", label: "FX 1", position: 2 },
     { key: "fx2", label: "FX 2", position: 3 },
-    { key: "settings", label: "Settings", position: 4 }
+    { key: "fx3", label: "FX 3", position: 4 },
+    { key: "fx4", label: "FX 4", position: 5 },
+    { key: "settings", label: "Settings", position: 6 }
 ];
 
 /* Module abbreviations cache - populated from module.json "abbrev" field */
@@ -337,10 +347,12 @@ const moduleAbbrevCache = {
 /* In-memory chain configuration (for future save/load) */
 function createEmptyChainConfig() {
     return {
-        midiFx: null,    // { module: "chord", params: {} } or null
-        synth: null,     // { module: "dexed", params: {} } or null
-        fx1: null,       // { module: "freeverb", params: {} } or null
-        fx2: null        // { module: "cloudseed", params: {} } or null
+        midiFx: null,
+        synth: null,
+        fx1: null,
+        fx2: null,
+        fx3: null,
+        fx4: null
     };
 }
 
@@ -1600,6 +1612,8 @@ function processAllUpdates() {
 const CHAIN_SETTINGS_ITEMS = [
     { key: "knobs", label: "Knobs", type: "action" },  // Opens knob assignment editor
     { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 4, step: 0.05 },
+    { key: "slot:send_a", label: "Send A", type: "float", min: 0, max: 1, step: 0.05 },
+    { key: "slot:send_b", label: "Send B", type: "float", min: 0, max: 1, step: 0.05 },
     { key: "slot:muted", label: "Muted", type: "int", min: 0, max: 1, step: 1 },
     { key: "slot:soloed", label: "Soloed", type: "int", min: 0, max: 1, step: 1 },
     { key: "slot:receive_channel", label: "Recv Ch", type: "int", min: 0, max: 16, step: 1 },
@@ -1615,6 +1629,7 @@ const CHAIN_SETTINGS_ITEMS = [
 ];
 let selectedChainSetting = 0;
 let editingChainSettingValue = false;
+let hierEditorReturnView = null;
 
 /* LFO editor state — generic context drives slot or MFX LFO */
 let lfoCtx = null;  /* Active LFO context: { lfoIdx, getParam, setParam, getTargetComponents, getTargetParams, title, returnView, returnAnnounce } */
@@ -2751,20 +2766,29 @@ function loadChainConfigFromSlot(slotIndex) {
     const midiFxModule = getSlotParam(slotIndex, "midi_fx1_module");
     const fx1Module = getSlotParam(slotIndex, "fx1_module");
     const fx2Module = getSlotParam(slotIndex, "fx2_module");
+    const fx3Module = getSlotParam(slotIndex, "fx3_module");
+    const fx4Module = getSlotParam(slotIndex, "fx4_module");
 
     const oldFx1 = cfg.fx1 ? cfg.fx1.module : null;
     const oldFx2 = cfg.fx2 ? cfg.fx2.module : null;
+    const oldFx3 = cfg.fx3 ? cfg.fx3.module : null;
+    const oldFx4 = cfg.fx4 ? cfg.fx4.module : null;
 
     cfg.synth = synthModule && synthModule !== "" ? { module: synthModule.toLowerCase(), params: {} } : null;
     cfg.midiFx = midiFxModule && midiFxModule !== "" ? { module: midiFxModule.toLowerCase(), params: {} } : null;
     cfg.fx1 = fx1Module && fx1Module !== "" ? { module: fx1Module.toLowerCase(), params: {} } : null;
     cfg.fx2 = fx2Module && fx2Module !== "" ? { module: fx2Module.toLowerCase(), params: {} } : null;
+    cfg.fx3 = fx3Module && fx3Module !== "" ? { module: fx3Module.toLowerCase(), params: {} } : null;
+    cfg.fx4 = fx4Module && fx4Module !== "" ? { module: fx4Module.toLowerCase(), params: {} } : null;
 
-    /* Clear display_name cache when FX modules change (prevents stale announcement on swap) */
     const newFx1 = cfg.fx1 ? cfg.fx1.module : null;
     const newFx2 = cfg.fx2 ? cfg.fx2.module : null;
+    const newFx3 = cfg.fx3 ? cfg.fx3.module : null;
+    const newFx4 = cfg.fx4 ? cfg.fx4.module : null;
     if (newFx1 !== oldFx1) delete fxDisplayNameCache[`${slotIndex}:fx1`];
     if (newFx2 !== oldFx2) delete fxDisplayNameCache[`${slotIndex}:fx2`];
+    if (newFx3 !== oldFx3) delete fxDisplayNameCache[`${slotIndex}:fx3`];
+    if (newFx4 !== oldFx4) delete fxDisplayNameCache[`${slotIndex}:fx4`];
 
     chainConfigs[slotIndex] = cfg;
     return cfg;
@@ -2776,7 +2800,9 @@ function getSlotModuleSignature(slotIndex) {
     const midiFxModule = getSlotParam(slotIndex, "midi_fx1_module") || "";
     const fx1Module = getSlotParam(slotIndex, "fx1_module") || "";
     const fx2Module = getSlotParam(slotIndex, "fx2_module") || "";
-    return `${synthModule}|${midiFxModule}|${fx1Module}|${fx2Module}`;
+    const fx3Module = getSlotParam(slotIndex, "fx3_module") || "";
+    const fx4Module = getSlotParam(slotIndex, "fx4_module") || "";
+    return `${synthModule}|${midiFxModule}|${fx1Module}|${fx2Module}|${fx3Module}|${fx4Module}`;
 }
 
 /* Refresh module signature for a slot and invalidate knob cache on changes */
@@ -3842,6 +3868,8 @@ function getComponentChainParams(slot, componentKey) {
     const key = componentKey === "synth" ? "synth:chain_params" :
                 componentKey === "fx1" ? "fx1:chain_params" :
                 componentKey === "fx2" ? "fx2:chain_params" :
+                componentKey === "fx3" ? "fx3:chain_params" :
+                componentKey === "fx4" ? "fx4:chain_params" :
                 componentKey === "midiFx" ? "midi_fx1:chain_params" : null;
     if (!key) return [];
 
@@ -3860,6 +3888,8 @@ function getComponentHierarchy(slot, componentKey) {
     const key = componentKey === "synth" ? "synth:ui_hierarchy" :
                 componentKey === "fx1" ? "fx1:ui_hierarchy" :
                 componentKey === "fx2" ? "fx2:ui_hierarchy" :
+                componentKey === "fx3" ? "fx3:ui_hierarchy" :
+                componentKey === "fx4" ? "fx4:ui_hierarchy" :
                 componentKey === "midiFx" ? "midi_fx1:ui_hierarchy" : null;
     if (!key) {
         debugLog(`getComponentHierarchy: no key for componentKey=${componentKey}`);
@@ -4444,6 +4474,50 @@ function buildSlotPatchJson(slotIndex, name, forAutosave, moduleChanged) {
             type: cfg.fx2.module,
             params: fx2Config,
             bypassed: parseInt(getSlotParam(slotIndex, "fx2:bypassed") || "0", 10) === 1 ? 1 : 0
+        });
+    }
+    if (cfg.fx3 && cfg.fx3.module) {
+        let fx3Config = cfg.fx3.params || {};
+        const fx3StateJson = getSlotStateWithRetry(slotIndex, "fx3:state");
+        if (fx3StateJson) {
+            try {
+                const state = JSON.parse(fx3StateJson);
+                fx3Config = { state: state };
+            } catch (e) {
+                fx3Config = { state: fx3StateJson };
+            }
+        } else if (bailIfEmpty) {
+            debugLog("buildSlotPatchJson: slot " + slotIndex +
+                     " fx3:state empty after retries — bailing (preserving existing slot_" +
+                     slotIndex + ".json)");
+            return null;
+        }
+        patch.audio_fx.push({
+            type: cfg.fx3.module,
+            params: fx3Config,
+            bypassed: parseInt(getSlotParam(slotIndex, "fx3:bypassed") || "0", 10) === 1 ? 1 : 0
+        });
+    }
+    if (cfg.fx4 && cfg.fx4.module) {
+        let fx4Config = cfg.fx4.params || {};
+        const fx4StateJson = getSlotStateWithRetry(slotIndex, "fx4:state");
+        if (fx4StateJson) {
+            try {
+                const state = JSON.parse(fx4StateJson);
+                fx4Config = { state: state };
+            } catch (e) {
+                fx4Config = { state: fx4StateJson };
+            }
+        } else if (bailIfEmpty) {
+            debugLog("buildSlotPatchJson: slot " + slotIndex +
+                     " fx4:state empty after retries — bailing (preserving existing slot_" +
+                     slotIndex + ".json)");
+            return null;
+        }
+        patch.audio_fx.push({
+            type: cfg.fx4.module,
+            params: fx4Config,
+            bypassed: parseInt(getSlotParam(slotIndex, "fx4:bypassed") || "0", 10) === 1 ? 1 : 0
         });
     }
 
@@ -6614,7 +6688,7 @@ function scanModulesForType(componentType) {
     } else if (componentType === "midiFx") {
         searchDirs = [`${MODULES_DIR}/midi_fx`];
         expectedTypes = ["midi_fx"];
-    } else if (componentType === "fx1" || componentType === "fx2") {
+    } else if (componentType === "fx1" || componentType === "fx2" || componentType === "fx3" || componentType === "fx4") {
         searchDirs = [`${MODULES_DIR}/audio_fx`];
         expectedTypes = ["audio_fx"];
     }
@@ -7347,6 +7421,12 @@ function applyComponentSelection() {
         case "fx2":
             paramKey = "fx2:module";
             break;
+        case "fx3":
+            paramKey = "fx3:module";
+            break;
+        case "fx4":
+            paramKey = "fx4:module";
+            break;
         case "midiFx":
             paramKey = "midi_fx1:module";
             break;
@@ -7447,6 +7527,10 @@ function getChainSettingValue(slot, setting) {
     if (val === null) return "-";
 
     if (setting.key === "slot:volume") {
+        const pct = Math.round(parseFloat(val) * 100);
+        return `${pct}%`;
+    }
+    if (setting.key === "slot:send_a" || setting.key === "slot:send_b") {
         const pct = Math.round(parseFloat(val) * 100);
         return `${pct}%`;
     }
@@ -7575,6 +7659,18 @@ function getKnobTargets(slot) {
     if (cfg.fx2 && cfg.fx2.module) {
         const name = getSlotParam(slot, "fx2:name") || cfg.fx2.module;
         targets.push({ id: "fx2", name: `FX2: ${name}` });
+    }
+
+    /* FX 3 */
+    if (cfg.fx3 && cfg.fx3.module) {
+        const name = getSlotParam(slot, "fx3:name") || cfg.fx3.module;
+        targets.push({ id: "fx3", name: `FX3: ${name}` });
+    }
+
+    /* FX 4 */
+    if (cfg.fx4 && cfg.fx4.module) {
+        const name = getSlotParam(slot, "fx4:name") || cfg.fx4.module;
+        targets.push({ id: "fx4", name: `FX4: ${name}` });
     }
 
     return targets;
@@ -8354,6 +8450,61 @@ function enterMasterFxHierarchyEditor(fxSlot) {
     }
 }
 
+function enterSendFxHierarchyEditor(bus, fxSlot) {
+    if (fxSlot < 0 || fxSlot >= 3) return;
+    const busKey = bus === 0 ? "a" : "b";
+    const busLabel = bus === 0 ? "Send FX A" : "Send FX B";
+    const compKey = `send_fx:${busKey}:fx${fxSlot + 1}`;
+
+    const hierJson = shadow_get_param(0, `${compKey}:ui_hierarchy`);
+    let hierarchy = null;
+    if (hierJson) {
+        try { hierarchy = JSON.parse(hierJson); } catch (e) { /* ignore */ }
+    }
+    if (!hierarchy) return;
+
+    hideOverlay();
+    invalidateKnobContextCache();
+    pendingHierKnobIndex = -1;
+    pendingHierKnobDelta = 0;
+
+    hierEditorSlot = 0;
+    hierEditorComponent = compKey;
+    hierEditorHierarchy = hierarchy;
+    hierEditorLevel = hierarchy.modes ? null : "root";
+    hierEditorPath = [];
+    hierEditorChildIndex = -1;
+    hierEditorChildCount = 0;
+    hierEditorChildLabel = "";
+    hierEditorSelectedIdx = 0;
+    hierEditorEditMode = false;
+    resetHierarchyEditState();
+    hierEditorIsMasterFx = false;
+    hierEditorMasterFxSlot = -1;
+    resetDynamicParamPickerState();
+
+    const cpJson = shadow_get_param(0, `${compKey}:chain_params`);
+    hierEditorChainParams = [];
+    if (cpJson) {
+        try { hierEditorChainParams = JSON.parse(cpJson); } catch (e) { /* ignore */ }
+    }
+
+    setupModuleParamShims(0, compKey);
+    loadHierarchyLevel();
+
+    hierEditorReturnView = VIEWS.SEND_FX;
+    setView(VIEWS.HIERARCHY_EDITOR);
+    needsRedraw = true;
+
+    const moduleName = shadow_get_param(0, `${compKey}:name`) || `FX ${fxSlot + 1}`;
+    if (hierEditorParams.length > 0) {
+        const param = hierEditorParams[0];
+        announce(`${busLabel} ${moduleName}, ${param.label || param.key}: ${param.value || ""}`);
+    } else {
+        announce(`${busLabel} ${moduleName}, No parameters`);
+    }
+}
+
 /* Load params and knobs for current hierarchy level */
 function loadHierarchyLevel() {
     if (!hierEditorHierarchy) return;
@@ -8553,7 +8704,12 @@ function exitHierarchyEditor() {
     filepathBrowserParamKey = "";
     resetDynamicParamPickerState();
 
-    view = returnToMasterFx ? VIEWS.MASTER_FX : VIEWS.CHAIN_EDIT;
+    if (hierEditorReturnView) {
+        view = hierEditorReturnView;
+        hierEditorReturnView = null;
+    } else {
+        view = returnToMasterFx ? VIEWS.MASTER_FX : VIEWS.CHAIN_EDIT;
+    }
     needsRedraw = true;
 }
 
@@ -11490,6 +11646,12 @@ function handleJog(delta) {
         case VIEWS.SLOT_SETTINGS:
             handleSlotSettingsJog(delta);
             break;
+        case VIEWS.SEND_FX:
+            handleSendFxJog(delta);
+            break;
+        case VIEWS.FX_BUS_PICKER:
+            fxBusPickerIndex = Math.max(0, Math.min(2, fxBusPickerIndex + delta));
+            break;
         case VIEWS.PATCHES:
             handlePatchesJog(delta);
             break;
@@ -11986,6 +12148,16 @@ function handleSelect() {
             break;
         case VIEWS.SLOT_SETTINGS:
             handleSlotSettingsSelect();
+            break;
+        case VIEWS.SEND_FX:
+            handleSendFxSelect();
+            break;
+        case VIEWS.FX_BUS_PICKER:
+            if (fxBusPickerIndex === 0) {
+                enterMasterFxSettings();
+            } else {
+                enterSendFxSettings(fxBusPickerIndex - 1);
+            }
             break;
         case VIEWS.PATCHES:
             handlePatchesSelect();
@@ -12844,6 +13016,17 @@ function handleBack() {
         case VIEWS.COMPONENT_PARAMS:
             handleComponentParamsBack();
             break;
+        case VIEWS.SEND_FX:
+            handleSendFxBack();
+            break;
+        case VIEWS.FX_BUS_PICKER:
+            if (coRunChainEditSlot >= 0) {
+                view = VIEWS.CHAIN_EDIT;
+                coRunView = VIEWS.CHAIN_EDIT;
+            } else {
+                exitShadowUI();
+            }
+            break;
         case VIEWS.MASTER_FX:
             if (masterShowingNamePreview) {
                 /* Cancel name preview */
@@ -12893,10 +13076,7 @@ function handleBack() {
                 needsRedraw = true;
                 announce("Master FX");
             } else {
-                /* Exit shadow mode and return to Move */
-                if (typeof shadow_request_exit === "function") {
-                    shadow_request_exit();
-                }
+                enterFxBusPicker();
             }
             break;
         case VIEWS.CHAIN_EDIT:
@@ -13046,8 +13226,9 @@ function handleBack() {
             } else {
                 /* At root level - exit hierarchy editor */
                 const wasMasterFx = hierEditorIsMasterFx;
+                const returnView = hierEditorReturnView;
                 exitHierarchyEditor();
-                announce(wasMasterFx ? "Master FX" : "Chain Editor");
+                announce(wasMasterFx ? "Master FX" : returnView === VIEWS.SEND_FX ? "Send FX" : "Chain Editor");
             }
             break;
         }
@@ -13365,12 +13546,12 @@ function drawChainEdit() {
     const cfg = chainConfigs[selectedSlot] || createEmptyChainConfig();
     const chainSelected = selectedChainComponent === -1;
 
-    /* Calculate box layout - 5 components, offset right to make room for slot indicators */
-    const BOX_W = 22;
+    /* Calculate box layout - 7 components, offset right to make room for slot indicators */
+    const BOX_W = 16;
     const BOX_H = 16;
-    const GAP = 2;
-    const TOTAL_W = 5 * BOX_W + 4 * GAP;  // 118px
-    const START_X = 6 + Math.floor((SCREEN_WIDTH - 6 - TOTAL_W) / 2);  // centered right of indicators
+    const GAP = 1;
+    const TOTAL_W = CHAIN_COMPONENTS.length * BOX_W + (CHAIN_COMPONENTS.length - 1) * GAP;
+    const START_X = 6 + Math.floor((SCREEN_WIDTH - 6 - TOTAL_W) / 2);
     const BOX_Y = 20;  // Below header
 
     /* Draw slot indicators - 4 marks in left margin, spanning from below header to footer */
@@ -13961,6 +14142,7 @@ function drawHelpDetail() {
     Object.defineProperty(_ctx, 'MASTER_FX_OPTIONS', {
         get() { return MASTER_FX_OPTIONS; }, set(v) { MASTER_FX_OPTIONS = v; }, enumerable: true
     });
+    _ctx.SEND_FX_OPTIONS = [];
     Object.defineProperty(_ctx, 'selectedMasterFxComponent', {
         get() { return selectedMasterFxComponent; }, set(v) { selectedMasterFxComponent = v; }, enumerable: true
     });
@@ -14211,6 +14393,9 @@ function drawHelpDetail() {
     _ctx.enterChainEdit = (...args) => enterChainEdit(...args);
     _ctx.enterPatchBrowser = (...args) => _enterPatchBrowser(...args);
     _ctx.enterMasterFxSettings = (...args) => enterMasterFxSettings(...args);
+    _ctx.enterSendFxSettings = (...args) => enterSendFxSettings(...args);
+    _ctx.enterFxBusPicker = () => enterFxBusPicker();
+    _ctx.enterSendFxHierarchyEditor = (...args) => enterSendFxHierarchyEditor(...args);
     _ctx.enterSlotSettings = (...args) => _enterSlotSettings(...args);
 })();
 
@@ -14228,6 +14413,34 @@ function applyPatchSelection() { _applyPatchSelection(); }
 function drawMasterFx() { _drawMasterFx(); }
 function getMasterFxDisplayName() { return _getMasterFxDisplayName(); }
 function enterMasterFxSettings() { _enterMasterFxSettings(); }
+function drawSendFx() { _drawSendFx(); }
+function enterSendFxSettings(bus) { _enterSendFxSettings(bus); }
+
+let fxBusPickerIndex = 0;
+function enterFxBusPicker() {
+    fxBusPickerIndex = 0;
+    view = VIEWS.FX_BUS_PICKER;
+    if (coRunChainEditSlot >= 0) coRunView = VIEWS.FX_BUS_PICKER;
+    needsRedraw = true;
+}
+function drawFxBusPicker() {
+    clear_screen();
+    drawHeader("FX Buses");
+    const items = [
+        { label: "Master FX", value: getMasterFxDisplayName() },
+        { label: "Send FX A", value: "" },
+        { label: "Send FX B", value: "" },
+    ];
+    drawMenuList({
+        items,
+        selectedIndex: fxBusPickerIndex,
+        listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
+        getLabel: (item) => item.label,
+        getValue: (item) => item.value,
+        valueAlignRight: true
+    });
+    drawFooter("Back: exit");
+}
 function scanForToolModules() { return _scanForToolModules(); }
 function enterToolsMenu() {
     _enterToolsMenu();
@@ -14847,6 +15060,9 @@ function dispatchCoRunDraw() {
             drawMessageOverlay('Install Complete', storePostInstallLines);
             break;
         case VIEWS.FILEPATH_BROWSER:     drawFilepathBrowser(); break;
+        case VIEWS.FX_BUS_PICKER:        drawFxBusPicker(); break;
+        case VIEWS.SEND_FX:              drawSendFx(); break;
+        case VIEWS.MASTER_FX:            drawMasterFx(); break;
         default:
             /* Unknown view in co-run — render slot list as a recoverable
              * fallback so user can navigate back. */
@@ -15067,9 +15283,11 @@ globalThis.tick = function() {
                 }
             }
             if (flags & SHADOW_UI_FLAG_JUMP_TO_MASTER_FX) {
-                /* Always jump to Master FX view */
-                enterMasterFxSettings();
-                /* Clear the flag */
+                if (coRunChainEditSlot >= 0) {
+                    coRunView = VIEWS.FX_BUS_PICKER;
+                } else {
+                    enterFxBusPicker();
+                }
                 if (typeof shadow_clear_ui_flags === "function") {
                     shadow_clear_ui_flags(SHADOW_UI_FLAG_JUMP_TO_MASTER_FX);
                 }
@@ -15429,7 +15647,7 @@ globalThis.tick = function() {
     /* Poll FX display_name for change-based announcements (e.g. key detection).
      * Check every ~1 second (30 ticks at 30fps). Only poll slots that have FX loaded. */
     if (!isOvertakeActive && refreshCounter % 30 === 0) {
-        const fxComponents = ["fx1", "fx2"];
+        const fxComponents = ["fx1", "fx2", "fx3", "fx4"];
         /* Per-slot FX */
         for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
             const cfg = chainConfigs[i];
@@ -15616,6 +15834,7 @@ globalThis.tick = function() {
         }
     }
 
+
     switch (view) {
         case VIEWS.SLOTS:
             drawSlots();
@@ -15634,6 +15853,12 @@ globalThis.tick = function() {
             break;
         case VIEWS.MASTER_FX:
             drawMasterFx();
+            break;
+        case VIEWS.SEND_FX:
+            drawSendFx();
+            break;
+        case VIEWS.FX_BUS_PICKER:
+            drawFxBusPicker();
             break;
         case VIEWS.CHAIN_EDIT:
             drawChainEdit();
@@ -16120,6 +16345,13 @@ globalThis.onMidiMessageInternal = function(data) {
              * Eating it here prevents the tool from reacting (e.g. its own
              * Shift+button shortcuts while you're navigating the editor). */
             if (d1 === 49 && coRunCedes(CORUN_GRP_SHIFT)) {
+                needsRedraw = true;
+                return;
+            }
+            /* Menu (CC 50): open FX bus picker during co-run */
+            if (d1 === 50 && d2 > 0) {
+                coRunView = VIEWS.FX_BUS_PICKER;
+                runCoRunChainEdit(function() { enterFxBusPicker(); });
                 needsRedraw = true;
                 return;
             }
