@@ -198,6 +198,21 @@ file build/move-anything
 **SSH connection issues**
 Add your public key at http://move.local/development/ssh
 
+**Phantom "regressions" after editing shared headers or pulling/rebasing (stale incremental build)**
+
+`build.sh` is **incremental** and tracks dependencies via hand-maintained lists
+in its `needs_rebuild` helper — there is **no compiler `-MMD` auto-dependency
+tracking**. If a shared header changes but a target's list doesn't name it, that
+target is silently skipped, leaving **mismatched binaries**: e.g. the host built
+against an old `shadow_constants.h` shared-memory layout while the shim/modules
+use the new one. The symptoms mimic real feature bugs — parameters that don't
+apply, values that read back empty, LFO targets that "revert" — and can send you
+chasing code bugs that don't exist.
+
+Two defenses:
+- **Deploy from a clean build:** `./scripts/clean.sh && ./scripts/build.sh && ./scripts/install.sh local`. A clean build can never produce mismatched binaries. A partial rebuild (e.g. `rm build/schwung`) is **not** enough — the rest stays cached.
+- The host target now depends on all of `src/host/*.h`, so SHM-layout headers can't be missed. When adding a new shared-memory participant target, list its shared headers (or glob) in `needs_rebuild`.
+
 ## Module Development
 
 Rebuild a single module:
