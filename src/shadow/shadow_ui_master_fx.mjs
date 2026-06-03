@@ -26,7 +26,7 @@ import {
 export function enterMasterFxSettings() {
     const { scanForAudioFxModules, loadMasterFxChainConfig,
             getMasterFxSlotModule, MASTER_FX_CHAIN_COMPONENTS,
-            setView, VIEWS } = ctx;
+            activeFxBus, setView, VIEWS } = ctx;
 
     ctx.MASTER_FX_OPTIONS = scanForAudioFxModules();
     loadMasterFxChainConfig();
@@ -37,15 +37,16 @@ export function enterMasterFxSettings() {
 
     const comp = MASTER_FX_CHAIN_COMPONENTS[0];
     const moduleName = getMasterFxSlotModule(0) || "Empty";
-    announce(`Master FX, ${comp.label} ${moduleName}`);
+    announce(`${activeFxBus.title}, ${comp.label} ${moduleName}`);
 }
 
 /* ---- Display name (used in slot list) ----------------------------------- */
 
 export function getMasterFxDisplayName() {
-    const { masterFxConfig } = ctx;
+    const { masterFxConfig, activeFxBus } = ctx;
+    const slotCount = activeFxBus ? activeFxBus.slotCount : 4;
     const parts = [];
-    for (let i = 1; i <= 4; i++) {
+    for (let i = 1; i <= slotCount; i++) {
         const key = `fx${i}`;
         if (masterFxConfig[key]?.module) {
             parts.push(masterFxConfig[key].module);
@@ -62,7 +63,7 @@ export function drawMasterFx() {
             inMasterPresetPicker, inMasterFxSettingsMenu,
             selectingMasterFxModule, selectedMasterFxComponent,
             masterFxConfig, MASTER_FX_CHAIN_COMPONENTS, MASTER_FX_OPTIONS,
-            currentMasterPresetName, getMasterFxParam,
+            currentMasterPresetName, getMasterFxParam, activeFxBus,
             getModuleAbbrev, isTextEntryActive, drawTextEntry,
             drawHelpDetail, drawHelpList } = ctx;
 
@@ -112,7 +113,7 @@ export function drawMasterFx() {
         return;
     }
 
-    drawHeader("Master FX");
+    drawHeader(activeFxBus.title);
 
     const BOX_W = 22;
     const BOX_H = 16;
@@ -157,7 +158,7 @@ export function drawMasterFx() {
             const comp = MASTER_FX_CHAIN_COMPONENTS[i];
             if (comp.key === "settings") continue;
             const bypassed = parseInt(
-                shadow_get_param(0, `master_fx:${comp.key}:bypassed`) || "0", 10
+                shadow_get_param(0, activeFxBus.paramPrefix + comp.key + ":bypassed") || "0", 10
             ) === 1;
             if (!bypassed) continue;
             const x = START_X + i * (BOX_W + GAP);
@@ -171,8 +172,9 @@ export function drawMasterFx() {
         }
     }
 
-    /* Draw LFO indicators above targeted FX boxes */
-    if (typeof shadow_get_param === "function") {
+    /* Draw LFO indicators above targeted FX boxes (master bus only — sends
+     * have no LFOs). */
+    if (activeFxBus.hasLfo && typeof shadow_get_param === "function") {
         const mfxLfoTargets = {};
         for (let li = 1; li <= 2; li++) {
             const enabled = shadow_get_param(0, "master_fx:lfo" + li + ":enabled");
@@ -280,9 +282,9 @@ export function drawMasterFx() {
 
 function drawMasterFxSettingsMenu() {
     const { currentMasterPresetName, selectedMasterFxSetting,
-            getMasterFxSettingsItems, getMasterFxSettingValue } = ctx;
+            getMasterFxSettingsItems, getMasterFxSettingValue, activeFxBus } = ctx;
 
-    const title = currentMasterPresetName || "Master FX";
+    const title = currentMasterPresetName || activeFxBus.title;
     drawHeader(truncateText(title, 18));
 
     const items = getMasterFxSettingsItems();
@@ -330,9 +332,9 @@ function drawMasterFxModuleSelect() {
 
 function drawMasterPresetPicker() {
     const { masterPresets, selectedMasterPresetIndex,
-            currentMasterPresetName } = ctx;
+            currentMasterPresetName, activeFxBus } = ctx;
 
-    drawHeader("Master Presets");
+    drawHeader(activeFxBus.presetPickerTitle);
 
     const items = [{ name: "[New]", index: -1 }];
     for (let i = 0; i < masterPresets.length; i++) {

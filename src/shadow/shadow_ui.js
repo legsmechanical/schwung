@@ -171,12 +171,6 @@ import {
     enterMasterFxSettings as _enterMasterFxSettings
 } from './shadow_ui_master_fx.mjs';
 import {
-    enterSendFxSettings as _enterSendFxSettings,
-    drawSendFx as _drawSendFx,
-    handleSendFxJog, handleSendFxSelect,
-    handleSendFxBack, handleSendFxShiftSelect
-} from './shadow_ui_send_fx.mjs';
-import {
     scanForToolModules as _scanForToolModules,
     enterToolsMenu as _enterToolsMenu,
     drawToolsMenu as _drawToolsMenu,
@@ -319,7 +313,6 @@ const VIEWS = {
     ANALYTICS_PROMPT: "analyticsprompt",       // First-run analytics opt-out prompt
     LFO_TARGET_COMPONENT: "lfotargetcomp",    // LFO target picker step 1: component
     LFO_TARGET_PARAM: "lfotargetparam",       // LFO target picker step 2: parameter
-    SEND_FX: "sendfx",                        // Send FX A/B editor
     FX_BUS_PICKER: "fxbuspicker"              // Pick Master FX / Send A / Send B
 };
 
@@ -866,6 +859,78 @@ const MASTER_FX_CHAIN_COMPONENTS = [
     { key: "fx4", label: "FX 4", position: 3, paramPrefix: "master_fx:fx4:" },
     { key: "settings", label: "Settings", position: 4, paramPrefix: "" }
 ];
+
+/* ---- FX bus descriptors -------------------------------------------------- *
+ * One editor (shadow_ui_master_fx.mjs + the helpers below) serves Master FX,
+ * Send A, and Send B. The FX bus picker selects the active bus before entry.
+ * Sends are identical to Master minus LFOs (hasLfo:false), with a different
+ * param prefix and (Phase 2 checkpoint B) their own per-bus presets + return
+ * level. Descriptors are plain object literals (QuickJS: no member-expression
+ * keys). Only one editor is open at a time, so the editor's transient state
+ * (selection, masterFxConfig, preset list) is shared and repopulated per bus
+ * on entry — no per-bus copies needed. */
+const SEND_FX_COMPONENTS_A = [
+    { key: "fx1", label: "FX 1", position: 0, paramPrefix: "send_fx:a:fx1:" },
+    { key: "fx2", label: "FX 2", position: 1, paramPrefix: "send_fx:a:fx2:" },
+    { key: "fx3", label: "FX 3", position: 2, paramPrefix: "send_fx:a:fx3:" },
+    { key: "settings", label: "Settings", position: 3, paramPrefix: "" }
+];
+const SEND_FX_COMPONENTS_B = [
+    { key: "fx1", label: "FX 1", position: 0, paramPrefix: "send_fx:b:fx1:" },
+    { key: "fx2", label: "FX 2", position: 1, paramPrefix: "send_fx:b:fx2:" },
+    { key: "fx3", label: "FX 3", position: 2, paramPrefix: "send_fx:b:fx3:" },
+    { key: "settings", label: "Settings", position: 3, paramPrefix: "" }
+];
+const FX_BUS = {
+    master: {
+        id: "master", title: "Master FX", paramPrefix: "master_fx:",
+        slotCount: 4, hasLfo: true, persistConfig: true,
+        volumeKey: "master_fx:volume", components: MASTER_FX_CHAIN_COMPONENTS,
+        presetPickerTitle: "Master Presets",
+        presetJsonRoot: "master_fx",
+        presetCountKey: "master_preset_count",
+        presetNamePrefix: "master_preset_name_",
+        presetJsonPrefix: "master_preset_json_",
+        presetSaveKey: "save_master_preset",
+        presetUpdateKey: "update_master_preset",
+        presetDeleteKey: "delete_master_preset"
+    },
+    sendA: {
+        id: "sendA", title: "Send FX A", paramPrefix: "send_fx:a:",
+        slotCount: 3, hasLfo: false, persistConfig: false,
+        volumeKey: "send_fx:a:return_level", components: SEND_FX_COMPONENTS_A,
+        presetPickerTitle: "Send FX A Presets",
+        presetJsonRoot: "send_fx",
+        presetCountKey: "send_a_preset_count",
+        presetNamePrefix: "send_a_preset_name_",
+        presetJsonPrefix: "send_a_preset_json_",
+        presetSaveKey: "save_send_a_preset",
+        presetUpdateKey: "update_send_a_preset",
+        presetDeleteKey: "delete_send_a_preset"
+    },
+    sendB: {
+        id: "sendB", title: "Send FX B", paramPrefix: "send_fx:b:",
+        slotCount: 3, hasLfo: false, persistConfig: false,
+        volumeKey: "send_fx:b:return_level", components: SEND_FX_COMPONENTS_B,
+        presetPickerTitle: "Send FX B Presets",
+        presetJsonRoot: "send_fx",
+        presetCountKey: "send_b_preset_count",
+        presetNamePrefix: "send_b_preset_name_",
+        presetJsonPrefix: "send_b_preset_json_",
+        presetSaveKey: "save_send_b_preset",
+        presetUpdateKey: "update_send_b_preset",
+        presetDeleteKey: "delete_send_b_preset"
+    }
+};
+/* Active bus for the FX editor. Set by the FX bus picker; persists through the
+ * editor's sub-views. Defaults to master. */
+let activeFxBus = FX_BUS.master;
+
+/* Build a slot param key for the active bus, e.g.
+ *   master: master_fx:fx2:bypassed   sendA: send_fx:a:fx2:bypassed */
+function fxBusSlotKey(slotIdx, leaf) {
+    return activeFxBus.paramPrefix + "fx" + (slotIdx + 1) + ":" + leaf;
+}
 
 /* Master FX chain editing state */
 let masterFxConfig = {
@@ -3911,9 +3976,8 @@ function getComponentHierarchy(slot, componentKey) {
 
 /* Fetch chain_params metadata from a Master FX slot */
 function getMasterFxChainParams(fxSlot) {
-    if (fxSlot < 0 || fxSlot >= 4) return [];
-    const fxKey = `fx${fxSlot + 1}`;
-    const key = `master_fx:${fxKey}:chain_params`;
+    if (fxSlot < 0 || fxSlot >= activeFxBus.slotCount) return [];
+    const key = fxBusSlotKey(fxSlot, "chain_params");
     const json = shadow_get_param(0, key);
     if (!json) return [];
     try {
@@ -3925,9 +3989,8 @@ function getMasterFxChainParams(fxSlot) {
 
 /* Fetch ui_hierarchy from a Master FX slot */
 function getMasterFxHierarchy(fxSlot) {
-    if (fxSlot < 0 || fxSlot >= 4) return null;
-    const fxKey = `fx${fxSlot + 1}`;
-    const key = `master_fx:${fxKey}:ui_hierarchy`;
+    if (fxSlot < 0 || fxSlot >= activeFxBus.slotCount) return null;
+    const key = fxBusSlotKey(fxSlot, "ui_hierarchy");
     const json = shadow_get_param(0, key);
     if (!json) return null;
     try {
@@ -4730,12 +4793,12 @@ function announceSavePreview(name, selectedIndex, full = true) {
 
 function loadMasterPresetList() {
     masterPresets = [];
-    const countStr = getSlotParam(0, "master_preset_count");
+    const countStr = getSlotParam(0, activeFxBus.presetCountKey);
     const count = parseInt(countStr, 10) || 0;
     debugLog(`loadMasterPresetList: countStr='${countStr}' count=${count}`);
 
     for (let i = 0; i < count; i++) {
-        const name = getSlotParam(0, `master_preset_name_${i}`) || `Preset ${i + 1}`;
+        const name = getSlotParam(0, `${activeFxBus.presetNamePrefix}${i}`) || `Preset ${i + 1}`;
         /* Hex dump first 20 chars to debug garbage issue */
         let hex = "";
         for (let j = 0; j < Math.min(20, name.length); j++) {
@@ -4753,7 +4816,7 @@ function enterMasterPresetPicker() {
     needsRedraw = true;
 
     /* Announce menu title + initial selection */
-    announce("Master Presets, [New]");
+    announce(`${activeFxBus.presetPickerTitle}, [New]`);
 }
 
 function exitMasterPresetPicker() {
@@ -4774,7 +4837,7 @@ function findMasterPresetByName(name) {
 
 function generateMasterPresetName() {
     const parts = [];
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < activeFxBus.slotCount; i++) {
         const key = `fx${i + 1}`;
         const moduleId = masterFxConfig[key]?.module;
         if (moduleId) {
@@ -4782,12 +4845,12 @@ function generateMasterPresetName() {
             parts.push(abbrev);
         }
     }
-    return parts.length > 0 ? parts.join(" + ") : "Master FX";
+    return parts.length > 0 ? parts.join(" + ") : activeFxBus.title;
 }
 
 function clearMasterFx() {
-    /* Clear all 4 FX slots */
-    for (let i = 0; i < 4; i++) {
+    /* Clear all FX slots on the active bus */
+    for (let i = 0; i < activeFxBus.slotCount; i++) {
         setMasterFxSlotModule(i, "");
         masterFxConfig[`fx${i + 1}`].module = "";
     }
@@ -4798,15 +4861,15 @@ function clearMasterFx() {
 
 function loadMasterPreset(index, presetName) {
     /* Get preset JSON from DSP */
-    const json = getSlotParam(0, `master_preset_json_${index}`);
+    const json = getSlotParam(0, `${activeFxBus.presetJsonPrefix}${index}`);
     if (!json) return;
 
     try {
         const preset = JSON.parse(json);
-        const fx = preset.master_fx || {};
+        const fx = preset[activeFxBus.presetJsonRoot] || {};
 
         /* Apply each FX slot */
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < activeFxBus.slotCount; i++) {
             const key = `fx${i + 1}`;
             const fxConfig = fx[key];
             if (fxConfig && fxConfig.type) {
@@ -4819,12 +4882,12 @@ function loadMasterPreset(index, presetName) {
                     /* Restore plugin_id first (CLAP sub-plugin selection) */
                     if (fxConfig.params && typeof shadow_set_param === "function") {
                         if (fxConfig.params.plugin_id) {
-                            shadow_set_param(0, `master_fx:${key}:plugin_id`, fxConfig.params.plugin_id);
+                            shadow_set_param(0, fxBusSlotKey(i, "plugin_id"), fxConfig.params.plugin_id);
                         }
                         /* Restore remaining params */
                         for (const [pkey, pval] of Object.entries(fxConfig.params)) {
                             if (pkey !== "plugin_id") {
-                                shadow_set_param(0, `master_fx:${key}:${pkey}`, String(pval));
+                                shadow_set_param(0, fxBusSlotKey(i, pkey), String(pval));
                             }
                         }
                     }
@@ -4839,17 +4902,19 @@ function loadMasterPreset(index, presetName) {
             }
         }
 
-        /* Restore master FX LFO configs */
-        for (let li = 1; li <= 2; li++) {
-            const lfoConfig = preset["lfo" + li];
-            if (lfoConfig && typeof shadow_set_param === "function") {
-                restoreMasterFxLfo(li, lfoConfig);
-            } else {
-                /* No LFO in preset — disable */
-                if (typeof shadow_set_param === "function") {
-                    shadow_set_param(0, "master_fx:lfo" + li + ":enabled", "0");
-                    shadow_set_param(0, "master_fx:lfo" + li + ":target", "");
-                    shadow_set_param(0, "master_fx:lfo" + li + ":target_param", "");
+        /* Restore FX LFO configs (master bus only — sends have no LFOs) */
+        if (activeFxBus.hasLfo) {
+            for (let li = 1; li <= 2; li++) {
+                const lfoConfig = preset["lfo" + li];
+                if (lfoConfig && typeof shadow_set_param === "function") {
+                    restoreMasterFxLfo(li, lfoConfig);
+                } else {
+                    /* No LFO in preset — disable */
+                    if (typeof shadow_set_param === "function") {
+                        shadow_set_param(0, "master_fx:lfo" + li + ":enabled", "0");
+                        shadow_set_param(0, "master_fx:lfo" + li + ":target", "");
+                        shadow_set_param(0, "master_fx:lfo" + li + ":target_param", "");
+                    }
                 }
             }
         }
@@ -4867,15 +4932,15 @@ function loadMasterPreset(index, presetName) {
 
 /* Build JSON for saving master preset */
 function buildMasterPresetJson(name) {
-    const preset = {
-        custom_name: name,
-        fx1: null,
-        fx2: null,
-        fx3: null,
-        fx4: null
-    };
+    /* Flat fx1..N + custom_name. The DSP side re-roots this under the bus's
+     * presetJsonRoot ("master_fx" / "send_fx") on save; loadMasterPreset reads
+     * it back from that root. */
+    const preset = { custom_name: name };
+    for (let i = 0; i < activeFxBus.slotCount; i++) {
+        preset[`fx${i + 1}`] = null;
+    }
 
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < activeFxBus.slotCount; i++) {
         const key = `fx${i + 1}`;
         const moduleId = masterFxConfig[key]?.module;
         if (moduleId) {
@@ -4887,7 +4952,7 @@ function buildMasterPresetJson(name) {
             /* Capture plugin_id (for CLAP sub-plugin selection) */
             if (typeof shadow_get_param === "function") {
                 try {
-                    const pluginId = shadow_get_param(0, `master_fx:${key}:plugin_id`);
+                    const pluginId = shadow_get_param(0, fxBusSlotKey(i, "plugin_id"));
                     if (pluginId) {
                         slotPreset.params["plugin_id"] = pluginId;
                     }
@@ -4898,7 +4963,7 @@ function buildMasterPresetJson(name) {
                     const chainParams = getMasterFxChainParams(i);
                     if (chainParams && chainParams.length > 0) {
                         for (const p of chainParams) {
-                            const val = shadow_get_param(0, `master_fx:${key}:${p.key}`);
+                            const val = shadow_get_param(0, fxBusSlotKey(i, p.key));
                             if (val !== null && val !== undefined && val !== "") {
                                 slotPreset.params[p.key] = val;
                             }
@@ -4911,14 +4976,16 @@ function buildMasterPresetJson(name) {
         }
     }
 
-    /* Include master FX LFO configs */
-    for (let li = 1; li <= 2; li++) {
-        try {
-            const configJson = shadow_get_param(0, "master_fx:lfo" + li + ":config");
-            if (configJson) {
-                preset["lfo" + li] = JSON.parse(configJson);
-            }
-        } catch (e) {}
+    /* Include FX LFO configs (master bus only) */
+    if (activeFxBus.hasLfo) {
+        for (let li = 1; li <= 2; li++) {
+            try {
+                const configJson = shadow_get_param(0, "master_fx:lfo" + li + ":config");
+                if (configJson) {
+                    preset["lfo" + li] = JSON.parse(configJson);
+                }
+            } catch (e) {}
+        }
     }
 
     return JSON.stringify(preset);
@@ -4930,10 +4997,10 @@ function doSaveMasterPreset(name) {
 
     if (masterOverwriteTargetIndex >= 0) {
         /* Overwriting existing preset */
-        setSlotParam(0, "update_master_preset", masterOverwriteTargetIndex + ":" + json);
+        setSlotParam(0, activeFxBus.presetUpdateKey, masterOverwriteTargetIndex + ":" + json);
     } else {
         /* Creating new preset */
-        setSlotParam(0, "save_master_preset", json);
+        setSlotParam(0, activeFxBus.presetSaveKey, json);
     }
 
     currentMasterPresetName = name;
@@ -5159,7 +5226,7 @@ function handleMasterFxSettingsAction(key) {
 function doDeleteMasterPreset() {
     const index = findMasterPresetByName(currentMasterPresetName);
     if (index >= 0) {
-        setSlotParam(0, "delete_master_preset", String(index));
+        setSlotParam(0, activeFxBus.presetDeleteKey, String(index));
     }
 
     /* Clear current preset and return to picker */
@@ -6025,15 +6092,15 @@ function handleGlobalSettingsAction(key) {
 
 /* Load master FX chain configuration from DSP */
 function loadMasterFxChainConfig() {
-    masterFxConfig = {
-        fx1: { module: "" },
-        fx2: { module: "" },
-        fx3: { module: "" },
-        fx4: { module: "" }
-    };
+    /* Rebuild masterFxConfig for the active bus's slot count. Shared object,
+     * repopulated on each editor entry (only one bus open at a time). */
+    masterFxConfig = {};
+    for (let i = 1; i <= activeFxBus.slotCount; i++) {
+        masterFxConfig[`fx${i}`] = { module: "" };
+    }
 
     /* Query each slot's module from DSP */
-    for (let i = 1; i <= 4; i++) {
+    for (let i = 1; i <= activeFxBus.slotCount; i++) {
         const key = `fx${i}`;
         const moduleId = getMasterFxSlotModule(i - 1);
         masterFxConfig[key].module = moduleId || "";
@@ -6044,30 +6111,30 @@ function loadMasterFxChainConfig() {
 function getMasterFxParam(slotIndex, key) {
     if (typeof shadow_get_param !== "function") return "";
     try {
-        return shadow_get_param(0, `master_fx:fx${slotIndex + 1}:${key}`) || "";
+        return shadow_get_param(0, fxBusSlotKey(slotIndex, key)) || "";
     } catch (e) {
         return "";
     }
 }
 
-/* Get module ID loaded in a master FX slot (0-3) */
+/* Get module ID loaded in an FX slot (0-based) on the active bus */
 function getMasterFxSlotModule(slotIndex) {
     if (typeof shadow_get_param !== "function") return "";
     try {
         /* Query returns the module_id from the shim */
-        return shadow_get_param(0, `master_fx:fx${slotIndex + 1}:name`) || "";
+        return shadow_get_param(0, fxBusSlotKey(slotIndex, "name")) || "";
     } catch (e) {
         return "";
     }
 }
 
-/* Set module for a master FX slot */
+/* Set module for an FX slot on the active bus */
 function setMasterFxSlotModule(slotIndex, dspPath) {
     if (typeof shadow_set_param !== "function") return false;
     /* Clear warning tracking for this slot so warning can show again for new module */
     warningShownForMasterFx.delete(slotIndex);
     try {
-        return shadow_set_param(0, `master_fx:fx${slotIndex + 1}:module`, dspPath || "");
+        return shadow_set_param(0, fxBusSlotKey(slotIndex, "module"), dspPath || "");
     } catch (e) {
         return false;
     }
@@ -6075,7 +6142,7 @@ function setMasterFxSlotModule(slotIndex, dspPath) {
 
 /* Enter module selection for a Master FX slot */
 function enterMasterFxModuleSelect(componentIndex) {
-    const comp = MASTER_FX_CHAIN_COMPONENTS[componentIndex];
+    const comp = activeFxBus.components[componentIndex];
     if (!comp || comp.key === "settings") return;
 
     /* Set selection index to current module if any */
@@ -6093,7 +6160,7 @@ function enterMasterFxModuleSelect(componentIndex) {
 
 /* Apply module selection for Master FX slot */
 function applyMasterFxModuleSelection() {
-    const comp = MASTER_FX_CHAIN_COMPONENTS[selectedMasterFxComponent];
+    const comp = activeFxBus.components[selectedMasterFxComponent];
     if (!comp || comp.key === "settings") return;
 
     const selected = MASTER_FX_OPTIONS[selectedMasterFxModuleIndex];
@@ -6118,6 +6185,10 @@ function applyMasterFxModuleSelection() {
 
 /* Save master FX chain configuration */
 function saveMasterFxChainConfig() {
+    /* Master-bus-only: persists Master FX to shadow_config.json + per-slot
+     * state files for boot restore. Send buses persist through the DSP send-FX
+     * state path (Phase 1), so this is a no-op for them. */
+    if (!activeFxBus.persistConfig) return;
     /* The shim persists the state, but we also save to shadow config */
     try {
         const configPath = "/data/UserData/schwung/shadow_config.json";
@@ -8494,7 +8565,8 @@ function enterSendFxHierarchyEditor(bus, fxSlot) {
     setupModuleParamShims(0, compKey);
     loadHierarchyLevel();
 
-    hierEditorReturnView = VIEWS.SEND_FX;
+    /* Sends now live in the shared generic editor (MASTER_FX view); return there. */
+    hierEditorReturnView = VIEWS.MASTER_FX;
     setView(VIEWS.HIERARCHY_EDITOR);
     needsRedraw = true;
 
@@ -9215,8 +9287,11 @@ function buildKnobContextForKnob(knobIndex) {
         }
     }
 
-    /* Master FX view with FX slot selected */
-    if (view === VIEWS.MASTER_FX && selectedMasterFxComponent >= 0 && selectedMasterFxComponent < 4) {
+    /* Master FX view with FX slot selected. Home-screen knob (71-78) param
+     * control is master-only for now; sends edit FX params via the hierarchy
+     * editor (Checkpoint A). */
+    if (view === VIEWS.MASTER_FX && activeFxBus.id === "master" &&
+        selectedMasterFxComponent >= 0 && selectedMasterFxComponent < activeFxBus.slotCount) {
         const comp = MASTER_FX_CHAIN_COMPONENTS[selectedMasterFxComponent];
         if (comp && comp.key !== "settings") {
             const chainParams = getMasterFxChainParams(selectedMasterFxComponent);
@@ -11211,7 +11286,7 @@ function changeComponentPreset(delta) {
 /* Get Master FX setting current value for display */
 function getMasterFxSettingValue(setting) {
     if (setting.key === "master_volume") {
-        const val = shadow_get_param(0, "master_fx:volume");
+        const val = shadow_get_param(0, activeFxBus.volumeKey);
         if (!val) return "100%";
         const num = parseFloat(val);
         return isNaN(num) ? val : `${Math.round(num * 100)}%`;
@@ -11324,10 +11399,10 @@ function adjustMasterFxSetting(setting, delta) {
     if (setting.type === "action") return;
 
     if (setting.key === "master_volume") {
-        let val = parseFloat(shadow_get_param(0, "master_fx:volume") || "1.0");
+        let val = parseFloat(shadow_get_param(0, activeFxBus.volumeKey) || "1.0");
         val += delta * setting.step;
         val = Math.max(setting.min, Math.min(setting.max, val));
-        shadow_set_param(0, "master_fx:volume", val.toFixed(2));
+        shadow_set_param(0, activeFxBus.volumeKey, val.toFixed(2));
         return;
     }
 
@@ -11659,11 +11734,11 @@ function handleJog(delta) {
             } else {
                 /* Navigate chain components (-1 = preset selection, like instrument slots)
                  * Preset picker is only accessible via click, not scroll */
-                selectedMasterFxComponent = Math.max(-1, Math.min(MASTER_FX_CHAIN_COMPONENTS.length - 1, selectedMasterFxComponent + delta));
+                selectedMasterFxComponent = Math.max(-1, Math.min(activeFxBus.components.length - 1, selectedMasterFxComponent + delta));
                 if (selectedMasterFxComponent === -1) {
                     announce("Preset Selection");
                 } else {
-                    const comp = MASTER_FX_CHAIN_COMPONENTS[selectedMasterFxComponent];
+                    const comp = activeFxBus.components[selectedMasterFxComponent];
                     const compKey = comp.key;
                     const moduleName = masterFxConfig?.[compKey]?.module || "Empty";
                     announceMenuItem(comp.label, moduleName);
@@ -11672,9 +11747,6 @@ function handleJog(delta) {
             break;
         case VIEWS.SLOT_SETTINGS:
             handleSlotSettingsJog(delta);
-            break;
-        case VIEWS.SEND_FX:
-            handleSendFxJog(delta);
             break;
         case VIEWS.FX_BUS_PICKER:
             fxBusPickerIndex = Math.max(0, Math.min(2, fxBusPickerIndex + delta));
@@ -12128,7 +12200,7 @@ function handleSelect() {
                 /* Preset selected - enter preset picker */
                 enterMasterPresetPicker();
             } else {
-                const selectedComp = MASTER_FX_CHAIN_COMPONENTS[selectedMasterFxComponent];
+                const selectedComp = activeFxBus.components[selectedMasterFxComponent];
                 if (selectedComp.key === "settings") {
                     /* Enter settings submenu */
                     inMasterFxSettingsMenu = true;
@@ -12140,15 +12212,15 @@ function handleSelect() {
                     if (items.length > 0) {
                         const item = items[0];
                         const value = getMasterFxSettingValue(item);
-                        announce(`Master FX Settings, ${item.label}: ${value}`);
+                        announce(`${activeFxBus.title} Settings, ${item.label}: ${value}`);
                     }
                 } else {
                     /* FX slot - check if module is loaded with hierarchy */
                     const moduleData = masterFxConfig[selectedComp.key];
 
-                    /* Mute+JogClick: toggle bypass on a populated MFX slot */
+                    /* Mute+JogClick: toggle bypass on a populated slot */
                     if (hostMuteHeld && moduleData && moduleData.module) {
-                        const fullKey = `master_fx:${selectedComp.key}:bypassed`;
+                        const fullKey = activeFxBus.paramPrefix + selectedComp.key + ":bypassed";
                         const cur = parseInt(shadow_get_param(0, fullKey) || "0", 10);
                         const next = cur ? 0 : 1;
                         shadow_set_param(0, fullKey, String(next));
@@ -12158,13 +12230,18 @@ function handleSelect() {
                     }
 
                     if (moduleData && moduleData.module) {
-                        /* Module is loaded - try hierarchy editor first */
-                        const hierarchy = getMasterFxHierarchy(selectedMasterFxComponent);
-                        if (hierarchy) {
-                            enterMasterFxHierarchyEditor(selectedMasterFxComponent);
+                        /* Module is loaded - open the param editor. Sends use the
+                         * dedicated send hierarchy editor; master uses its own. */
+                        if (activeFxBus.id === "master") {
+                            const hierarchy = getMasterFxHierarchy(selectedMasterFxComponent);
+                            if (hierarchy) {
+                                enterMasterFxHierarchyEditor(selectedMasterFxComponent);
+                            } else {
+                                enterMasterFxModuleSelect(selectedMasterFxComponent);
+                            }
                         } else {
-                            /* No hierarchy - enter module selection to swap */
-                            enterMasterFxModuleSelect(selectedMasterFxComponent);
+                            const busIdx = (activeFxBus.id === "sendB") ? 1 : 0;
+                            enterSendFxHierarchyEditor(busIdx, selectedMasterFxComponent);
                         }
                     } else {
                         /* No module loaded - enter module selection */
@@ -12176,14 +12253,11 @@ function handleSelect() {
         case VIEWS.SLOT_SETTINGS:
             handleSlotSettingsSelect();
             break;
-        case VIEWS.SEND_FX:
-            handleSendFxSelect();
-            break;
         case VIEWS.FX_BUS_PICKER:
             if (fxBusPickerIndex === 0) {
-                enterMasterFxSettings();
+                enterFxBusEditor("master");
             } else {
-                enterSendFxSettings(fxBusPickerIndex - 1);
+                enterFxBusEditor(fxBusPickerIndex === 1 ? "sendA" : "sendB");
             }
             break;
         case VIEWS.PATCHES:
@@ -13043,9 +13117,6 @@ function handleBack() {
         case VIEWS.COMPONENT_PARAMS:
             handleComponentParamsBack();
             break;
-        case VIEWS.SEND_FX:
-            handleSendFxBack();
-            break;
         case VIEWS.FX_BUS_PICKER:
             if (coRunChainEditSlot >= 0) {
                 view = VIEWS.CHAIN_EDIT;
@@ -13059,17 +13130,17 @@ function handleBack() {
                 /* Cancel name preview */
                 masterShowingNamePreview = false;
                 needsRedraw = true;
-                announce("Master FX Settings");
+                announce(`${activeFxBus.title} Settings`);
             } else if (masterConfirmingOverwrite) {
                 /* Cancel overwrite - return to settings */
                 masterConfirmingOverwrite = false;
                 needsRedraw = true;
-                announce("Master FX Settings");
+                announce(`${activeFxBus.title} Settings`);
             } else if (masterConfirmingDelete) {
                 /* Cancel delete */
                 masterConfirmingDelete = false;
                 needsRedraw = true;
-                announce("Master FX Settings");
+                announce(`${activeFxBus.title} Settings`);
             } else if (helpDetailScrollState) {
                 helpDetailScrollState = null;
                 needsRedraw = true;
@@ -13085,23 +13156,23 @@ function handleBack() {
                     helpReturnView = null;
                     enterGlobalSettings();
                 } else {
-                    announce("Master FX Settings");
+                    announce(`${activeFxBus.title} Settings`);
                 }
             } else if (inMasterPresetPicker) {
                 /* Exit preset picker, return to FX list */
                 exitMasterPresetPicker();
-                announce("Master FX");
+                announce(activeFxBus.title);
             } else if (inMasterFxSettingsMenu) {
                 /* Exit settings menu */
                 inMasterFxSettingsMenu = false;
                 editingMasterFxSetting = false;
                 needsRedraw = true;
-                announce("Master FX");
+                announce(activeFxBus.title);
             } else if (selectingMasterFxModule) {
                 /* Cancel module selection, return to chain view */
                 selectingMasterFxModule = false;
                 needsRedraw = true;
-                announce("Master FX");
+                announce(activeFxBus.title);
             } else {
                 enterFxBusPicker();
             }
@@ -13255,7 +13326,7 @@ function handleBack() {
                 const wasMasterFx = hierEditorIsMasterFx;
                 const returnView = hierEditorReturnView;
                 exitHierarchyEditor();
-                announce(wasMasterFx ? "Master FX" : returnView === VIEWS.SEND_FX ? "Send FX" : "Chain Editor");
+                announce(returnView === VIEWS.MASTER_FX ? activeFxBus.title : wasMasterFx ? "Master FX" : "Chain Editor");
             }
             break;
         }
@@ -14169,7 +14240,6 @@ function drawHelpDetail() {
     Object.defineProperty(_ctx, 'MASTER_FX_OPTIONS', {
         get() { return MASTER_FX_OPTIONS; }, set(v) { MASTER_FX_OPTIONS = v; }, enumerable: true
     });
-    _ctx.SEND_FX_OPTIONS = [];
     Object.defineProperty(_ctx, 'selectedMasterFxComponent', {
         get() { return selectedMasterFxComponent; }, set(v) { selectedMasterFxComponent = v; }, enumerable: true
     });
@@ -14224,7 +14294,14 @@ function drawHelpDetail() {
         get() { return masterConfirmIndex; }, enumerable: true
     });
 
-    _ctx.MASTER_FX_CHAIN_COMPONENTS = MASTER_FX_CHAIN_COMPONENTS;
+    /* Components follow the active bus (master: 4 slots, sends: 3). */
+    Object.defineProperty(_ctx, 'MASTER_FX_CHAIN_COMPONENTS', {
+        get() { return activeFxBus.components; }, enumerable: true
+    });
+    /* Active FX bus descriptor (master/sendA/sendB) for the generic editor. */
+    Object.defineProperty(_ctx, 'activeFxBus', {
+        get() { return activeFxBus; }, set(v) { if (v) activeFxBus = v; }, enumerable: true
+    });
 
     /* Utility functions */
     _ctx.setView = setView;
@@ -14420,7 +14497,7 @@ function drawHelpDetail() {
     _ctx.enterChainEdit = (...args) => enterChainEdit(...args);
     _ctx.enterPatchBrowser = (...args) => _enterPatchBrowser(...args);
     _ctx.enterMasterFxSettings = (...args) => enterMasterFxSettings(...args);
-    _ctx.enterSendFxSettings = (...args) => enterSendFxSettings(...args);
+    _ctx.enterFxBusEditor = (...args) => enterFxBusEditor(...args);
     _ctx.enterFxBusPicker = () => enterFxBusPicker();
     _ctx.enterSendFxHierarchyEditor = (...args) => enterSendFxHierarchyEditor(...args);
     _ctx.enterSlotSettings = (...args) => _enterSlotSettings(...args);
@@ -14440,8 +14517,13 @@ function applyPatchSelection() { _applyPatchSelection(); }
 function drawMasterFx() { _drawMasterFx(); }
 function getMasterFxDisplayName() { return _getMasterFxDisplayName(); }
 function enterMasterFxSettings() { _enterMasterFxSettings(); }
-function drawSendFx() { _drawSendFx(); }
-function enterSendFxSettings(bus) { _enterSendFxSettings(bus); }
+
+/* Enter the generic FX editor for a bus (master/sendA/sendB). Sets the active
+ * bus descriptor, then runs the shared Master-FX-style editor entry. */
+function enterFxBusEditor(busId) {
+    activeFxBus = FX_BUS[busId] || FX_BUS.master;
+    enterMasterFxSettings();
+}
 
 let fxBusPickerIndex = 0;
 function enterFxBusPicker() {
@@ -15088,7 +15170,6 @@ function dispatchCoRunDraw() {
             break;
         case VIEWS.FILEPATH_BROWSER:     drawFilepathBrowser(); break;
         case VIEWS.FX_BUS_PICKER:        drawFxBusPicker(); break;
-        case VIEWS.SEND_FX:              drawSendFx(); break;
         case VIEWS.MASTER_FX:            drawMasterFx(); break;
         default:
             /* Unknown view in co-run — render slot list as a recoverable
@@ -15881,9 +15962,6 @@ globalThis.tick = function() {
         case VIEWS.MASTER_FX:
             drawMasterFx();
             break;
-        case VIEWS.SEND_FX:
-            drawSendFx();
-            break;
         case VIEWS.FX_BUS_PICKER:
             drawFxBusPicker();
             break;
@@ -16334,7 +16412,7 @@ globalThis.onMidiMessageInternal = function(data) {
                 runCoRunChainEdit(function() {
                     if (hostShiftHeld && view === VIEWS.CHAIN_EDIT && selectedChainComponent >= 0) {
                         handleShiftSelect();
-                    } else if (hostShiftHeld && view === VIEWS.MASTER_FX && selectedMasterFxComponent >= 0 && selectedMasterFxComponent < 4) {
+                    } else if (hostShiftHeld && view === VIEWS.MASTER_FX && selectedMasterFxComponent >= 0 && selectedMasterFxComponent < activeFxBus.slotCount) {
                         enterMasterFxModuleSelect(selectedMasterFxComponent);
                     } else {
                         handleSelect();
@@ -16509,8 +16587,8 @@ globalThis.onMidiMessageInternal = function(data) {
             /* Shift+Click in chain edit enters component edit mode */
             if (isShiftHeld() && view === VIEWS.CHAIN_EDIT && selectedChainComponent >= 0) {
                 handleShiftSelect();
-            } else if (isShiftHeld() && view === VIEWS.MASTER_FX && selectedMasterFxComponent >= 0 && selectedMasterFxComponent < 4) {
-                /* Shift+Click in Master FX view enters module selector for the slot */
+            } else if (isShiftHeld() && view === VIEWS.MASTER_FX && selectedMasterFxComponent >= 0 && selectedMasterFxComponent < activeFxBus.slotCount) {
+                /* Shift+Click in FX editor enters module selector for the slot */
                 enterMasterFxModuleSelect(selectedMasterFxComponent);
             } else {
                 handleSelect();
