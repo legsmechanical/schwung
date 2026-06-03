@@ -225,10 +225,15 @@ else
 fi
 
 # Build host with module manager and settings
+# Depend on ALL host headers (src/host/*.h), not a hand-picked subset. The host
+# includes shadow_constants.h (the shared-memory layout) but it was historically
+# omitted here, so a layout change rebuilt the shim/modules but NOT the host —
+# leaving mismatched binaries. Globbing every header makes that class of bug
+# impossible (over-rebuilds slightly on unrelated header edits; correctness wins).
 if needs_rebuild build/schwung \
     src/schwung_host.c src/host/module_manager.c src/host/settings.c src/host/unified_log.c \
     src/host/analytics.c \
-    src/host/module_manager.h src/host/settings.h src/host/plugin_api_v1.h src/host/unified_log.h; then
+    src/host/*.h; then
     echo "Building host..."
     "${CROSS_PREFIX}gcc" -g -O3 \
         src/schwung_host.c \
