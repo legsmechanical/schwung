@@ -137,6 +137,14 @@ Breaking change:
       and their param values both come back — not just the module. Prior
       bug: `master_fx_N.json` could be overwritten with `params: {}` if a
       save fired while the shim was mid-teardown, losing all tweaks.
+- [ ] **Master preset save — large modules** (`fc8db9bb`): load a large
+      module (e.g. spectra) into a Master FX slot, **Save As** a preset,
+      clear (**New**), reload from the preset browser. Full chain restores
+      (not an empty chain). Prior bug: `save_master_preset` /
+      `update_master_preset` extracted each FX slot into `char fxN[512]`,
+      so big modules were truncated → malformed preset JSON → empty chain.
+      Buffers enlarged to 8192 (`final_json` → 40960); round-trip stays
+      under the 64 KB `master_preset_json` GET limit.
 
 ### 6 — Regression watch
 
