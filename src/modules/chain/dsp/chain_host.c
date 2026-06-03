@@ -5884,14 +5884,16 @@ static int save_master_preset(const char *json_str) {
     snprintf(path, sizeof(path), "%s/%s.json", PRESETS_MASTER_DIR, filename);
 
     /* Extract each FX section */
-    char fx1[512], fx2[512], fx3[512], fx4[512];
+    char fx1[8192], fx2[8192], fx3[8192], fx4[8192];
     extract_fx_section(json_str, "fx1", fx1, sizeof(fx1));
     extract_fx_section(json_str, "fx2", fx2, sizeof(fx2));
     extract_fx_section(json_str, "fx3", fx3, sizeof(fx3));
     extract_fx_section(json_str, "fx4", fx4, sizeof(fx4));
 
-    /* Build wrapped JSON */
-    char final_json[8192];
+    /* Build wrapped JSON. Buffers sized so a 4-slot preset of large modules
+     * (e.g. spectra) isn't truncated: 4×8192 fx sections + wrapper stays well
+     * under the 64KB preset round-trip limit (master_preset_json GET). */
+    char final_json[40960];
     snprintf(final_json, sizeof(final_json),
         "{\n"
         "    \"name\": \"%s\",\n"
@@ -5941,14 +5943,16 @@ static int update_master_preset(int index, const char *json_str) {
     }
 
     /* Extract each FX section */
-    char fx1[512], fx2[512], fx3[512], fx4[512];
+    char fx1[8192], fx2[8192], fx3[8192], fx4[8192];
     extract_fx_section(json_str, "fx1", fx1, sizeof(fx1));
     extract_fx_section(json_str, "fx2", fx2, sizeof(fx2));
     extract_fx_section(json_str, "fx3", fx3, sizeof(fx3));
     extract_fx_section(json_str, "fx4", fx4, sizeof(fx4));
 
-    /* Build wrapped JSON */
-    char final_json[8192];
+    /* Build wrapped JSON. Buffers sized so a 4-slot preset of large modules
+     * (e.g. spectra) isn't truncated: 4×8192 fx sections + wrapper stays well
+     * under the 64KB preset round-trip limit (master_preset_json GET). */
+    char final_json[40960];
     snprintf(final_json, sizeof(final_json),
         "{\n"
         "    \"name\": \"%s\",\n"
