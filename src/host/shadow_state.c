@@ -202,6 +202,16 @@ void shadow_save_state(void)
             host_chain_slots[1].volume,
             host_chain_slots[2].volume,
             host_chain_slots[3].volume);
+    fprintf(f, "  \"slot_send_a\": [%.3f, %.3f, %.3f, %.3f],\n",
+            host_chain_slots[0].send_a,
+            host_chain_slots[1].send_a,
+            host_chain_slots[2].send_a,
+            host_chain_slots[3].send_a);
+    fprintf(f, "  \"slot_send_b\": [%.3f, %.3f, %.3f, %.3f],\n",
+            host_chain_slots[0].send_b,
+            host_chain_slots[1].send_b,
+            host_chain_slots[2].send_b,
+            host_chain_slots[3].send_b);
     fprintf(f, "  \"slot_channels\": [%d, %d, %d, %d],\n",
             host_chain_slots[0].channel,
             host_chain_slots[1].channel,
@@ -297,6 +307,46 @@ void shadow_load_state(void)
                 snprintf(msg, sizeof(msg), "Loaded slot volumes: [%.2f, %.2f, %.2f, %.2f]",
                          v0, v1, v2, v3);
                 if (host_log) host_log(msg);
+            }
+        }
+    }
+
+    /* Parse slot_send_a array */
+    const char *sa_key = "\"slot_send_a\":";
+    char *sa_pos = strstr(json, sa_key);
+    if (sa_pos) {
+        sa_pos = strchr(sa_pos, '[');
+        if (sa_pos) {
+            float s0, s1, s2, s3;
+            if (sscanf(sa_pos, "[%f, %f, %f, %f]", &s0, &s1, &s2, &s3) == 4) {
+                if (s0 < 0.0f) s0 = 0.0f; if (s0 > 1.0f) s0 = 1.0f;
+                if (s1 < 0.0f) s1 = 0.0f; if (s1 > 1.0f) s1 = 1.0f;
+                if (s2 < 0.0f) s2 = 0.0f; if (s2 > 1.0f) s2 = 1.0f;
+                if (s3 < 0.0f) s3 = 0.0f; if (s3 > 1.0f) s3 = 1.0f;
+                host_chain_slots[0].send_a = s0;
+                host_chain_slots[1].send_a = s1;
+                host_chain_slots[2].send_a = s2;
+                host_chain_slots[3].send_a = s3;
+            }
+        }
+    }
+
+    /* Parse slot_send_b array */
+    const char *sb_key = "\"slot_send_b\":";
+    char *sb_pos = strstr(json, sb_key);
+    if (sb_pos) {
+        sb_pos = strchr(sb_pos, '[');
+        if (sb_pos) {
+            float s0, s1, s2, s3;
+            if (sscanf(sb_pos, "[%f, %f, %f, %f]", &s0, &s1, &s2, &s3) == 4) {
+                if (s0 < 0.0f) s0 = 0.0f; if (s0 > 1.0f) s0 = 1.0f;
+                if (s1 < 0.0f) s1 = 0.0f; if (s1 > 1.0f) s1 = 1.0f;
+                if (s2 < 0.0f) s2 = 0.0f; if (s2 > 1.0f) s2 = 1.0f;
+                if (s3 < 0.0f) s3 = 0.0f; if (s3 > 1.0f) s3 = 1.0f;
+                host_chain_slots[0].send_b = s0;
+                host_chain_slots[1].send_b = s1;
+                host_chain_slots[2].send_b = s2;
+                host_chain_slots[3].send_b = s3;
             }
         }
     }
