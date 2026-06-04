@@ -1,0 +1,64 @@
+From e3aa8dfcae2f7d85a90d08ec7f304f15158fc151 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Thu, 4 Jun 2026 00:12:06 -0400
+Subject: [PATCH 3/8] fix(fx): set-change no longer freezes/lags when a Send FX
+ editor was open
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Changing a Move set while a Send FX editor was the last-active FX bus froze,
+then (post-partial-fix) globally and persistently lagged the device.
+
+Root cause in the SET_CHANGED master-FX restore loop: the editor genericization
+made setMasterFxSlotModule() activeFxBus-relative, and masterFxConfig is rebuilt
+to activeFxBus.slotCount on editor entry (3 for sends). So when a send bus was
+active during a set change, the 4-slot master restore loop both (a) misdirected
+the master chain's modules to send_fx:* keys — loading heavy modules into send
+slots and firing out-of-range fx4, flooding the blocking set_param channel — and
+(b) wrote masterFxConfig["fx4"], undefined after a 3-slot send editor, throwing a
+TypeError before shadow_clear_ui_flags(SET_CHANGED). The uncleared flag made the
+handler re-run every tick → persistent global lag (CPU idle, stalling on blocking
+calls). Master-only users never hit it (masterFxConfig inits to 4 slots).
+
+Fix: the restore is always a master operation — force activeFxBus = FX_BUS.master
+and rebuild masterFxConfig for the 4 master slots before the loop, making it
+self-contained regardless of which FX editor was last open.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 152c66f7..49ef7c73 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -15553,7 +15553,23 @@ globalThis.tick = function() {
+              * overwrite the freshly-written slot files */
+             autosaveSuppressUntil = 150; /* ~5 seconds at 30fps */
+ 
+-            /* 7. Reload master FX modules from per-set state files */
++            /* 7. Reload master FX modules from per-set state files.
++             * This restore is always about the MASTER bus. Two things must be
++             * reset first, because a Send FX editor (3 slots) may have been the
++             * last-active bus when the set changed:
++             *   - activeFxBus: setMasterFxSlotModule() is activeFxBus-relative, so
++             *     a stale send bus would misdirect the master chain's modules to
++             *     send_fx:* keys (loading heavy modules into send slots + firing the
++             *     out-of-range fx4) and flood the blocking set_param channel.
++             *   - masterFxConfig: it is rebuilt to activeFxBus.slotCount on editor
++             *     entry, so after a 3-slot send editor it only has fx1..fx3. The
++             *     loop below writes masterFxConfig["fx4"], which would be undefined
++             *     → TypeError → the handler throws BEFORE clearing SHADOW_UI_FLAG_SET_CHANGED
++             *     (step 11) → SET_CHANGED re-runs every tick → persistent global lag.
++             * Rebuilding it for the 4 master slots makes the restore self-contained. */
++            activeFxBus = FX_BUS.master;
++            masterFxConfig = { fx1: { module: "" }, fx2: { module: "" },
++                               fx3: { module: "" }, fx4: { module: "" } };
+             for (let mfxi = 0; mfxi < 4; mfxi++) {
+                 const mfxPath = activeSlotStateDir + "/master_fx_" + mfxi + ".json";
+                 let mfxDspPath = "";
+-- 
+2.53.0
+

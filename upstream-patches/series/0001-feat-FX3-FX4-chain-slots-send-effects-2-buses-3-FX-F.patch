@@ -1,0 +1,1990 @@
+From ee0acc8607510832e01e98ae20c59bcdacad3b34 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 3 Jun 2026 07:09:15 -0400
+Subject: [PATCH 1/8] =?UTF-8?q?feat:=20FX3/FX4=20chain=20slots,=20send=20e?=
+ =?UTF-8?q?ffects=20(2=20buses=20=C3=97=203=20FX),=20FX=20bus=20picker?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Wire FX3/FX4 into chain_host.c param routing (set/get, knob mappings,
+  modulation targets, component_ui_mode, module loading)
+- Add FX3/FX4 to shadow_ui.js chain editor (CHAIN_COMPONENTS, config,
+  patch save/load, LFO targets, display name polling, module browser)
+- Add send_a/send_b per-slot params (shadow_chain_types.h, param set/get,
+  state persistence in shadow_state.c)
+- Send bus FX infrastructure: send_fx_slot_t type (reuses master_fx_slot_t),
+  load/unload functions, send_fx: param namespace routing in both direct
+  and SHM param handlers
+- DSP rendering: post-fader send accumulation in all 3 mix paths
+  (rebuild_from_la, deferred FX, legacy inline), send FX processing,
+  returns summed into ME bus before Master FX
+- FX bus picker: Master FX gesture now shows picker (Master FX / Send A /
+  Send B); works in co-run via Menu button (CC 50) intercept
+- Send FX UI: shadow_ui_send_fx.mjs with component bar, module browser,
+  hierarchy param editor, bypass; send level controls in chain settings
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/host/shadow_chain_mgmt.c       | 311 ++++++++++++++++++++++++
+ src/host/shadow_chain_mgmt.h       |  22 ++
+ src/host/shadow_chain_types.h      |   2 +
+ src/host/shadow_state.c            |  50 ++++
+ src/modules/chain/dsp/chain_host.c | 369 ++++++++++++++++++++++++++++-
+ src/schwung_shim.c                 |  56 ++++-
+ src/shadow/shadow_ui.js            | 280 ++++++++++++++++++++--
+ src/shadow/shadow_ui_send_fx.mjs   | 213 +++++++++++++++++
+ src/shadow/shadow_ui_slots.mjs     |  32 ++-
+ 9 files changed, 1303 insertions(+), 32 deletions(-)
+ create mode 100644 src/shadow/shadow_ui_send_fx.mjs
+
+diff --git a/src/host/shadow_chain_mgmt.c b/src/host/shadow_chain_mgmt.c
+index d05aa9fd..250d4df6 100644
+--- a/src/host/shadow_chain_mgmt.c
++++ b/src/host/shadow_chain_mgmt.c
+@@ -60,6 +60,9 @@ int shadow_inprocess_ready = 0;
+ /* Master FX slots */
+ master_fx_slot_t shadow_master_fx_slots[MASTER_FX_SLOTS];
+ 
++/* Send FX slots */
++master_fx_slot_t shadow_send_fx_slots[SEND_BUS_COUNT][SEND_FX_SLOTS];
++
+ /* Master FX LFOs */
+ lfo_state_t shadow_master_fx_lfos[MASTER_FX_LFO_COUNT];
+ static float mfx_lfo_base_value[MASTER_FX_LFO_COUNT];
+@@ -415,6 +418,8 @@ void shadow_chain_defaults(void) {
+         shadow_chain_slots[i].patch_index = -1;
+         shadow_chain_slots[i].channel = shadow_chain_parse_channel(1 + i);
+         shadow_chain_slots[i].volume = 1.0f;
++        shadow_chain_slots[i].send_a = 0.0f;
++        shadow_chain_slots[i].send_b = 0.0f;
+         shadow_chain_slots[i].muted = 0;
+         shadow_chain_slots[i].soloed = 0;
+         shadow_chain_slots[i].forward_channel = -1;
+@@ -670,6 +675,148 @@ void shadow_master_fx_unload_all(void) {
+     }
+ }
+ 
++/* ============================================================================
++ * Send FX Load / Unload
++ * ============================================================================ */
++
++void shadow_send_fx_slot_unload(int bus, int slot) {
++    if (bus < 0 || bus >= SEND_BUS_COUNT) return;
++    if (slot < 0 || slot >= SEND_FX_SLOTS) return;
++    master_fx_slot_t *s = &shadow_send_fx_slots[bus][slot];
++
++    if (s->instance && s->api && s->api->destroy_instance) {
++        s->api->destroy_instance(s->instance);
++    }
++    s->instance = NULL;
++    s->api = NULL;
++    s->on_midi = NULL;
++    if (s->handle) {
++        dlclose(s->handle);
++        s->handle = NULL;
++    }
++    s->module_path[0] = '\0';
++    s->module_id[0] = '\0';
++    s->bypassed = 0;
++    capture_clear(&s->capture);
++}
++
++void shadow_send_fx_unload_all(void) {
++    for (int b = 0; b < SEND_BUS_COUNT; b++) {
++        for (int i = 0; i < SEND_FX_SLOTS; i++) {
++            shadow_send_fx_slot_unload(b, i);
++        }
++    }
++}
++
++int shadow_send_fx_slot_load(int bus, int slot, const char *dsp_path) {
++    if (bus < 0 || bus >= SEND_BUS_COUNT) return -1;
++    if (slot < 0 || slot >= SEND_FX_SLOTS) return -1;
++    master_fx_slot_t *s = &shadow_send_fx_slots[bus][slot];
++
++    if (!dsp_path || !dsp_path[0]) {
++        shadow_send_fx_slot_unload(bus, slot);
++        return 0;
++    }
++
++    if (strcmp(s->module_path, dsp_path) == 0 && s->instance) {
++        return 0;
++    }
++
++    shadow_send_fx_slot_unload(bus, slot);
++
++    s->handle = dlopen(dsp_path, RTLD_NOW | RTLD_LOCAL);
++    if (!s->handle) {
++        fprintf(stderr, "Send FX[%d][%d]: failed to load %s: %s\n", bus, slot, dsp_path, dlerror());
++        return -1;
++    }
++
++    audio_fx_init_v2_fn init_fn = (audio_fx_init_v2_fn)dlsym(s->handle, AUDIO_FX_INIT_V2_SYMBOL);
++    if (!init_fn) {
++        fprintf(stderr, "Send FX[%d][%d]: %s not found in %s\n", bus, slot, AUDIO_FX_INIT_V2_SYMBOL, dsp_path);
++        dlclose(s->handle);
++        s->handle = NULL;
++        return -1;
++    }
++
++    s->api = init_fn(&shadow_host_api);
++    if (!s->api || !s->api->create_instance) {
++        fprintf(stderr, "Send FX[%d][%d]: init failed for %s\n", bus, slot, dsp_path);
++        dlclose(s->handle);
++        s->handle = NULL;
++        s->api = NULL;
++        return -1;
++    }
++
++    char module_dir[256];
++    strncpy(module_dir, dsp_path, sizeof(module_dir) - 1);
++    module_dir[sizeof(module_dir) - 1] = '\0';
++    char *last_slash = strrchr(module_dir, '/');
++    if (last_slash) *last_slash = '\0';
++
++    s->instance = s->api->create_instance(module_dir, NULL);
++    if (!s->instance) {
++        fprintf(stderr, "Send FX[%d][%d]: create_instance failed for %s\n", bus, slot, dsp_path);
++        dlclose(s->handle);
++        s->handle = NULL;
++        s->api = NULL;
++        return -1;
++    }
++
++    strncpy(s->module_path, dsp_path, sizeof(s->module_path) - 1);
++    s->module_path[sizeof(s->module_path) - 1] = '\0';
++
++    const char *id_start = strrchr(module_dir, '/');
++    if (id_start) {
++        strncpy(s->module_id, id_start + 1, sizeof(s->module_id) - 1);
++    } else {
++        strncpy(s->module_id, module_dir, sizeof(s->module_id) - 1);
++    }
++    s->module_id[sizeof(s->module_id) - 1] = '\0';
++
++    s->chain_params_cached = 0;
++    s->chain_params_cache[0] = '\0';
++
++    char module_json_path[512];
++    snprintf(module_json_path, sizeof(module_json_path), "%s/module.json", module_dir);
++    FILE *f = fopen(module_json_path, "r");
++    if (f) {
++        fseek(f, 0, SEEK_END);
++        long size = ftell(f);
++        fseek(f, 0, SEEK_SET);
++        if (size > 0 && size < 65536) {
++            char *json = malloc(size + 1);
++            if (json) {
++                size_t nread = fread(json, 1, size, f);
++                json[nread] = '\0';
++                const char *chain_params = strstr(json, "\"chain_params\"");
++                if (chain_params) {
++                    const char *arr_start = strchr(chain_params, '[');
++                    if (arr_start) {
++                        int depth = 1;
++                        const char *arr_end = arr_start + 1;
++                        while (*arr_end && depth > 0) {
++                            if (*arr_end == '[') depth++;
++                            else if (*arr_end == ']') depth--;
++                            arr_end++;
++                        }
++                        int len = (int)(arr_end - arr_start);
++                        if (len > 0 && len < (int)sizeof(s->chain_params_cache) - 1) {
++                            memcpy(s->chain_params_cache, arr_start, len);
++                            s->chain_params_cache[len] = '\0';
++                            s->chain_params_cached = 1;
++                        }
++                    }
++                }
++                free(json);
++            }
++        }
++        fclose(f);
++    }
++
++    fprintf(stderr, "Send FX[%d][%d]: loaded %s\n", bus, slot, s->module_id);
++    return 0;
++}
++
+ int shadow_master_fx_slot_load(int slot, const char *dsp_path) {
+     return shadow_master_fx_slot_load_with_config(slot, dsp_path, NULL);
+ }
+@@ -1341,6 +1488,9 @@ int shadow_inprocess_load_chain(void) {
+     }
+ 
+     shadow_inprocess_ready = 1;
++
++
++
+     if (host.startup_modwheel_countdown) {
+         *host.startup_modwheel_countdown = host.startup_modwheel_reset_frames;
+     }
+@@ -1570,6 +1720,20 @@ int shadow_handle_slot_param_set(int slot, const char *key, const char *value) {
+         shadow_ui_state_update_slot(slot);
+         return 1;
+     }
++    if (strcmp(key, "slot:send_a") == 0) {
++        float lvl = atof(value);
++        if (lvl < 0.0f) lvl = 0.0f;
++        if (lvl > 1.0f) lvl = 1.0f;
++        shadow_chain_slots[slot].send_a = lvl;
++        return 1;
++    }
++    if (strcmp(key, "slot:send_b") == 0) {
++        float lvl = atof(value);
++        if (lvl < 0.0f) lvl = 0.0f;
++        if (lvl > 1.0f) lvl = 1.0f;
++        shadow_chain_slots[slot].send_b = lvl;
++        return 1;
++    }
+     if (strcmp(key, "slot:muted") == 0) {
+         shadow_apply_mute(slot, atoi(value));
+         return 1;
+@@ -1623,6 +1787,12 @@ int shadow_handle_slot_param_get(int slot, const char *key, char *buf, int buf_l
+     if (strcmp(key, "slot:volume") == 0) {
+         return snprintf(buf, buf_len, "%.2f", shadow_chain_slots[slot].volume);
+     }
++    if (strcmp(key, "slot:send_a") == 0) {
++        return snprintf(buf, buf_len, "%.2f", shadow_chain_slots[slot].send_a);
++    }
++    if (strcmp(key, "slot:send_b") == 0) {
++        return snprintf(buf, buf_len, "%.2f", shadow_chain_slots[slot].send_b);
++    }
+     if (strcmp(key, "slot:muted") == 0) {
+         return snprintf(buf, buf_len, "%d", shadow_chain_slots[slot].muted);
+     }
+@@ -1690,6 +1860,32 @@ void shadow_direct_set_param(uint8_t slot, const char *key, const char *value) {
+         return;
+     }
+ 
++    /* Handle send FX params: send_fx:a:fx1:param or send_fx:b:fx2:module */
++    if (strncmp(key, "send_fx:", 8) == 0) {
++        const char *rest = key + 8;
++        int bus = -1;
++        if (rest[0] == 'a' && rest[1] == ':') { bus = 0; rest += 2; }
++        else if (rest[0] == 'b' && rest[1] == ':') { bus = 1; rest += 2; }
++        if (bus < 0) return;
++
++        int sfx_slot = -1;
++        if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
++        else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
++        else if (strncmp(rest, "fx3:", 4) == 0) { sfx_slot = 2; rest += 4; }
++        if (sfx_slot < 0) return;
++
++        master_fx_slot_t *sfx = &shadow_send_fx_slots[bus][sfx_slot];
++        if (strcmp(rest, "module") == 0) {
++            shadow_send_fx_slot_load(bus, sfx_slot, value);
++        } else if (strcmp(rest, "bypassed") == 0) {
++            sfx->bypassed = (value[0] && atoi(value)) ? 1 : 0;
++        } else if (sfx->api && sfx->instance && sfx->api->set_param) {
++            sfx->api->set_param(sfx->instance, rest, value);
++        }
++        if (host.on_param_changed) host.on_param_changed(slot, key, value);
++        return;
++    }
++
+     /* Try slot-level params first */
+     if (shadow_handle_slot_param_set(slot, key, value)) {
+         if (host.on_param_changed) host.on_param_changed(slot, key, value);
+@@ -2622,6 +2818,121 @@ void shadow_inprocess_handle_param_request(void) {
+         return;
+     }
+ 
++    /* Handle send FX params: send_fx:a:fx1:param or send_fx:b:fx2:module */
++    if (strncmp(shadow_param->key, "send_fx:", 8) == 0) {
++        const char *rest = shadow_param->key + 8;
++        int bus = -1;
++        if (rest[0] == 'a' && rest[1] == ':') { bus = 0; rest += 2; }
++        else if (rest[0] == 'b' && rest[1] == ':') { bus = 1; rest += 2; }
++        if (bus < 0) {
++            shadow_param->error = 1;
++            shadow_param->result_len = -1;
++            shadow_param_publish_response(req_id);
++            return;
++        }
++
++        int sfx_slot = -1;
++        if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
++        else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
++        else if (strncmp(rest, "fx3:", 4) == 0) { sfx_slot = 2; rest += 4; }
++        if (sfx_slot < 0) {
++            shadow_param->error = 1;
++            shadow_param->result_len = -1;
++            shadow_param_publish_response(req_id);
++            return;
++        }
++
++        master_fx_slot_t *sfx = &shadow_send_fx_slots[bus][sfx_slot];
++
++        if (req_type == 1) {  /* SET */
++            if (strcmp(rest, "module") == 0) {
++                int result = shadow_send_fx_slot_load(bus, sfx_slot, shadow_param->value);
++                shadow_param->error = (result == 0) ? 0 : 7;
++                shadow_param->result_len = 0;
++            } else if (strcmp(rest, "bypassed") == 0) {
++                sfx->bypassed = (shadow_param->value[0] && atoi(shadow_param->value)) ? 1 : 0;
++                shadow_param->error = 0;
++                shadow_param->result_len = 0;
++            } else if (sfx->api && sfx->instance && sfx->api->set_param) {
++                sfx->api->set_param(sfx->instance, rest, shadow_param->value);
++                shadow_param->error = 0;
++                shadow_param->result_len = 0;
++            } else {
++                shadow_param->error = 9;
++                shadow_param->result_len = -1;
++            }
++        } else if (req_type == 2) {  /* GET */
++            if (strcmp(rest, "module") == 0) {
++                strncpy(shadow_param->value, sfx->module_path, SHADOW_PARAM_VALUE_LEN - 1);
++                shadow_param->value[SHADOW_PARAM_VALUE_LEN - 1] = '\0';
++                shadow_param->error = 0;
++                shadow_param->result_len = strlen(shadow_param->value);
++            } else if (strcmp(rest, "name") == 0) {
++                strncpy(shadow_param->value, sfx->module_id, SHADOW_PARAM_VALUE_LEN - 1);
++                shadow_param->value[SHADOW_PARAM_VALUE_LEN - 1] = '\0';
++                shadow_param->error = 0;
++                shadow_param->result_len = strlen(shadow_param->value);
++            } else if (strcmp(rest, "bypassed") == 0) {
++                snprintf(shadow_param->value, SHADOW_PARAM_VALUE_LEN, "%d", sfx->bypassed ? 1 : 0);
++                shadow_param->error = 0;
++                shadow_param->result_len = strlen(shadow_param->value);
++            } else if (strcmp(rest, "chain_params") == 0) {
++                if (sfx->api && sfx->instance && sfx->api->get_param) {
++                    int len = sfx->api->get_param(sfx->instance, "chain_params",
++                                                   shadow_param->value, SHADOW_PARAM_VALUE_LEN);
++                    if (len > 2) {
++                        shadow_param->error = 0;
++                        shadow_param->result_len = len;
++                        shadow_param_publish_response(req_id);
++                        return;
++                    }
++                }
++                if (sfx->chain_params_cached && sfx->chain_params_cache[0]) {
++                    int len = strlen(sfx->chain_params_cache);
++                    if (len < SHADOW_PARAM_VALUE_LEN - 1) {
++                        memcpy(shadow_param->value, sfx->chain_params_cache, len + 1);
++                        shadow_param->error = 0;
++                        shadow_param->result_len = len;
++                        shadow_param_publish_response(req_id);
++                        return;
++                    }
++                }
++                shadow_param->value[0] = '['; shadow_param->value[1] = ']'; shadow_param->value[2] = '\0';
++                shadow_param->error = 0;
++                shadow_param->result_len = 2;
++            } else if (strcmp(rest, "ui_hierarchy") == 0) {
++                if (sfx->api && sfx->instance && sfx->api->get_param) {
++                    int len = sfx->api->get_param(sfx->instance, "ui_hierarchy",
++                                                   shadow_param->value, SHADOW_PARAM_VALUE_LEN);
++                    if (len > 2) {
++                        shadow_param->error = 0;
++                        shadow_param->result_len = len;
++                        shadow_param_publish_response(req_id);
++                        return;
++                    }
++                }
++                shadow_param->value[0] = '\0';
++                shadow_param->error = 0;
++                shadow_param->result_len = 0;
++            } else if (sfx->api && sfx->instance && sfx->api->get_param) {
++                int len = sfx->api->get_param(sfx->instance, rest,
++                                               shadow_param->value, SHADOW_PARAM_VALUE_LEN);
++                if (len >= 0) {
++                    shadow_param->error = 0;
++                    shadow_param->result_len = len;
++                } else {
++                    shadow_param->error = 10;
++                    shadow_param->result_len = -1;
++                }
++            } else {
++                shadow_param->error = 11;
++                shadow_param->result_len = -1;
++            }
++        }
++        shadow_param_publish_response(req_id);
++        return;
++    }
++
+     /* Handle overtake DSP params - delegate to shim */
+     if (strncmp(shadow_param->key, "overtake_dsp:", 13) == 0) {
+         if (host.handle_param_special && host.handle_param_special(req_type, req_id)) {
+diff --git a/src/host/shadow_chain_mgmt.h b/src/host/shadow_chain_mgmt.h
+index a4c4f632..2723ddbe 100644
+--- a/src/host/shadow_chain_mgmt.h
++++ b/src/host/shadow_chain_mgmt.h
+@@ -19,6 +19,8 @@
+  * ============================================================================ */
+ 
+ #define MASTER_FX_SLOTS 4
++#define SEND_BUS_COUNT 2
++#define SEND_FX_SLOTS  3
+ #define SHADOW_CHAIN_MODULE_DIR "/data/UserData/schwung/modules/chain"
+ #define SHADOW_CHAIN_DSP_PATH "/data/UserData/schwung/modules/chain/dsp.so"
+ 
+@@ -111,6 +113,9 @@ extern int shadow_inprocess_ready;
+ /* Master FX slots */
+ extern master_fx_slot_t shadow_master_fx_slots[MASTER_FX_SLOTS];
+ 
++/* Send FX slots — 2 buses (A, B) × 3 FX slots each */
++extern master_fx_slot_t shadow_send_fx_slots[SEND_BUS_COUNT][SEND_FX_SLOTS];
++
+ /* Master FX LFOs */
+ #define MASTER_FX_LFO_COUNT 2
+ extern lfo_state_t shadow_master_fx_lfos[MASTER_FX_LFO_COUNT];
+@@ -166,6 +171,18 @@ static inline int shadow_master_fx_chain_active(void) {
+     return 0;
+ }
+ 
++/* Check if any send FX slot is active on a bus */
++static inline int shadow_send_fx_bus_active(int bus) {
++    if (bus < 0 || bus >= SEND_BUS_COUNT) return 0;
++    for (int fx = 0; fx < SEND_FX_SLOTS; fx++) {
++        master_fx_slot_t *s = &shadow_send_fx_slots[bus][fx];
++        if (s->instance && s->api && s->api->process_block) {
++            return 1;
++        }
++    }
++    return 0;
++}
++
+ /* ============================================================================
+  * Public functions
+  * ============================================================================ */
+@@ -214,6 +231,11 @@ int shadow_master_fx_load(const char *dsp_path);
+ void shadow_master_fx_unload(void);
+ void shadow_master_fx_forward_midi(const uint8_t *msg, int len, int source);
+ 
++/* --- Send FX --- */
++void shadow_send_fx_slot_unload(int bus, int slot);
++void shadow_send_fx_unload_all(void);
++int shadow_send_fx_slot_load(int bus, int slot, const char *dsp_path);
++
+ /* --- Capture loading --- */
+ void shadow_slot_load_capture(int slot, int patch_index);
+ 
+diff --git a/src/host/shadow_chain_types.h b/src/host/shadow_chain_types.h
+index ca39fac5..26e98ff6 100644
+--- a/src/host/shadow_chain_types.h
++++ b/src/host/shadow_chain_types.h
+@@ -35,6 +35,8 @@ typedef struct shadow_chain_slot_t {
+     int patch_index;
+     int active;
+     float volume;           /* 0.0 to 1.0, user-set level (never modified by mute/solo) */
++    float send_a;           /* 0.0 to 1.0, post-fader send level to Send A bus */
++    float send_b;           /* 0.0 to 1.0, post-fader send level to Send B bus */
+     int muted;              /* 1 = muted (Mute+Track or Move speakerOn sync) */
+     int soloed;             /* 1 = soloed (Shift+Mute+Track or Move solo-cue sync) */
+     int forward_channel;    /* -2 = passthrough, -1 = auto, 0-15 = forward MIDI to this channel */
+diff --git a/src/host/shadow_state.c b/src/host/shadow_state.c
+index 859835f1..cb1c614b 100644
+--- a/src/host/shadow_state.c
++++ b/src/host/shadow_state.c
+@@ -202,6 +202,16 @@ void shadow_save_state(void)
+             host_chain_slots[1].volume,
+             host_chain_slots[2].volume,
+             host_chain_slots[3].volume);
++    fprintf(f, "  \"slot_send_a\": [%.3f, %.3f, %.3f, %.3f],\n",
++            host_chain_slots[0].send_a,
++            host_chain_slots[1].send_a,
++            host_chain_slots[2].send_a,
++            host_chain_slots[3].send_a);
++    fprintf(f, "  \"slot_send_b\": [%.3f, %.3f, %.3f, %.3f],\n",
++            host_chain_slots[0].send_b,
++            host_chain_slots[1].send_b,
++            host_chain_slots[2].send_b,
++            host_chain_slots[3].send_b);
+     fprintf(f, "  \"slot_channels\": [%d, %d, %d, %d],\n",
+             host_chain_slots[0].channel,
+             host_chain_slots[1].channel,
+@@ -301,6 +311,46 @@ void shadow_load_state(void)
+         }
+     }
+ 
++    /* Parse slot_send_a array */
++    const char *sa_key = "\"slot_send_a\":";
++    char *sa_pos = strstr(json, sa_key);
++    if (sa_pos) {
++        sa_pos = strchr(sa_pos, '[');
++        if (sa_pos) {
++            float s0, s1, s2, s3;
++            if (sscanf(sa_pos, "[%f, %f, %f, %f]", &s0, &s1, &s2, &s3) == 4) {
++                if (s0 < 0.0f) s0 = 0.0f; if (s0 > 1.0f) s0 = 1.0f;
++                if (s1 < 0.0f) s1 = 0.0f; if (s1 > 1.0f) s1 = 1.0f;
++                if (s2 < 0.0f) s2 = 0.0f; if (s2 > 1.0f) s2 = 1.0f;
++                if (s3 < 0.0f) s3 = 0.0f; if (s3 > 1.0f) s3 = 1.0f;
++                host_chain_slots[0].send_a = s0;
++                host_chain_slots[1].send_a = s1;
++                host_chain_slots[2].send_a = s2;
++                host_chain_slots[3].send_a = s3;
++            }
++        }
++    }
++
++    /* Parse slot_send_b array */
++    const char *sb_key = "\"slot_send_b\":";
++    char *sb_pos = strstr(json, sb_key);
++    if (sb_pos) {
++        sb_pos = strchr(sb_pos, '[');
++        if (sb_pos) {
++            float s0, s1, s2, s3;
++            if (sscanf(sb_pos, "[%f, %f, %f, %f]", &s0, &s1, &s2, &s3) == 4) {
++                if (s0 < 0.0f) s0 = 0.0f; if (s0 > 1.0f) s0 = 1.0f;
++                if (s1 < 0.0f) s1 = 0.0f; if (s1 > 1.0f) s1 = 1.0f;
++                if (s2 < 0.0f) s2 = 0.0f; if (s2 > 1.0f) s2 = 1.0f;
++                if (s3 < 0.0f) s3 = 0.0f; if (s3 > 1.0f) s3 = 1.0f;
++                host_chain_slots[0].send_b = s0;
++                host_chain_slots[1].send_b = s1;
++                host_chain_slots[2].send_b = s2;
++                host_chain_slots[3].send_b = s3;
++            }
++        }
++    }
++
+     /* Parse slot_channels (receive channel) array */
+     const char *ch_key = "\"slot_channels\":";
+     char *ch_pos = strstr(json, ch_key);
+diff --git a/src/modules/chain/dsp/chain_host.c b/src/modules/chain/dsp/chain_host.c
+index 93f9e86b..03f8cb7e 100644
+--- a/src/modules/chain/dsp/chain_host.c
++++ b/src/modules/chain/dsp/chain_host.c
+@@ -2721,6 +2721,8 @@ static chain_param_info_t *knob_find_param(chain_instance_t *inst, const char *t
+         return find_param_info(inst->fx_params[1], inst->fx_param_counts[1], param);
+     if (strcmp(target, "fx3") == 0 && inst->fx_count > 2)
+         return find_param_info(inst->fx_params[2], inst->fx_param_counts[2], param);
++    if (strcmp(target, "fx4") == 0 && inst->fx_count > 3)
++        return find_param_info(inst->fx_params[3], inst->fx_param_counts[3], param);
+     if (strcmp(target, "midi_fx1") == 0 && inst->midi_fx_count > 0)
+         return find_param_info(inst->midi_fx_params[0], inst->midi_fx_param_counts[0], param);
+     if (strcmp(target, "midi_fx2") == 0 && inst->midi_fx_count > 1)
+@@ -2750,6 +2752,11 @@ static void knob_forward_value(chain_instance_t *inst, const char *target, const
+             inst->fx_plugins_v2[2]->set_param(inst->fx_instances[2], param, val_str);
+         else if (inst->fx_plugins[2] && inst->fx_plugins[2]->set_param)
+             inst->fx_plugins[2]->set_param(param, val_str);
++    } else if (strcmp(target, "fx4") == 0 && inst->fx_count > 3) {
++        if (inst->fx_is_v2[3] && inst->fx_plugins_v2[3] && inst->fx_instances[3])
++            inst->fx_plugins_v2[3]->set_param(inst->fx_instances[3], param, val_str);
++        else if (inst->fx_plugins[3] && inst->fx_plugins[3]->set_param)
++            inst->fx_plugins[3]->set_param(param, val_str);
+     } else if (strcmp(target, "midi_fx1") == 0 && inst->midi_fx_count > 0) {
+         if (inst->midi_fx_plugins[0] && inst->midi_fx_instances[0] && inst->midi_fx_plugins[0]->set_param)
+             inst->midi_fx_plugins[0]->set_param(inst->midi_fx_instances[0], param, val_str);
+@@ -3546,6 +3553,10 @@ static int load_patch(int index) {
+             pinfo = find_param_info(g_fx_params[0], g_fx_param_counts[0], param);
+         } else if (strcmp(target, "fx2") == 0 && g_fx_count > 1) {
+             pinfo = find_param_info(g_fx_params[1], g_fx_param_counts[1], param);
++        } else if (strcmp(target, "fx3") == 0 && g_fx_count > 2) {
++            pinfo = find_param_info(g_fx_params[2], g_fx_param_counts[2], param);
++        } else if (strcmp(target, "fx4") == 0 && g_fx_count > 3) {
++            pinfo = find_param_info(g_fx_params[3], g_fx_param_counts[3], param);
+         }
+ 
+         /* Use saved value if present, otherwise initialize to middle of range */
+@@ -3584,6 +3595,10 @@ static int load_patch(int index) {
+             pinfo = find_param_info(g_fx_params[0], g_fx_param_counts[0], param);
+         } else if (strcmp(target, "fx2") == 0 && g_fx_count > 1) {
+             pinfo = find_param_info(g_fx_params[1], g_fx_param_counts[1], param);
++        } else if (strcmp(target, "fx3") == 0 && g_fx_count > 2) {
++            pinfo = find_param_info(g_fx_params[2], g_fx_param_counts[2], param);
++        } else if (strcmp(target, "fx4") == 0 && g_fx_count > 3) {
++            pinfo = find_param_info(g_fx_params[3], g_fx_param_counts[3], param);
+         }
+ 
+         /* Format value string */
+@@ -3615,6 +3630,22 @@ static int load_patch(int index) {
+                     g_fx_plugins[1]->set_param(param, val_str);
+                 }
+             }
++        } else if (strcmp(target, "fx3") == 0) {
++            if (g_fx_count > 2) {
++                if (g_fx_is_v2[2] && g_fx_plugins_v2[2] && g_fx_instances[2] && g_fx_plugins_v2[2]->set_param) {
++                    g_fx_plugins_v2[2]->set_param(g_fx_instances[2], param, val_str);
++                } else if (g_fx_plugins[2] && g_fx_plugins[2]->set_param) {
++                    g_fx_plugins[2]->set_param(param, val_str);
++                }
++            }
++        } else if (strcmp(target, "fx4") == 0) {
++            if (g_fx_count > 3) {
++                if (g_fx_is_v2[3] && g_fx_plugins_v2[3] && g_fx_instances[3] && g_fx_plugins_v2[3]->set_param) {
++                    g_fx_plugins_v2[3]->set_param(g_fx_instances[3], param, val_str);
++                } else if (g_fx_plugins[3] && g_fx_plugins[3]->set_param) {
++                    g_fx_plugins[3]->set_param(param, val_str);
++                }
++            }
+         }
+     }
+ 
+@@ -3729,6 +3760,10 @@ static void plugin_on_midi(const uint8_t *msg, int len, int source) {
+                         pinfo = find_param_info(g_fx_params[0], g_fx_param_counts[0], param);
+                     } else if (strcmp(target, "fx2") == 0 && g_fx_count > 1) {
+                         pinfo = find_param_info(g_fx_params[1], g_fx_param_counts[1], param);
++                    } else if (strcmp(target, "fx3") == 0 && g_fx_count > 2) {
++                        pinfo = find_param_info(g_fx_params[2], g_fx_param_counts[2], param);
++                    } else if (strcmp(target, "fx4") == 0 && g_fx_count > 3) {
++                        pinfo = find_param_info(g_fx_params[3], g_fx_param_counts[3], param);
+                     }
+ 
+                     if (!pinfo) continue;  /* Skip if param not found */
+@@ -3795,6 +3830,22 @@ static void plugin_on_midi(const uint8_t *msg, int len, int source) {
+                                 g_fx_plugins[1]->set_param(param, val_str);
+                             }
+                         }
++                    } else if (strcmp(target, "fx3") == 0) {
++                        if (g_fx_count > 2) {
++                            if (g_fx_is_v2[2] && g_fx_plugins_v2[2] && g_fx_instances[2] && g_fx_plugins_v2[2]->set_param) {
++                                g_fx_plugins_v2[2]->set_param(g_fx_instances[2], param, val_str);
++                            } else if (g_fx_plugins[2] && g_fx_plugins[2]->set_param) {
++                                g_fx_plugins[2]->set_param(param, val_str);
++                            }
++                        }
++                    } else if (strcmp(target, "fx4") == 0) {
++                        if (g_fx_count > 3) {
++                            if (g_fx_is_v2[3] && g_fx_plugins_v2[3] && g_fx_instances[3] && g_fx_plugins_v2[3]->set_param) {
++                                g_fx_plugins_v2[3]->set_param(g_fx_instances[3], param, val_str);
++                            } else if (g_fx_plugins[3] && g_fx_plugins[3]->set_param) {
++                                g_fx_plugins[3]->set_param(param, val_str);
++                            }
++                        }
+                     } else if (strcmp(target, "midi_fx") == 0) {
+                         /* MIDI FX params handled separately */
+                     }
+@@ -3841,7 +3892,7 @@ static void plugin_set_param(const char *key, const char *val) {
+     }
+ 
+     /* Component UI mode - bypasses knob macro mappings */
+-    /* 0 = normal, 1 = synth, 2 = fx1, 3 = fx2 */
++    /* 0 = normal, 1 = synth, 2 = fx1, 3 = fx2, 4 = fx3, 5 = fx4 */
+     if (strcmp(key, "component_ui_mode") == 0) {
+         if (strcmp(val, "synth") == 0) {
+             g_component_ui_mode = 1;
+@@ -3849,6 +3900,10 @@ static void plugin_set_param(const char *key, const char *val) {
+             g_component_ui_mode = 2;
+         } else if (strcmp(val, "fx2") == 0) {
+             g_component_ui_mode = 3;
++        } else if (strcmp(val, "fx3") == 0) {
++            g_component_ui_mode = 4;
++        } else if (strcmp(val, "fx4") == 0) {
++            g_component_ui_mode = 5;
+         } else {
+             g_component_ui_mode = 0;  /* "none" or any other value */
+         }
+@@ -3959,6 +4014,32 @@ static void plugin_set_param(const char *key, const char *val) {
+         return;
+     }
+ 
++    /* Route to FX3 with fx3: prefix */
++    if (strncmp(key, "fx3:", 4) == 0) {
++        const char *subkey = key + 4;
++        if (g_fx_count > 2 && subkey[0] != '\0') {
++            if (g_fx_is_v2[2] && g_fx_plugins_v2[2] && g_fx_instances[2] && g_fx_plugins_v2[2]->set_param) {
++                g_fx_plugins_v2[2]->set_param(g_fx_instances[2], subkey, val);
++            } else if (g_fx_plugins[2] && g_fx_plugins[2]->set_param) {
++                g_fx_plugins[2]->set_param(subkey, val);
++            }
++        }
++        return;
++    }
++
++    /* Route to FX4 with fx4: prefix */
++    if (strncmp(key, "fx4:", 4) == 0) {
++        const char *subkey = key + 4;
++        if (g_fx_count > 3 && subkey[0] != '\0') {
++            if (g_fx_is_v2[3] && g_fx_plugins_v2[3] && g_fx_instances[3] && g_fx_plugins_v2[3]->set_param) {
++                g_fx_plugins_v2[3]->set_param(g_fx_instances[3], subkey, val);
++            } else if (g_fx_plugins[3] && g_fx_plugins[3]->set_param) {
++                g_fx_plugins[3]->set_param(subkey, val);
++            }
++        }
++        return;
++    }
++
+     /* Handle chain-level params */
+     if (strcmp(key, "patch") == 0) {
+         int index = atoi(val);
+@@ -4055,10 +4136,36 @@ static int plugin_get_param(const char *key, char *buf, int buf_len) {
+         return -1;
+     }
+ 
++    /* Route to FX3 with fx3: prefix */
++    if (strncmp(key, "fx3:", 4) == 0) {
++        const char *subkey = key + 4;
++        if (g_fx_count > 2 && subkey[0] != '\0') {
++            if (g_fx_is_v2[2] && g_fx_plugins_v2[2] && g_fx_instances[2] && g_fx_plugins_v2[2]->get_param) {
++                return g_fx_plugins_v2[2]->get_param(g_fx_instances[2], subkey, buf, buf_len);
++            } else if (g_fx_plugins[2] && g_fx_plugins[2]->get_param) {
++                return g_fx_plugins[2]->get_param(subkey, buf, buf_len);
++            }
++        }
++        return -1;
++    }
++
++    /* Route to FX4 with fx4: prefix */
++    if (strncmp(key, "fx4:", 4) == 0) {
++        const char *subkey = key + 4;
++        if (g_fx_count > 3 && subkey[0] != '\0') {
++            if (g_fx_is_v2[3] && g_fx_plugins_v2[3] && g_fx_instances[3] && g_fx_plugins_v2[3]->get_param) {
++                return g_fx_plugins_v2[3]->get_param(g_fx_instances[3], subkey, buf, buf_len);
++            } else if (g_fx_plugins[3] && g_fx_plugins[3]->get_param) {
++                return g_fx_plugins[3]->get_param(subkey, buf, buf_len);
++            }
++        }
++        return -1;
++    }
++
+     /* Component UI mode */
+     if (strcmp(key, "component_ui_mode") == 0) {
+-        const char *modes[] = {"none", "synth", "fx1", "fx2"};
+-        int mode_idx = (g_component_ui_mode >= 0 && g_component_ui_mode < 4) ? g_component_ui_mode : 0;
++        const char *modes[] = {"none", "synth", "fx1", "fx2", "fx3", "fx4"};
++        int mode_idx = (g_component_ui_mode >= 0 && g_component_ui_mode < 6) ? g_component_ui_mode : 0;
+         snprintf(buf, buf_len, "%s", modes[mode_idx]);
+         return 0;
+     }
+@@ -4133,6 +4240,8 @@ static int plugin_get_param(const char *key, char *buf, int buf_len) {
+                     ki = find_param_info(g_fx_params[1], g_fx_param_counts[1], km_param);
+                 } else if (strcmp(km_target, "fx3") == 0) {
+                     ki = find_param_info(g_fx_params[2], g_fx_param_counts[2], km_param);
++                } else if (strcmp(km_target, "fx4") == 0) {
++                    ki = find_param_info(g_fx_params[3], g_fx_param_counts[3], km_param);
+                 }
+                 const char *type_str = (ki && (ki->type == KNOB_TYPE_INT || ki->type == KNOB_TYPE_ENUM)) ? "int" : "float";
+                 float min_v = ki ? ki->min_val : 0.0f;
+@@ -4209,6 +4318,24 @@ static int plugin_get_param(const char *key, char *buf, int buf_len) {
+         }
+         return 0;
+     }
++    if (strcmp(key, "fx3_module") == 0) {
++        if (g_current_patch >= 0 && g_current_patch < g_patch_count &&
++            g_patches[g_current_patch].audio_fx_count > 2) {
++            snprintf(buf, buf_len, "%s", g_patches[g_current_patch].audio_fx[2].module);
++        } else {
++            buf[0] = '\0';
++        }
++        return 0;
++    }
++    if (strcmp(key, "fx4_module") == 0) {
++        if (g_current_patch >= 0 && g_current_patch < g_patch_count &&
++            g_patches[g_current_patch].audio_fx_count > 3) {
++            snprintf(buf, buf_len, "%s", g_patches[g_current_patch].audio_fx[3].module);
++        } else {
++            buf[0] = '\0';
++        }
++        return 0;
++    }
+     if (strcmp(key, "raw_midi") == 0) {
+         snprintf(buf, buf_len, "%d", g_raw_midi);
+         return 0;
+@@ -6924,6 +7051,12 @@ static int v2_load_from_patch_info(chain_instance_t *inst, patch_info_t *patch)
+         } else if (strcmp(target, "fx2") == 0 && inst->fx_count > 1 &&
+                    inst->fx_is_v2[1] && inst->fx_plugins_v2[1] && inst->fx_instances[1]) {
+             got = inst->fx_plugins_v2[1]->get_param(inst->fx_instances[1], param, val_buf, sizeof(val_buf));
++        } else if (strcmp(target, "fx3") == 0 && inst->fx_count > 2 &&
++                   inst->fx_is_v2[2] && inst->fx_plugins_v2[2] && inst->fx_instances[2]) {
++            got = inst->fx_plugins_v2[2]->get_param(inst->fx_instances[2], param, val_buf, sizeof(val_buf));
++        } else if (strcmp(target, "fx4") == 0 && inst->fx_count > 3 &&
++                   inst->fx_is_v2[3] && inst->fx_plugins_v2[3] && inst->fx_instances[3]) {
++            got = inst->fx_plugins_v2[3]->get_param(inst->fx_instances[3], param, val_buf, sizeof(val_buf));
+         } else if (strcmp(target, "midi_fx1") == 0 && inst->midi_fx_count > 0 &&
+                    inst->midi_fx_plugins[0] && inst->midi_fx_instances[0]) {
+             got = inst->midi_fx_plugins[0]->get_param(inst->midi_fx_instances[0], param, val_buf, sizeof(val_buf));
+@@ -7529,6 +7662,78 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
+             inst->dirty = 1;
+         }
+     }
++    else if (strncmp(key, "fx3:", 4) == 0) {
++        const char *subkey = key + 4;
++        if (strcmp(subkey, "module") == 0) {
++            v2_load_audio_fx_slot(inst, 2, val);
++            smoother_reset(&inst->fx_smoothers[2]);
++            inst->dirty = 1;
++        } else if (inst->fx_count > 2) {
++            if (chain_mod_is_target_active(inst, "fx3", subkey)) {
++                chain_mod_update_base_from_set_param(inst, "fx3", subkey, val);
++                mod_target_state_t *entry = chain_mod_find_target_entry(inst, "fx3", subkey);
++                if (entry) {
++                    chain_mod_apply_effective_value(inst, entry, 0);
++                    inst->dirty = 1;
++                    return;
++                }
++            }
++
++            float fval;
++            if (is_smoothable_float(val, &fval)) {
++                chain_param_info_t *pinfo = find_param_info(inst->fx_params[2], inst->fx_param_counts[2], subkey);
++                if (!pinfo || pinfo->type == KNOB_TYPE_FLOAT) {
++                    smoother_set_target(&inst->fx_smoothers[2], subkey, fval);
++                }
++            }
++            if (inst->fx_is_v2[2] && inst->fx_plugins_v2[2] && inst->fx_instances[2]) {
++                inst->fx_plugins_v2[2]->set_param(inst->fx_instances[2], subkey, val);
++            } else if (inst->fx_plugins[2] && inst->fx_plugins[2]->set_param) {
++                inst->fx_plugins[2]->set_param(subkey, val);
++            }
++            if (strcmp(subkey, "plugin_id") == 0) {
++                inst->fx_param_counts[2] = 0;
++                inst->mod_param_refresh_ms_fx[2] = 0;
++            }
++            inst->dirty = 1;
++        }
++    }
++    else if (strncmp(key, "fx4:", 4) == 0) {
++        const char *subkey = key + 4;
++        if (strcmp(subkey, "module") == 0) {
++            v2_load_audio_fx_slot(inst, 3, val);
++            smoother_reset(&inst->fx_smoothers[3]);
++            inst->dirty = 1;
++        } else if (inst->fx_count > 3) {
++            if (chain_mod_is_target_active(inst, "fx4", subkey)) {
++                chain_mod_update_base_from_set_param(inst, "fx4", subkey, val);
++                mod_target_state_t *entry = chain_mod_find_target_entry(inst, "fx4", subkey);
++                if (entry) {
++                    chain_mod_apply_effective_value(inst, entry, 0);
++                    inst->dirty = 1;
++                    return;
++                }
++            }
++
++            float fval;
++            if (is_smoothable_float(val, &fval)) {
++                chain_param_info_t *pinfo = find_param_info(inst->fx_params[3], inst->fx_param_counts[3], subkey);
++                if (!pinfo || pinfo->type == KNOB_TYPE_FLOAT) {
++                    smoother_set_target(&inst->fx_smoothers[3], subkey, fval);
++                }
++            }
++            if (inst->fx_is_v2[3] && inst->fx_plugins_v2[3] && inst->fx_instances[3]) {
++                inst->fx_plugins_v2[3]->set_param(inst->fx_instances[3], subkey, val);
++            } else if (inst->fx_plugins[3] && inst->fx_plugins[3]->set_param) {
++                inst->fx_plugins[3]->set_param(subkey, val);
++            }
++            if (strcmp(subkey, "plugin_id") == 0) {
++                inst->fx_param_counts[3] = 0;
++                inst->mod_param_refresh_ms_fx[3] = 0;
++            }
++            inst->dirty = 1;
++        }
++    }
+     else if (strncmp(key, "midi_fx1:", 9) == 0) {
+         const char *subkey = key + 9;
+         /* Intercept module change to swap MIDI FX1 dynamically */
+@@ -7693,6 +7898,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
+                         pinfo = find_param_info(inst->fx_params[1], inst->fx_param_counts[1], param);
+                     } else if (strcmp(target, "fx3") == 0 && inst->fx_count > 2) {
+                         pinfo = find_param_info(inst->fx_params[2], inst->fx_param_counts[2], param);
++                    } else if (strcmp(target, "fx4") == 0 && inst->fx_count > 3) {
++                        pinfo = find_param_info(inst->fx_params[3], inst->fx_param_counts[3], param);
+                     } else if (strcmp(target, "midi_fx1") == 0 && inst->midi_fx_count > 0) {
+                         pinfo = find_param_info(inst->midi_fx_params[0], inst->midi_fx_param_counts[0], param);
+                     } else if (strcmp(target, "midi_fx2") == 0 && inst->midi_fx_count > 1) {
+@@ -8129,6 +8336,12 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
+     if (strcmp(key, "fx2_module") == 0) {
+         return snprintf(buf, buf_len, "%s", inst->current_fx_modules[1]);
+     }
++    if (strcmp(key, "fx3_module") == 0) {
++        return snprintf(buf, buf_len, "%s", inst->current_fx_modules[2]);
++    }
++    if (strcmp(key, "fx4_module") == 0) {
++        return snprintf(buf, buf_len, "%s", inst->current_fx_modules[3]);
++    }
+     if (strcmp(key, "midi_fx_count") == 0) {
+         return snprintf(buf, buf_len, "%d", inst->midi_fx_count);
+     }
+@@ -8247,6 +8460,12 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
+             } else if (strcmp(target, "fx2") == 0 && inst->fx_count > 1 &&
+                        inst->fx_is_v2[1] && inst->fx_plugins_v2[1] && inst->fx_instances[1]) {
+                 got = inst->fx_plugins_v2[1]->get_param(inst->fx_instances[1], param, val_buf, sizeof(val_buf));
++            } else if (strcmp(target, "fx3") == 0 && inst->fx_count > 2 &&
++                       inst->fx_is_v2[2] && inst->fx_plugins_v2[2] && inst->fx_instances[2]) {
++                got = inst->fx_plugins_v2[2]->get_param(inst->fx_instances[2], param, val_buf, sizeof(val_buf));
++            } else if (strcmp(target, "fx4") == 0 && inst->fx_count > 3 &&
++                       inst->fx_is_v2[3] && inst->fx_plugins_v2[3] && inst->fx_instances[3]) {
++                got = inst->fx_plugins_v2[3]->get_param(inst->fx_instances[3], param, val_buf, sizeof(val_buf));
+             } else if (strcmp(target, "midi_fx1") == 0 && inst->midi_fx_count > 0 &&
+                        inst->midi_fx_plugins[0] && inst->midi_fx_instances[0]) {
+                 got = inst->midi_fx_plugins[0]->get_param(inst->midi_fx_instances[0], param, val_buf, sizeof(val_buf));
+@@ -8290,6 +8509,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
+                         pinfo = find_param_info(inst->fx_params[1], inst->fx_param_counts[1], param);
+                     } else if (strcmp(target, "fx3") == 0 && inst->fx_count > 2) {
+                         pinfo = find_param_info(inst->fx_params[2], inst->fx_param_counts[2], param);
++                    } else if (strcmp(target, "fx4") == 0 && inst->fx_count > 3) {
++                        pinfo = find_param_info(inst->fx_params[3], inst->fx_param_counts[3], param);
+                     } else if (strcmp(target, "midi_fx1") == 0 && inst->midi_fx_count > 0) {
+                         pinfo = find_param_info(inst->midi_fx_params[0], inst->midi_fx_param_counts[0], param);
+                     } else if (strcmp(target, "midi_fx2") == 0 && inst->midi_fx_count > 1) {
+@@ -8566,6 +8787,148 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
+         return -1;
+     }
+ 
++    /* Route fx3: prefixed params to FX3 (strip prefix) */
++    if (strncmp(key, "fx3:", 4) == 0) {
++        const char *subkey = key + 4;
++        int base_result = chain_mod_get_base_for_subkey(inst, "fx3", subkey, buf, buf_len);
++        if (base_result >= 0) return base_result;
++        int mod_result = chain_mod_get_modulated_for_subkey(inst, "fx3", subkey, buf, buf_len);
++        if (mod_result >= 0) return mod_result;
++
++        if (strcmp(subkey, "ui_hierarchy") == 0 && inst->fx_count > 2) {
++            if (inst->fx_ui_hierarchy[2][0]) {
++                int len = strlen(inst->fx_ui_hierarchy[2]);
++                if (len < buf_len) {
++                    strcpy(buf, inst->fx_ui_hierarchy[2]);
++                    return len;
++                }
++            }
++        }
++
++        if (strcmp(subkey, "chain_params") == 0 && inst->fx_count > 2) {
++            if (inst->fx_is_v2[2] && inst->fx_plugins_v2[2] && inst->fx_instances[2] && inst->fx_plugins_v2[2]->get_param) {
++                int result = inst->fx_plugins_v2[2]->get_param(inst->fx_instances[2], subkey, buf, buf_len);
++                if (result > 0) return result;
++            } else if (inst->fx_plugins[2] && inst->fx_plugins[2]->get_param) {
++                int result = inst->fx_plugins[2]->get_param(subkey, buf, buf_len);
++                if (result > 0) return result;
++            }
++            if (inst->fx_param_counts[2] > 0) {
++                int offset = 0;
++                offset += snprintf(buf + offset, buf_len - offset, "[");
++                for (int i = 0; i < inst->fx_param_counts[2] && offset < buf_len - 100; i++) {
++                    chain_param_info_t *p = &inst->fx_params[2][i];
++                    if (i > 0) offset += snprintf(buf + offset, buf_len - offset, ",");
++                    const char *type_str = (p->type == KNOB_TYPE_INT) ? "int" :
++                                          (p->type == KNOB_TYPE_ENUM) ? "enum" : "float";
++                    offset += snprintf(buf + offset, buf_len - offset,
++                        "{\"key\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"min\":%g,\"max\":%g",
++                        p->key, p->name[0] ? p->name : p->key,
++                        type_str,
++                        p->min_val, p->max_val);
++                    if (p->type == KNOB_TYPE_ENUM && p->option_count > 0) {
++                        offset += snprintf(buf + offset, buf_len - offset, ",\"options\":[");
++                        for (int j = 0; j < p->option_count && j < MAX_ENUM_OPTIONS; j++) {
++                            if (j > 0) offset += snprintf(buf + offset, buf_len - offset, ",");
++                            offset += snprintf(buf + offset, buf_len - offset, "\"%s\"", p->options[j]);
++                        }
++                        offset += snprintf(buf + offset, buf_len - offset, "]");
++                    }
++                    if (p->unit[0]) {
++                        offset += snprintf(buf + offset, buf_len - offset, ",\"unit\":\"%s\"", p->unit);
++                    }
++                    if (p->display_format[0]) {
++                        offset += snprintf(buf + offset, buf_len - offset, ",\"display_format\":\"%s\"", p->display_format);
++                    }
++                    offset += snprintf(buf + offset, buf_len - offset, "}");
++                }
++                offset += snprintf(buf + offset, buf_len - offset, "]");
++                return offset;
++            }
++            return -1;
++        }
++
++        if (inst->fx_count > 2) {
++            if (inst->fx_is_v2[2] && inst->fx_plugins_v2[2] && inst->fx_instances[2] && inst->fx_plugins_v2[2]->get_param) {
++                return inst->fx_plugins_v2[2]->get_param(inst->fx_instances[2], subkey, buf, buf_len);
++            } else if (inst->fx_plugins[2] && inst->fx_plugins[2]->get_param) {
++                return inst->fx_plugins[2]->get_param(subkey, buf, buf_len);
++            }
++        }
++        return -1;
++    }
++
++    /* Route fx4: prefixed params to FX4 (strip prefix) */
++    if (strncmp(key, "fx4:", 4) == 0) {
++        const char *subkey = key + 4;
++        int base_result = chain_mod_get_base_for_subkey(inst, "fx4", subkey, buf, buf_len);
++        if (base_result >= 0) return base_result;
++        int mod_result = chain_mod_get_modulated_for_subkey(inst, "fx4", subkey, buf, buf_len);
++        if (mod_result >= 0) return mod_result;
++
++        if (strcmp(subkey, "ui_hierarchy") == 0 && inst->fx_count > 3) {
++            if (inst->fx_ui_hierarchy[3][0]) {
++                int len = strlen(inst->fx_ui_hierarchy[3]);
++                if (len < buf_len) {
++                    strcpy(buf, inst->fx_ui_hierarchy[3]);
++                    return len;
++                }
++            }
++        }
++
++        if (strcmp(subkey, "chain_params") == 0 && inst->fx_count > 3) {
++            if (inst->fx_is_v2[3] && inst->fx_plugins_v2[3] && inst->fx_instances[3] && inst->fx_plugins_v2[3]->get_param) {
++                int result = inst->fx_plugins_v2[3]->get_param(inst->fx_instances[3], subkey, buf, buf_len);
++                if (result > 0) return result;
++            } else if (inst->fx_plugins[3] && inst->fx_plugins[3]->get_param) {
++                int result = inst->fx_plugins[3]->get_param(subkey, buf, buf_len);
++                if (result > 0) return result;
++            }
++            if (inst->fx_param_counts[3] > 0) {
++                int offset = 0;
++                offset += snprintf(buf + offset, buf_len - offset, "[");
++                for (int i = 0; i < inst->fx_param_counts[3] && offset < buf_len - 100; i++) {
++                    chain_param_info_t *p = &inst->fx_params[3][i];
++                    if (i > 0) offset += snprintf(buf + offset, buf_len - offset, ",");
++                    const char *type_str = (p->type == KNOB_TYPE_INT) ? "int" :
++                                          (p->type == KNOB_TYPE_ENUM) ? "enum" : "float";
++                    offset += snprintf(buf + offset, buf_len - offset,
++                        "{\"key\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"min\":%g,\"max\":%g",
++                        p->key, p->name[0] ? p->name : p->key,
++                        type_str,
++                        p->min_val, p->max_val);
++                    if (p->type == KNOB_TYPE_ENUM && p->option_count > 0) {
++                        offset += snprintf(buf + offset, buf_len - offset, ",\"options\":[");
++                        for (int j = 0; j < p->option_count && j < MAX_ENUM_OPTIONS; j++) {
++                            if (j > 0) offset += snprintf(buf + offset, buf_len - offset, ",");
++                            offset += snprintf(buf + offset, buf_len - offset, "\"%s\"", p->options[j]);
++                        }
++                        offset += snprintf(buf + offset, buf_len - offset, "]");
++                    }
++                    if (p->unit[0]) {
++                        offset += snprintf(buf + offset, buf_len - offset, ",\"unit\":\"%s\"", p->unit);
++                    }
++                    if (p->display_format[0]) {
++                        offset += snprintf(buf + offset, buf_len - offset, ",\"display_format\":\"%s\"", p->display_format);
++                    }
++                    offset += snprintf(buf + offset, buf_len - offset, "}");
++                }
++                offset += snprintf(buf + offset, buf_len - offset, "]");
++                return offset;
++            }
++            return -1;
++        }
++
++        if (inst->fx_count > 3) {
++            if (inst->fx_is_v2[3] && inst->fx_plugins_v2[3] && inst->fx_instances[3] && inst->fx_plugins_v2[3]->get_param) {
++                return inst->fx_plugins_v2[3]->get_param(inst->fx_instances[3], subkey, buf, buf_len);
++            } else if (inst->fx_plugins[3] && inst->fx_plugins[3]->get_param) {
++                return inst->fx_plugins[3]->get_param(subkey, buf, buf_len);
++            }
++        }
++        return -1;
++    }
++
+     /* Route midi_fx1: prefixed params to MIDI FX1 (strip prefix) */
+     if (strncmp(key, "midi_fx1:", 9) == 0) {
+         const char *subkey = key + 9;
+diff --git a/src/schwung_shim.c b/src/schwung_shim.c
+index e1268000..2f3df270 100644
+--- a/src/schwung_shim.c
++++ b/src/schwung_shim.c
+@@ -1844,6 +1844,19 @@ static void shadow_latency_delay_apply(int slot, const int16_t *in,
+     shadow_latency_delay_wp[slot] = wp + FRAMES_PER_BLOCK * 2;
+ }
+ 
++static inline void accumulate_sends(int slot, const int16_t *fx_buf,
++                                    int32_t send_accum[][FRAMES_PER_BLOCK * 2]) {
++    float vol = shadow_effective_volume(slot) * shadow_chain_slots[slot].fade.gain;
++    float levels[SEND_BUS_COUNT] = { shadow_chain_slots[slot].send_a,
++                                     shadow_chain_slots[slot].send_b };
++    for (int b = 0; b < SEND_BUS_COUNT; b++) {
++        if (levels[b] < 0.001f) continue;
++        float g = levels[b] * vol;
++        for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++)
++            send_accum[b][i] += (int32_t)lroundf((float)fx_buf[i] * g);
++    }
++}
++
+ static void shadow_inprocess_mix_from_buffer(void) {
+     if (!shadow_inprocess_ready || !global_mmap_addr) return;
+     if (!shadow_deferred_dsp_valid) return;  /* No buffer to mix yet */
+@@ -1862,8 +1875,9 @@ static void shadow_inprocess_mix_from_buffer(void) {
+     int any_la_rebuild = (link_audio.enabled && link_audio_routing_enabled &&
+                          shadow_chain_process_fx && shim_move_channel_count() >= 4);
+     int any_capture = (sampler_source == SAMPLER_SOURCE_RESAMPLE);
++    int any_send_fx = (shadow_send_fx_bus_active(0) || shadow_send_fx_bus_active(1));
+ 
+-    if (!any_slot && !any_mfx && !any_overtake_dsp && !any_la_rebuild && !any_capture) {
++    if (!any_slot && !any_mfx && !any_overtake_dsp && !any_la_rebuild && !any_capture && !any_send_fx) {
+         int16_t *mailbox_audio = (int16_t *)(global_mmap_addr + AUDIO_OUT_OFFSET);
+         memcpy(native_bridge_move_component, mailbox_audio, AUDIO_BUFFER_SIZE);
+         memset(native_bridge_me_component, 0, AUDIO_BUFFER_SIZE);
+@@ -1890,6 +1904,10 @@ static void shadow_inprocess_mix_from_buffer(void) {
+     int32_t me_unity[FRAMES_PER_BLOCK * 2];
+     memset(me_unity, 0, sizeof(me_unity));
+ 
++    /* Send bus accumulators — post-fader taps summed across all slots */
++    int32_t send_accum[SEND_BUS_COUNT][FRAMES_PER_BLOCK * 2];
++    memset(send_accum, 0, sizeof(send_accum));
++
+     /* Zero-and-rebuild approach: if Link Audio provides per-track data,
+      * zero the mailbox and rebuild from Link Audio, applying FX per-slot.
+      * This completely eliminates dry signal leakage — no subtraction needed.
+@@ -2205,6 +2223,7 @@ static void shadow_inprocess_mix_from_buffer(void) {
+                     me_unity[i] += (int32_t)lroundf((float)fx_buf[i] * vol);
+                     if (i & 1) shadow_fade_advance(s);
+                 }
++                accumulate_sends(s, fx_buf, send_accum);
+             } else if (have_move_track) {
+                 /* Inactive slot: pass Link Audio through at unity level.
+                  * Master volume is applied after capture at the end. */
+@@ -2262,6 +2281,7 @@ skip_la_rebuild:
+                     me_unity[i] += contrib;
+                     if (i & 1) shadow_fade_advance(s);
+                 }
++                accumulate_sends(s, fx_buf, send_accum);
+             } else if (shadow_slot_deferred_valid[s]) {
+                 /* Fallback: FX not deferred — run inline (legacy path) */
+                 if (shadow_slot_fx_idle[s] && shadow_slot_idle[s]) continue;
+@@ -2307,6 +2327,40 @@ skip_la_rebuild:
+                     me_unity[i] += contrib;
+                     if (i & 1) shadow_fade_advance(s);
+                 }
++                accumulate_sends(s, fx_buf, send_accum);
++            }
++        }
++    }
++
++    /* Process send FX buses and sum returns into ME bus (before Master FX) */
++    for (int b = 0; b < SEND_BUS_COUNT; b++) {
++        if (!shadow_send_fx_bus_active(b)) continue;
++
++        int16_t send_buf[FRAMES_PER_BLOCK * 2];
++        for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
++            int32_t v = send_accum[b][i];
++            if (v > 32767) v = 32767;
++            if (v < -32768) v = -32768;
++            send_buf[i] = (int16_t)v;
++        }
++
++        for (int fx = 0; fx < SEND_FX_SLOTS; fx++) {
++            master_fx_slot_t *sf = &shadow_send_fx_slots[b][fx];
++            if (!(sf->instance && sf->api && sf->api->process_block)) continue;
++            if (sf->bypassed) continue;
++            sf->api->process_block(sf->instance, send_buf, FRAMES_PER_BLOCK);
++        }
++
++        for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
++            me_full[i] += (int32_t)send_buf[i];
++            me_unity[i] += (int32_t)send_buf[i];
++        }
++        if (rebuild_from_la) {
++            for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
++                int32_t mixed = (int32_t)mailbox_audio[i] + (int32_t)send_buf[i];
++                if (mixed > 32767) mixed = 32767;
++                if (mixed < -32768) mixed = -32768;
++                mailbox_audio[i] = (int16_t)mixed;
+             }
+         }
+     }
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index fa954985..6e9bd6e5 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -170,6 +170,12 @@ import {
+     getMasterFxDisplayName as _getMasterFxDisplayName,
+     enterMasterFxSettings as _enterMasterFxSettings
+ } from './shadow_ui_master_fx.mjs';
++import {
++    enterSendFxSettings as _enterSendFxSettings,
++    drawSendFx as _drawSendFx,
++    handleSendFxJog, handleSendFxSelect,
++    handleSendFxBack, handleSendFxShiftSelect
++} from './shadow_ui_send_fx.mjs';
+ import {
+     scanForToolModules as _scanForToolModules,
+     enterToolsMenu as _enterToolsMenu,
+@@ -312,7 +318,9 @@ const VIEWS = {
+     LFO_EDIT: "lfoedit",                      // LFO sub-menu editor
+     ANALYTICS_PROMPT: "analyticsprompt",       // First-run analytics opt-out prompt
+     LFO_TARGET_COMPONENT: "lfotargetcomp",    // LFO target picker step 1: component
+-    LFO_TARGET_PARAM: "lfotargetparam"        // LFO target picker step 2: parameter
++    LFO_TARGET_PARAM: "lfotargetparam",       // LFO target picker step 2: parameter
++    SEND_FX: "sendfx",                        // Send FX A/B editor
++    FX_BUS_PICKER: "fxbuspicker"              // Pick Master FX / Send A / Send B
+ };
+ 
+ /* Special action key for swap module option */
+@@ -324,7 +332,9 @@ const CHAIN_COMPONENTS = [
+     { key: "synth", label: "Synth", position: 1 },
+     { key: "fx1", label: "FX 1", position: 2 },
+     { key: "fx2", label: "FX 2", position: 3 },
+-    { key: "settings", label: "Settings", position: 4 }
++    { key: "fx3", label: "FX 3", position: 4 },
++    { key: "fx4", label: "FX 4", position: 5 },
++    { key: "settings", label: "Settings", position: 6 }
+ ];
+ 
+ /* Module abbreviations cache - populated from module.json "abbrev" field */
+@@ -337,10 +347,12 @@ const moduleAbbrevCache = {
+ /* In-memory chain configuration (for future save/load) */
+ function createEmptyChainConfig() {
+     return {
+-        midiFx: null,    // { module: "chord", params: {} } or null
+-        synth: null,     // { module: "dexed", params: {} } or null
+-        fx1: null,       // { module: "freeverb", params: {} } or null
+-        fx2: null        // { module: "cloudseed", params: {} } or null
++        midiFx: null,
++        synth: null,
++        fx1: null,
++        fx2: null,
++        fx3: null,
++        fx4: null
+     };
+ }
+ 
+@@ -1600,6 +1612,8 @@ function processAllUpdates() {
+ const CHAIN_SETTINGS_ITEMS = [
+     { key: "knobs", label: "Knobs", type: "action" },  // Opens knob assignment editor
+     { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 4, step: 0.05 },
++    { key: "slot:send_a", label: "Send A", type: "float", min: 0, max: 1, step: 0.05 },
++    { key: "slot:send_b", label: "Send B", type: "float", min: 0, max: 1, step: 0.05 },
+     { key: "slot:muted", label: "Muted", type: "int", min: 0, max: 1, step: 1 },
+     { key: "slot:soloed", label: "Soloed", type: "int", min: 0, max: 1, step: 1 },
+     { key: "slot:receive_channel", label: "Recv Ch", type: "int", min: 0, max: 16, step: 1 },
+@@ -1615,6 +1629,7 @@ const CHAIN_SETTINGS_ITEMS = [
+ ];
+ let selectedChainSetting = 0;
+ let editingChainSettingValue = false;
++let hierEditorReturnView = null;
+ 
+ /* LFO editor state — generic context drives slot or MFX LFO */
+ let lfoCtx = null;  /* Active LFO context: { lfoIdx, getParam, setParam, getTargetComponents, getTargetParams, title, returnView, returnAnnounce } */
+@@ -2751,20 +2766,29 @@ function loadChainConfigFromSlot(slotIndex) {
+     const midiFxModule = getSlotParam(slotIndex, "midi_fx1_module");
+     const fx1Module = getSlotParam(slotIndex, "fx1_module");
+     const fx2Module = getSlotParam(slotIndex, "fx2_module");
++    const fx3Module = getSlotParam(slotIndex, "fx3_module");
++    const fx4Module = getSlotParam(slotIndex, "fx4_module");
+ 
+     const oldFx1 = cfg.fx1 ? cfg.fx1.module : null;
+     const oldFx2 = cfg.fx2 ? cfg.fx2.module : null;
++    const oldFx3 = cfg.fx3 ? cfg.fx3.module : null;
++    const oldFx4 = cfg.fx4 ? cfg.fx4.module : null;
+ 
+     cfg.synth = synthModule && synthModule !== "" ? { module: synthModule.toLowerCase(), params: {} } : null;
+     cfg.midiFx = midiFxModule && midiFxModule !== "" ? { module: midiFxModule.toLowerCase(), params: {} } : null;
+     cfg.fx1 = fx1Module && fx1Module !== "" ? { module: fx1Module.toLowerCase(), params: {} } : null;
+     cfg.fx2 = fx2Module && fx2Module !== "" ? { module: fx2Module.toLowerCase(), params: {} } : null;
++    cfg.fx3 = fx3Module && fx3Module !== "" ? { module: fx3Module.toLowerCase(), params: {} } : null;
++    cfg.fx4 = fx4Module && fx4Module !== "" ? { module: fx4Module.toLowerCase(), params: {} } : null;
+ 
+-    /* Clear display_name cache when FX modules change (prevents stale announcement on swap) */
+     const newFx1 = cfg.fx1 ? cfg.fx1.module : null;
+     const newFx2 = cfg.fx2 ? cfg.fx2.module : null;
++    const newFx3 = cfg.fx3 ? cfg.fx3.module : null;
++    const newFx4 = cfg.fx4 ? cfg.fx4.module : null;
+     if (newFx1 !== oldFx1) delete fxDisplayNameCache[`${slotIndex}:fx1`];
+     if (newFx2 !== oldFx2) delete fxDisplayNameCache[`${slotIndex}:fx2`];
++    if (newFx3 !== oldFx3) delete fxDisplayNameCache[`${slotIndex}:fx3`];
++    if (newFx4 !== oldFx4) delete fxDisplayNameCache[`${slotIndex}:fx4`];
+ 
+     chainConfigs[slotIndex] = cfg;
+     return cfg;
+@@ -2776,7 +2800,9 @@ function getSlotModuleSignature(slotIndex) {
+     const midiFxModule = getSlotParam(slotIndex, "midi_fx1_module") || "";
+     const fx1Module = getSlotParam(slotIndex, "fx1_module") || "";
+     const fx2Module = getSlotParam(slotIndex, "fx2_module") || "";
+-    return `${synthModule}|${midiFxModule}|${fx1Module}|${fx2Module}`;
++    const fx3Module = getSlotParam(slotIndex, "fx3_module") || "";
++    const fx4Module = getSlotParam(slotIndex, "fx4_module") || "";
++    return `${synthModule}|${midiFxModule}|${fx1Module}|${fx2Module}|${fx3Module}|${fx4Module}`;
+ }
+ 
+ /* Refresh module signature for a slot and invalidate knob cache on changes */
+@@ -3842,6 +3868,8 @@ function getComponentChainParams(slot, componentKey) {
+     const key = componentKey === "synth" ? "synth:chain_params" :
+                 componentKey === "fx1" ? "fx1:chain_params" :
+                 componentKey === "fx2" ? "fx2:chain_params" :
++                componentKey === "fx3" ? "fx3:chain_params" :
++                componentKey === "fx4" ? "fx4:chain_params" :
+                 componentKey === "midiFx" ? "midi_fx1:chain_params" : null;
+     if (!key) return [];
+ 
+@@ -3860,6 +3888,8 @@ function getComponentHierarchy(slot, componentKey) {
+     const key = componentKey === "synth" ? "synth:ui_hierarchy" :
+                 componentKey === "fx1" ? "fx1:ui_hierarchy" :
+                 componentKey === "fx2" ? "fx2:ui_hierarchy" :
++                componentKey === "fx3" ? "fx3:ui_hierarchy" :
++                componentKey === "fx4" ? "fx4:ui_hierarchy" :
+                 componentKey === "midiFx" ? "midi_fx1:ui_hierarchy" : null;
+     if (!key) {
+         debugLog(`getComponentHierarchy: no key for componentKey=${componentKey}`);
+@@ -4446,6 +4476,50 @@ function buildSlotPatchJson(slotIndex, name, forAutosave, moduleChanged) {
+             bypassed: parseInt(getSlotParam(slotIndex, "fx2:bypassed") || "0", 10) === 1 ? 1 : 0
+         });
+     }
++    if (cfg.fx3 && cfg.fx3.module) {
++        let fx3Config = cfg.fx3.params || {};
++        const fx3StateJson = getSlotStateWithRetry(slotIndex, "fx3:state");
++        if (fx3StateJson) {
++            try {
++                const state = JSON.parse(fx3StateJson);
++                fx3Config = { state: state };
++            } catch (e) {
++                fx3Config = { state: fx3StateJson };
++            }
++        } else if (bailIfEmpty) {
++            debugLog("buildSlotPatchJson: slot " + slotIndex +
++                     " fx3:state empty after retries — bailing (preserving existing slot_" +
++                     slotIndex + ".json)");
++            return null;
++        }
++        patch.audio_fx.push({
++            type: cfg.fx3.module,
++            params: fx3Config,
++            bypassed: parseInt(getSlotParam(slotIndex, "fx3:bypassed") || "0", 10) === 1 ? 1 : 0
++        });
++    }
++    if (cfg.fx4 && cfg.fx4.module) {
++        let fx4Config = cfg.fx4.params || {};
++        const fx4StateJson = getSlotStateWithRetry(slotIndex, "fx4:state");
++        if (fx4StateJson) {
++            try {
++                const state = JSON.parse(fx4StateJson);
++                fx4Config = { state: state };
++            } catch (e) {
++                fx4Config = { state: fx4StateJson };
++            }
++        } else if (bailIfEmpty) {
++            debugLog("buildSlotPatchJson: slot " + slotIndex +
++                     " fx4:state empty after retries — bailing (preserving existing slot_" +
++                     slotIndex + ".json)");
++            return null;
++        }
++        patch.audio_fx.push({
++            type: cfg.fx4.module,
++            params: fx4Config,
++            bypassed: parseInt(getSlotParam(slotIndex, "fx4:bypassed") || "0", 10) === 1 ? 1 : 0
++        });
++    }
+ 
+     /* Include slot channel settings */
+     const recvCh = getSlotParam(slotIndex, "slot:receive_channel");
+@@ -6614,7 +6688,7 @@ function scanModulesForType(componentType) {
+     } else if (componentType === "midiFx") {
+         searchDirs = [`${MODULES_DIR}/midi_fx`];
+         expectedTypes = ["midi_fx"];
+-    } else if (componentType === "fx1" || componentType === "fx2") {
++    } else if (componentType === "fx1" || componentType === "fx2" || componentType === "fx3" || componentType === "fx4") {
+         searchDirs = [`${MODULES_DIR}/audio_fx`];
+         expectedTypes = ["audio_fx"];
+     }
+@@ -7347,6 +7421,12 @@ function applyComponentSelection() {
+         case "fx2":
+             paramKey = "fx2:module";
+             break;
++        case "fx3":
++            paramKey = "fx3:module";
++            break;
++        case "fx4":
++            paramKey = "fx4:module";
++            break;
+         case "midiFx":
+             paramKey = "midi_fx1:module";
+             break;
+@@ -7450,6 +7530,10 @@ function getChainSettingValue(slot, setting) {
+         const pct = Math.round(parseFloat(val) * 100);
+         return `${pct}%`;
+     }
++    if (setting.key === "slot:send_a" || setting.key === "slot:send_b") {
++        const pct = Math.round(parseFloat(val) * 100);
++        return `${pct}%`;
++    }
+     if (setting.key === "slot:muted") {
+         return parseInt(val) ? "Yes" : "No";
+     }
+@@ -7577,6 +7661,18 @@ function getKnobTargets(slot) {
+         targets.push({ id: "fx2", name: `FX2: ${name}` });
+     }
+ 
++    /* FX 3 */
++    if (cfg.fx3 && cfg.fx3.module) {
++        const name = getSlotParam(slot, "fx3:name") || cfg.fx3.module;
++        targets.push({ id: "fx3", name: `FX3: ${name}` });
++    }
++
++    /* FX 4 */
++    if (cfg.fx4 && cfg.fx4.module) {
++        const name = getSlotParam(slot, "fx4:name") || cfg.fx4.module;
++        targets.push({ id: "fx4", name: `FX4: ${name}` });
++    }
++
+     return targets;
+ }
+ 
+@@ -8354,6 +8450,61 @@ function enterMasterFxHierarchyEditor(fxSlot) {
+     }
+ }
+ 
++function enterSendFxHierarchyEditor(bus, fxSlot) {
++    if (fxSlot < 0 || fxSlot >= 3) return;
++    const busKey = bus === 0 ? "a" : "b";
++    const busLabel = bus === 0 ? "Send FX A" : "Send FX B";
++    const compKey = `send_fx:${busKey}:fx${fxSlot + 1}`;
++
++    const hierJson = shadow_get_param(0, `${compKey}:ui_hierarchy`);
++    let hierarchy = null;
++    if (hierJson) {
++        try { hierarchy = JSON.parse(hierJson); } catch (e) { /* ignore */ }
++    }
++    if (!hierarchy) return;
++
++    hideOverlay();
++    invalidateKnobContextCache();
++    pendingHierKnobIndex = -1;
++    pendingHierKnobDelta = 0;
++
++    hierEditorSlot = 0;
++    hierEditorComponent = compKey;
++    hierEditorHierarchy = hierarchy;
++    hierEditorLevel = hierarchy.modes ? null : "root";
++    hierEditorPath = [];
++    hierEditorChildIndex = -1;
++    hierEditorChildCount = 0;
++    hierEditorChildLabel = "";
++    hierEditorSelectedIdx = 0;
++    hierEditorEditMode = false;
++    resetHierarchyEditState();
++    hierEditorIsMasterFx = false;
++    hierEditorMasterFxSlot = -1;
++    resetDynamicParamPickerState();
++
++    const cpJson = shadow_get_param(0, `${compKey}:chain_params`);
++    hierEditorChainParams = [];
++    if (cpJson) {
++        try { hierEditorChainParams = JSON.parse(cpJson); } catch (e) { /* ignore */ }
++    }
++
++    setupModuleParamShims(0, compKey);
++    loadHierarchyLevel();
++
++    hierEditorReturnView = VIEWS.SEND_FX;
++    setView(VIEWS.HIERARCHY_EDITOR);
++    needsRedraw = true;
++
++    const moduleName = shadow_get_param(0, `${compKey}:name`) || `FX ${fxSlot + 1}`;
++    if (hierEditorParams.length > 0) {
++        const param = hierEditorParams[0];
++        announce(`${busLabel} ${moduleName}, ${param.label || param.key}: ${param.value || ""}`);
++    } else {
++        announce(`${busLabel} ${moduleName}, No parameters`);
++    }
++}
++
+ /* Load params and knobs for current hierarchy level */
+ function loadHierarchyLevel() {
+     if (!hierEditorHierarchy) return;
+@@ -8553,7 +8704,12 @@ function exitHierarchyEditor() {
+     filepathBrowserParamKey = "";
+     resetDynamicParamPickerState();
+ 
+-    view = returnToMasterFx ? VIEWS.MASTER_FX : VIEWS.CHAIN_EDIT;
++    if (hierEditorReturnView) {
++        view = hierEditorReturnView;
++        hierEditorReturnView = null;
++    } else {
++        view = returnToMasterFx ? VIEWS.MASTER_FX : VIEWS.CHAIN_EDIT;
++    }
+     needsRedraw = true;
+ }
+ 
+@@ -11490,6 +11646,12 @@ function handleJog(delta) {
+         case VIEWS.SLOT_SETTINGS:
+             handleSlotSettingsJog(delta);
+             break;
++        case VIEWS.SEND_FX:
++            handleSendFxJog(delta);
++            break;
++        case VIEWS.FX_BUS_PICKER:
++            fxBusPickerIndex = Math.max(0, Math.min(2, fxBusPickerIndex + delta));
++            break;
+         case VIEWS.PATCHES:
+             handlePatchesJog(delta);
+             break;
+@@ -11987,6 +12149,16 @@ function handleSelect() {
+         case VIEWS.SLOT_SETTINGS:
+             handleSlotSettingsSelect();
+             break;
++        case VIEWS.SEND_FX:
++            handleSendFxSelect();
++            break;
++        case VIEWS.FX_BUS_PICKER:
++            if (fxBusPickerIndex === 0) {
++                enterMasterFxSettings();
++            } else {
++                enterSendFxSettings(fxBusPickerIndex - 1);
++            }
++            break;
+         case VIEWS.PATCHES:
+             handlePatchesSelect();
+             break;
+@@ -12844,6 +13016,17 @@ function handleBack() {
+         case VIEWS.COMPONENT_PARAMS:
+             handleComponentParamsBack();
+             break;
++        case VIEWS.SEND_FX:
++            handleSendFxBack();
++            break;
++        case VIEWS.FX_BUS_PICKER:
++            if (coRunChainEditSlot >= 0) {
++                view = VIEWS.CHAIN_EDIT;
++                coRunView = VIEWS.CHAIN_EDIT;
++            } else {
++                exitShadowUI();
++            }
++            break;
+         case VIEWS.MASTER_FX:
+             if (masterShowingNamePreview) {
+                 /* Cancel name preview */
+@@ -12893,10 +13076,7 @@ function handleBack() {
+                 needsRedraw = true;
+                 announce("Master FX");
+             } else {
+-                /* Exit shadow mode and return to Move */
+-                if (typeof shadow_request_exit === "function") {
+-                    shadow_request_exit();
+-                }
++                enterFxBusPicker();
+             }
+             break;
+         case VIEWS.CHAIN_EDIT:
+@@ -13046,8 +13226,9 @@ function handleBack() {
+             } else {
+                 /* At root level - exit hierarchy editor */
+                 const wasMasterFx = hierEditorIsMasterFx;
++                const returnView = hierEditorReturnView;
+                 exitHierarchyEditor();
+-                announce(wasMasterFx ? "Master FX" : "Chain Editor");
++                announce(wasMasterFx ? "Master FX" : returnView === VIEWS.SEND_FX ? "Send FX" : "Chain Editor");
+             }
+             break;
+         }
+@@ -13365,12 +13546,12 @@ function drawChainEdit() {
+     const cfg = chainConfigs[selectedSlot] || createEmptyChainConfig();
+     const chainSelected = selectedChainComponent === -1;
+ 
+-    /* Calculate box layout - 5 components, offset right to make room for slot indicators */
+-    const BOX_W = 22;
++    /* Calculate box layout - 7 components, offset right to make room for slot indicators */
++    const BOX_W = 16;
+     const BOX_H = 16;
+-    const GAP = 2;
+-    const TOTAL_W = 5 * BOX_W + 4 * GAP;  // 118px
+-    const START_X = 6 + Math.floor((SCREEN_WIDTH - 6 - TOTAL_W) / 2);  // centered right of indicators
++    const GAP = 1;
++    const TOTAL_W = CHAIN_COMPONENTS.length * BOX_W + (CHAIN_COMPONENTS.length - 1) * GAP;
++    const START_X = 6 + Math.floor((SCREEN_WIDTH - 6 - TOTAL_W) / 2);
+     const BOX_Y = 20;  // Below header
+ 
+     /* Draw slot indicators - 4 marks in left margin, spanning from below header to footer */
+@@ -13961,6 +14142,7 @@ function drawHelpDetail() {
+     Object.defineProperty(_ctx, 'MASTER_FX_OPTIONS', {
+         get() { return MASTER_FX_OPTIONS; }, set(v) { MASTER_FX_OPTIONS = v; }, enumerable: true
+     });
++    _ctx.SEND_FX_OPTIONS = [];
+     Object.defineProperty(_ctx, 'selectedMasterFxComponent', {
+         get() { return selectedMasterFxComponent; }, set(v) { selectedMasterFxComponent = v; }, enumerable: true
+     });
+@@ -14211,6 +14393,9 @@ function drawHelpDetail() {
+     _ctx.enterChainEdit = (...args) => enterChainEdit(...args);
+     _ctx.enterPatchBrowser = (...args) => _enterPatchBrowser(...args);
+     _ctx.enterMasterFxSettings = (...args) => enterMasterFxSettings(...args);
++    _ctx.enterSendFxSettings = (...args) => enterSendFxSettings(...args);
++    _ctx.enterFxBusPicker = () => enterFxBusPicker();
++    _ctx.enterSendFxHierarchyEditor = (...args) => enterSendFxHierarchyEditor(...args);
+     _ctx.enterSlotSettings = (...args) => _enterSlotSettings(...args);
+ })();
+ 
+@@ -14228,6 +14413,34 @@ function applyPatchSelection() { _applyPatchSelection(); }
+ function drawMasterFx() { _drawMasterFx(); }
+ function getMasterFxDisplayName() { return _getMasterFxDisplayName(); }
+ function enterMasterFxSettings() { _enterMasterFxSettings(); }
++function drawSendFx() { _drawSendFx(); }
++function enterSendFxSettings(bus) { _enterSendFxSettings(bus); }
++
++let fxBusPickerIndex = 0;
++function enterFxBusPicker() {
++    fxBusPickerIndex = 0;
++    view = VIEWS.FX_BUS_PICKER;
++    if (coRunChainEditSlot >= 0) coRunView = VIEWS.FX_BUS_PICKER;
++    needsRedraw = true;
++}
++function drawFxBusPicker() {
++    clear_screen();
++    drawHeader("FX Buses");
++    const items = [
++        { label: "Master FX", value: getMasterFxDisplayName() },
++        { label: "Send FX A", value: "" },
++        { label: "Send FX B", value: "" },
++    ];
++    drawMenuList({
++        items,
++        selectedIndex: fxBusPickerIndex,
++        listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
++        getLabel: (item) => item.label,
++        getValue: (item) => item.value,
++        valueAlignRight: true
++    });
++    drawFooter("Back: exit");
++}
+ function scanForToolModules() { return _scanForToolModules(); }
+ function enterToolsMenu() {
+     _enterToolsMenu();
+@@ -14847,6 +15060,9 @@ function dispatchCoRunDraw() {
+             drawMessageOverlay('Install Complete', storePostInstallLines);
+             break;
+         case VIEWS.FILEPATH_BROWSER:     drawFilepathBrowser(); break;
++        case VIEWS.FX_BUS_PICKER:        drawFxBusPicker(); break;
++        case VIEWS.SEND_FX:              drawSendFx(); break;
++        case VIEWS.MASTER_FX:            drawMasterFx(); break;
+         default:
+             /* Unknown view in co-run — render slot list as a recoverable
+              * fallback so user can navigate back. */
+@@ -15067,9 +15283,11 @@ globalThis.tick = function() {
+                 }
+             }
+             if (flags & SHADOW_UI_FLAG_JUMP_TO_MASTER_FX) {
+-                /* Always jump to Master FX view */
+-                enterMasterFxSettings();
+-                /* Clear the flag */
++                if (coRunChainEditSlot >= 0) {
++                    coRunView = VIEWS.FX_BUS_PICKER;
++                } else {
++                    enterFxBusPicker();
++                }
+                 if (typeof shadow_clear_ui_flags === "function") {
+                     shadow_clear_ui_flags(SHADOW_UI_FLAG_JUMP_TO_MASTER_FX);
+                 }
+@@ -15429,7 +15647,7 @@ globalThis.tick = function() {
+     /* Poll FX display_name for change-based announcements (e.g. key detection).
+      * Check every ~1 second (30 ticks at 30fps). Only poll slots that have FX loaded. */
+     if (!isOvertakeActive && refreshCounter % 30 === 0) {
+-        const fxComponents = ["fx1", "fx2"];
++        const fxComponents = ["fx1", "fx2", "fx3", "fx4"];
+         /* Per-slot FX */
+         for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
+             const cfg = chainConfigs[i];
+@@ -15616,6 +15834,7 @@ globalThis.tick = function() {
+         }
+     }
+ 
++
+     switch (view) {
+         case VIEWS.SLOTS:
+             drawSlots();
+@@ -15635,6 +15854,12 @@ globalThis.tick = function() {
+         case VIEWS.MASTER_FX:
+             drawMasterFx();
+             break;
++        case VIEWS.SEND_FX:
++            drawSendFx();
++            break;
++        case VIEWS.FX_BUS_PICKER:
++            drawFxBusPicker();
++            break;
+         case VIEWS.CHAIN_EDIT:
+             drawChainEdit();
+             break;
+@@ -16123,6 +16348,13 @@ globalThis.onMidiMessageInternal = function(data) {
+                 needsRedraw = true;
+                 return;
+             }
++            /* Menu (CC 50): open FX bus picker during co-run */
++            if (d1 === 50 && d2 > 0) {
++                coRunView = VIEWS.FX_BUS_PICKER;
++                runCoRunChainEdit(function() { enterFxBusPicker(); });
++                needsRedraw = true;
++                return;
++            }
+             /* Track buttons: CC 43=Track 1 (slot 0), CC 40=Track 4 (slot 3) */
+             if (d1 >= 40 && d1 <= 43 && d2 > 0 && coRunCedes(CORUN_GRP_TRACK_BUTTONS)) {
+                 const _slot = 43 - d1;
+diff --git a/src/shadow/shadow_ui_send_fx.mjs b/src/shadow/shadow_ui_send_fx.mjs
+new file mode 100644
+index 00000000..07688189
+--- /dev/null
++++ b/src/shadow/shadow_ui_send_fx.mjs
+@@ -0,0 +1,213 @@
++import { ctx } from './shadow_ui_ctx.mjs';
++import {
++    SCREEN_WIDTH,
++    LIST_TOP_Y, LIST_LINE_HEIGHT, LIST_HIGHLIGHT_HEIGHT,
++    LIST_LABEL_X, LIST_VALUE_X,
++    FOOTER_RULE_Y,
++    truncateText
++} from '/data/UserData/schwung/shared/chain_ui_views.mjs';
++import {
++    drawMenuHeader as drawHeader,
++    drawMenuFooter as drawFooter,
++    drawMenuList
++} from '/data/UserData/schwung/shared/menu_layout.mjs';
++import {
++    announce, announceMenuItem
++} from '/data/UserData/schwung/shared/screen_reader.mjs';
++
++const SEND_FX_COMPONENTS = [
++    { key: "fx1", label: "FX 1", position: 0 },
++    { key: "fx2", label: "FX 2", position: 1 },
++    { key: "fx3", label: "FX 3", position: 2 },
++];
++
++let activeBus = 0;
++let selectedComponent = 0;
++let selectingModule = false;
++let selectedModuleIndex = 0;
++
++function busKey() { return activeBus === 0 ? "a" : "b"; }
++function busLabel() { return activeBus === 0 ? "Send FX A" : "Send FX B"; }
++function paramPrefix(slot) { return `send_fx:${busKey()}:fx${slot + 1}:`; }
++
++function getParam(slot, key) {
++    return shadow_get_param(0, paramPrefix(slot) + key);
++}
++function setParam(slot, key, val) {
++    shadow_set_param(0, paramPrefix(slot) + key, val);
++}
++
++function getSlotModule(slot) {
++    return getParam(slot, "name") || "";
++}
++
++export function enterSendFxSettings(bus) {
++    const { scanForAudioFxModules, setView, VIEWS } = ctx;
++    activeBus = bus;
++    ctx.SEND_FX_OPTIONS = scanForAudioFxModules();
++    selectedComponent = 0;
++    selectingModule = false;
++    setView(VIEWS.SEND_FX);
++    ctx.needsRedraw = true;
++
++    const moduleName = getSlotModule(0) || "Empty";
++    announce(`${busLabel()}, FX 1 ${moduleName}`);
++}
++
++export function drawSendFx() {
++    const { getModuleAbbrev } = ctx;
++
++    clear_screen();
++
++    if (selectingModule) {
++        drawModuleSelect();
++        return;
++    }
++
++    drawHeader(busLabel());
++
++    const BOX_W = 28;
++    const BOX_H = 16;
++    const GAP = 3;
++    const TOTAL_W = SEND_FX_COMPONENTS.length * BOX_W + (SEND_FX_COMPONENTS.length - 1) * GAP;
++    const START_X = Math.floor((SCREEN_WIDTH - TOTAL_W) / 2);
++    const BOX_Y = 20;
++
++    for (let i = 0; i < SEND_FX_COMPONENTS.length; i++) {
++        const comp = SEND_FX_COMPONENTS[i];
++        const x = START_X + i * (BOX_W + GAP);
++        const isSelected = i === selectedComponent;
++
++        const moduleName = getSlotModule(i);
++        let abbrev = moduleName ? (ctx.getModuleAbbrev(moduleName) || moduleName.slice(0, 3).toUpperCase()) : "--";
++
++        if (isSelected) {
++            fill_rect(x, BOX_Y, BOX_W, BOX_H, 1);
++        } else {
++            draw_rect(x, BOX_Y, BOX_W, BOX_H, 1);
++        }
++
++        const textColor = isSelected ? 0 : 1;
++        const textX = x + Math.floor((BOX_W - abbrev.length * 5) / 2);
++        const textY = BOX_Y + 5;
++        print(textX, textY, abbrev, textColor);
++
++        const bypassed = parseInt(getParam(i, "bypassed") || "0", 10) === 1;
++        if (bypassed) {
++            const bx = x + 1;
++            const by = BOX_Y - 6;
++            set_pixel(bx, by, 1); set_pixel(bx + 1, by, 1);
++            set_pixel(bx, by + 1, 1); set_pixel(bx + 2, by + 1, 1);
++            set_pixel(bx, by + 2, 1); set_pixel(bx + 1, by + 2, 1);
++            set_pixel(bx, by + 3, 1); set_pixel(bx + 1, by + 3, 1); set_pixel(bx + 2, by + 3, 1);
++        }
++    }
++
++    const comp = SEND_FX_COMPONENTS[selectedComponent];
++    const labelY = BOX_Y + BOX_H + 4;
++    const label = comp.label;
++    const labelX = Math.floor((SCREEN_WIDTH - label.length * 5) / 2);
++    print(labelX, labelY, label, 1);
++
++    const infoY = labelY + 12;
++    const moduleName = getSlotModule(selectedComponent);
++    let infoLine = "(empty)";
++    if (moduleName) {
++        const opt = (ctx.SEND_FX_OPTIONS || []).find(o => o.id === moduleName);
++        infoLine = opt ? opt.name : moduleName;
++    }
++    infoLine = truncateText(infoLine, 24);
++    const infoX = Math.floor((SCREEN_WIDTH - infoLine.length * 5) / 2);
++    print(infoX, infoY, infoLine, 1);
++}
++
++function drawModuleSelect() {
++    const options = ctx.SEND_FX_OPTIONS || [];
++    const comp = SEND_FX_COMPONENTS[selectedComponent];
++    drawHeader(`Select ${comp ? comp.label : "FX"}`);
++
++    if (options.length === 0) {
++        print(LIST_LABEL_X, LIST_TOP_Y, "No FX modules available", 1);
++        return;
++    }
++
++    drawMenuList({
++        items: options,
++        selectedIndex: selectedModuleIndex,
++        listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
++        getLabel: (item) => item.name,
++        getValue: (item) => {
++            const currentModule = getSlotModule(selectedComponent);
++            return item.id === currentModule ? "*" : "";
++        }
++    });
++    drawFooter({left: "Back: cancel", right: "Click: apply"});
++}
++
++export function handleSendFxJog(delta) {
++    if (selectingModule) {
++        const options = ctx.SEND_FX_OPTIONS || [];
++        selectedModuleIndex = Math.max(0, Math.min(options.length - 1, selectedModuleIndex + delta));
++        const item = options[selectedModuleIndex];
++        if (item) announceMenuItem(item.name);
++    } else {
++        selectedComponent = Math.max(0, Math.min(SEND_FX_COMPONENTS.length - 1, selectedComponent + delta));
++        const comp = SEND_FX_COMPONENTS[selectedComponent];
++        const moduleName = getSlotModule(selectedComponent) || "Empty";
++        announce(`${comp.label} ${moduleName}`);
++    }
++}
++
++export function handleSendFxSelect() {
++    if (selectingModule) {
++        const options = ctx.SEND_FX_OPTIONS || [];
++        const selected = options[selectedModuleIndex];
++        if (selected) {
++            if (selected.id === "") {
++                setParam(selectedComponent, "module", "");
++            } else {
++                setParam(selectedComponent, "module", selected.dspPath || "");
++            }
++        }
++        selectingModule = false;
++        ctx.needsRedraw = true;
++    } else {
++        const currentModule = getSlotModule(selectedComponent);
++        if (currentModule) {
++            const { enterSendFxHierarchyEditor } = ctx;
++            enterSendFxHierarchyEditor(activeBus, selectedComponent);
++        } else {
++            enterModuleSelect();
++        }
++    }
++}
++
++function enterModuleSelect() {
++    const options = ctx.SEND_FX_OPTIONS || [];
++    selectedModuleIndex = 0;
++    const currentModule = getSlotModule(selectedComponent);
++    if (currentModule) {
++        const idx = options.findIndex(o => o.id === currentModule);
++        if (idx >= 0) selectedModuleIndex = idx;
++    }
++    selectingModule = true;
++    ctx.needsRedraw = true;
++}
++
++export function handleSendFxBack() {
++    const { setView, VIEWS, enterFxBusPicker } = ctx;
++    if (selectingModule) {
++        selectingModule = false;
++        ctx.needsRedraw = true;
++    } else {
++        enterFxBusPicker();
++    }
++}
++
++export function handleSendFxShiftSelect() {
++    const bypassed = parseInt(getParam(selectedComponent, "bypassed") || "0", 10);
++    setParam(selectedComponent, "bypassed", bypassed ? "0" : "1");
++    const state = bypassed ? "enabled" : "bypassed";
++    announce(`${SEND_FX_COMPONENTS[selectedComponent].label} ${state}`);
++    ctx.needsRedraw = true;
++}
+diff --git a/src/shadow/shadow_ui_slots.mjs b/src/shadow/shadow_ui_slots.mjs
+index 8fc7a319..7e798d89 100644
+--- a/src/shadow/shadow_ui_slots.mjs
++++ b/src/shadow/shadow_ui_slots.mjs
+@@ -27,6 +27,8 @@ export const SLOT_SETTINGS = [
+     { key: "patch", label: "Patch", type: "action" },
+     { key: "chain", label: "Edit Chain", type: "action" },
+     { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 4, step: 0.05 },
++    { key: "slot:send_a", label: "Send A", type: "float", min: 0, max: 1, step: 0.05 },
++    { key: "slot:send_b", label: "Send B", type: "float", min: 0, max: 1, step: 0.05 },
+     { key: "slot:muted", label: "Muted", type: "int", min: 0, max: 1, step: 1 },
+     { key: "slot:soloed", label: "Soloed", type: "int", min: 0, max: 1, step: 1 },
+     { key: "slot:receive_channel", label: "Recv Ch", type: "int", min: 0, max: 16, step: 1 },
+@@ -41,6 +43,17 @@ export const SLOT_SETTINGS = [
+ let selectedSetting = 0;
+ let editingSettingValue = false;
+ 
++function getSendFxDisplayName(bus) {
++    const { getSlotParam } = ctx;
++    const busKey = bus === 0 ? "a" : "b";
++    const parts = [];
++    for (let i = 1; i <= 3; i++) {
++        const name = getSlotParam(0, `send_fx:${busKey}:fx${i}:name`);
++        if (name) parts.push(name);
++    }
++    return parts.length > 0 ? parts.join("+") : "None";
++}
++
+ /* ---- Helpers ------------------------------------------------------------ */
+ 
+ /* Check if a slot is in MPE mode (Recv=All + Fwd=THRU) */
+@@ -67,6 +80,11 @@ export function getSlotSettingValue(slot, setting) {
+         const pct = isNaN(num) ? 0 : Math.round(num * 100);
+         return `${pct}%`;
+     }
++    if (setting.key === "slot:send_a" || setting.key === "slot:send_b") {
++        const num = parseFloat(val);
++        const pct = isNaN(num) ? 0 : Math.round(num * 100);
++        return `${pct}%`;
++    }
+     if (setting.key === "slot:muted") {
+         return parseInt(val) ? "Yes" : "No";
+     }
+@@ -183,7 +201,9 @@ export function drawSlots() {
+                 isSlot: true
+             };
+         }),
+-        { label: " Master FX", value: getMasterFxDisplayName(), isSlot: false }
++        { label: " Master FX", value: getMasterFxDisplayName(), isSlot: false },
++        { label: " Send FX A", value: getSendFxDisplayName(0), isSlot: false },
++        { label: " Send FX B", value: getSendFxDisplayName(1), isSlot: false }
+     ];
+ 
+     drawMenuList({
+@@ -256,7 +276,7 @@ export function drawSlotSettings() {
+ 
+ export function handleSlotsJog(delta) {
+     const { slots, updateFocusedSlot } = ctx;
+-    ctx.selectedSlot = Math.max(0, Math.min(slots.length, ctx.selectedSlot + delta));
++    ctx.selectedSlot = Math.max(0, Math.min(slots.length + 2, ctx.selectedSlot + delta));
+     updateFocusedSlot(ctx.selectedSlot);
+ }
+ 
+@@ -278,11 +298,15 @@ export function handleSlotSettingsJog(delta) {
+ /* ---- Select ------------------------------------------------------------- */
+ 
+ export function handleSlotsSelect() {
+-    const { selectedSlot, slots, enterChainEdit, enterMasterFxSettings } = ctx;
++    const { selectedSlot, slots, enterChainEdit, enterMasterFxSettings, enterSendFxSettings } = ctx;
+     if (selectedSlot < slots.length) {
+         enterChainEdit(selectedSlot);
+-    } else {
++    } else if (selectedSlot === slots.length) {
+         enterMasterFxSettings();
++    } else if (selectedSlot === slots.length + 1) {
++        enterSendFxSettings(0);
++    } else if (selectedSlot === slots.length + 2) {
++        enterSendFxSettings(1);
+     }
+ }
+ 
+-- 
+2.53.0
+
