@@ -901,32 +901,36 @@ const FX_BUS = {
         id: "sendA", title: "Send FX A", paramPrefix: "send_fx:a:",
         slotCount: 4, hasLfo: false, persistConfig: false,
         volumeKey: "send_fx:a:return_level", components: SEND_FX_COMPONENTS_A,
-        presetPickerTitle: "Send FX A Presets",
+        presetPickerTitle: "Send Presets",
         presetJsonRoot: "send_fx",
-        presetCountKey: "send_a_preset_count",
-        presetNamePrefix: "send_a_preset_name_",
-        presetJsonPrefix: "send_a_preset_json_",
-        presetSaveKey: "save_send_a_preset",
-        presetUpdateKey: "update_send_a_preset",
-        presetDeleteKey: "delete_send_a_preset"
+        presetCountKey: "send_preset_count",
+        presetNamePrefix: "send_preset_name_",
+        presetJsonPrefix: "send_preset_json_",
+        presetSaveKey: "save_send_preset",
+        presetUpdateKey: "update_send_preset",
+        presetDeleteKey: "delete_send_preset"
     },
     sendB: {
         id: "sendB", title: "Send FX B", paramPrefix: "send_fx:b:",
         slotCount: 4, hasLfo: false, persistConfig: false,
         volumeKey: "send_fx:b:return_level", components: SEND_FX_COMPONENTS_B,
-        presetPickerTitle: "Send FX B Presets",
+        presetPickerTitle: "Send Presets",
         presetJsonRoot: "send_fx",
-        presetCountKey: "send_b_preset_count",
-        presetNamePrefix: "send_b_preset_name_",
-        presetJsonPrefix: "send_b_preset_json_",
-        presetSaveKey: "save_send_b_preset",
-        presetUpdateKey: "update_send_b_preset",
-        presetDeleteKey: "delete_send_b_preset"
+        presetCountKey: "send_preset_count",
+        presetNamePrefix: "send_preset_name_",
+        presetJsonPrefix: "send_preset_json_",
+        presetSaveKey: "save_send_preset",
+        presetUpdateKey: "update_send_preset",
+        presetDeleteKey: "delete_send_preset"
     }
 };
 /* Active bus for the FX editor. Set by the FX bus picker; persists through the
  * editor's sub-views. Defaults to master. */
 let activeFxBus = FX_BUS.master;
+/* Per-bus loaded-preset name, so the preset name/overwrite target doesn't leak
+ * across buses (e.g. a master "SPECTRA" preselecting overwrite on a send save).
+ * Stashed/restored on bus switch in enterFxBusEditor. */
+let fxBusPresetName = { master: "", sendA: "", sendB: "" };
 
 /* Build a slot param key for the active bus, e.g.
  *   master: master_fx:fx2:bypassed   sendA: send_fx:a:fx2:bypassed */
@@ -950,7 +954,7 @@ const MASTER_FX_SETTINGS_ITEMS_BASE = [
     { key: "master_volume", label: "Volume", type: "float", min: 0, max: 1, step: 0.05 },
     { key: "mfx_lfo1", label: "LFO 1", type: "action" },
     { key: "mfx_lfo2", label: "LFO 2", type: "action" },
-    { key: "save", label: "[Save MFX Preset]", type: "action" },
+    { key: "save", label: "[Save Preset]", type: "action" },
     { key: "save_as", label: "[Save As]", type: "action" },
     { key: "delete", label: "[Delete]", type: "action" }
 ];
@@ -14645,7 +14649,13 @@ function enterMasterFxSettings() { _enterMasterFxSettings(); }
 /* Enter the generic FX editor for a bus (master/sendA/sendB). Sets the active
  * bus descriptor, then runs the shared Master-FX-style editor entry. */
 function enterFxBusEditor(busId) {
+    /* Stash the outgoing bus's loaded-preset name, then restore the incoming
+     * bus's — keeps the preset name + overwrite target per-bus so a master
+     * preset (e.g. SPECTRA) can't preselect overwrite on a send save. */
+    if (activeFxBus && activeFxBus.id) fxBusPresetName[activeFxBus.id] = currentMasterPresetName;
     activeFxBus = FX_BUS[busId] || FX_BUS.master;
+    currentMasterPresetName = fxBusPresetName[activeFxBus.id] || "";
+    masterOverwriteTargetIndex = -1;
     enterMasterFxSettings();
 }
 
