@@ -1884,6 +1884,7 @@ void shadow_direct_set_param(uint8_t slot, const char *key, const char *value) {
         if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
         else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
         else if (strncmp(rest, "fx3:", 4) == 0) { sfx_slot = 2; rest += 4; }
+        else if (strncmp(rest, "fx4:", 4) == 0) { sfx_slot = 3; rest += 4; }
         if (sfx_slot < 0) return;
 
         master_fx_slot_t *sfx = &shadow_send_fx_slots[bus][sfx_slot];
@@ -2865,6 +2866,7 @@ void shadow_inprocess_handle_param_request(void) {
         if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
         else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
         else if (strncmp(rest, "fx3:", 4) == 0) { sfx_slot = 2; rest += 4; }
+        else if (strncmp(rest, "fx4:", 4) == 0) { sfx_slot = 3; rest += 4; }
         if (sfx_slot < 0) {
             shadow_param->error = 1;
             shadow_param->result_len = -1;

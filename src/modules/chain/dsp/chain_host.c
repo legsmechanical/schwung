@@ -6250,10 +6250,11 @@ static void scan_send_presets(int bus) {
  * master path so large modules round-trip under the 64KB GET limit. */
 static void build_send_preset_json(char *out, int out_len,
                                    const char *name, const char *json_str) {
-    char fx1[8192], fx2[8192], fx3[8192];
+    char fx1[8192], fx2[8192], fx3[8192], fx4[8192];
     extract_fx_section(json_str, "fx1", fx1, sizeof(fx1));
     extract_fx_section(json_str, "fx2", fx2, sizeof(fx2));
     extract_fx_section(json_str, "fx3", fx3, sizeof(fx3));
+    extract_fx_section(json_str, "fx4", fx4, sizeof(fx4));
     snprintf(out, out_len,
         "{\n"
         "    \"name\": \"%s\",\n"
@@ -6261,10 +6262,11 @@ static void build_send_preset_json(char *out, int out_len,
         "    \"send_fx\": {\n"
         "        \"fx1\": %s,\n"
         "        \"fx2\": %s,\n"
-        "        \"fx3\": %s\n"
+        "        \"fx3\": %s,\n"
+        "        \"fx4\": %s\n"
         "    }\n"
         "}\n",
-        name, fx1, fx2, fx3);
+        name, fx1, fx2, fx3, fx4);
 }
 
 static int save_send_preset(int bus, const char *json_str) {

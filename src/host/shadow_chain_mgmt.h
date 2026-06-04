@@ -20,7 +20,7 @@
 
 #define MASTER_FX_SLOTS 4
 #define SEND_BUS_COUNT 2
-#define SEND_FX_SLOTS  3
+#define SEND_FX_SLOTS  4
 #define SHADOW_CHAIN_MODULE_DIR "/data/UserData/schwung/modules/chain"
 #define SHADOW_CHAIN_DSP_PATH "/data/UserData/schwung/modules/chain/dsp.so"
 
