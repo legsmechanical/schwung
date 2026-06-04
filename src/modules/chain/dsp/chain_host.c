@@ -6167,6 +6167,214 @@ static int load_master_preset_json(int index, char *buf, int buf_len) {
 
 /* ========== End Master Preset Functions ========== */
 
+/* ========== Send Preset Functions ========== */
+/* Mirror of the master preset CRUD, parameterized by bus (0=A, 1=B). Presets
+ * live in per-bus directories and wrap 3 FX slots under a "send_fx" root.
+ * The JS editor is descriptor-driven (presetJsonRoot "send_fx", 3 slots), so
+ * these only need to store/retrieve the files. */
+
+#define PRESETS_SEND_A_DIR "/data/UserData/schwung/presets_send_a"
+#define PRESETS_SEND_B_DIR "/data/UserData/schwung/presets_send_b"
+#define MAX_SEND_PRESETS 64
+#define SEND_PRESET_BUSES 2
+
+static char send_preset_names[SEND_PRESET_BUSES][MAX_SEND_PRESETS][MAX_NAME_LEN];
+static char send_preset_paths[SEND_PRESET_BUSES][MAX_SEND_PRESETS][MAX_PATH_LEN];
+static int send_preset_count[SEND_PRESET_BUSES] = {0, 0};
+
+static const char *send_presets_dir(int bus) {
+    return bus == 0 ? PRESETS_SEND_A_DIR : PRESETS_SEND_B_DIR;
+}
+
+static void ensure_presets_send_dir(int bus) {
+    struct stat st = {0};
+    const char *dir = send_presets_dir(bus);
+    if (stat(dir, &st) == -1) {
+        mkdir(dir, 0755);
+    }
+}
+
+static void scan_send_presets(int bus) {
+    if (bus < 0 || bus >= SEND_PRESET_BUSES) return;
+    send_preset_count[bus] = 0;
+    memset(send_preset_names[bus], 0, sizeof(send_preset_names[bus]));
+    memset(send_preset_paths[bus], 0, sizeof(send_preset_paths[bus]));
+    ensure_presets_send_dir(bus);
+
+    DIR *dir = opendir(send_presets_dir(bus));
+    if (!dir) return;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && send_preset_count[bus] < MAX_SEND_PRESETS) {
+        if (entry->d_type != DT_REG) continue;
+
+        const char *name = entry->d_name;
+        size_t len = strlen(name);
+        if (len < 6 || strcmp(name + len - 5, ".json") != 0) continue;
+
+        size_t name_len = len - 5;
+        if (name_len >= MAX_NAME_LEN) name_len = MAX_NAME_LEN - 1;
+
+        char path[MAX_PATH_LEN];
+        snprintf(path, sizeof(path), "%s/%s", send_presets_dir(bus), name);
+
+        int idx = send_preset_count[bus];
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char json_buf[2048];
+            size_t read_len = fread(json_buf, 1, sizeof(json_buf) - 1, f);
+            json_buf[read_len] = '\0';
+            fclose(f);
+
+            char parsed_name[MAX_NAME_LEN] = {0};
+            if (json_get_string(json_buf, "name", parsed_name, sizeof(parsed_name)) == 0) {
+                strncpy(send_preset_names[bus][idx], parsed_name, MAX_NAME_LEN - 1);
+                send_preset_names[bus][idx][MAX_NAME_LEN - 1] = '\0';
+            } else {
+                memcpy(send_preset_names[bus][idx], name, name_len);
+                send_preset_names[bus][idx][name_len] = '\0';
+            }
+        } else {
+            memcpy(send_preset_names[bus][idx], name, name_len);
+            send_preset_names[bus][idx][name_len] = '\0';
+        }
+
+        strncpy(send_preset_paths[bus][idx], path, MAX_PATH_LEN - 1);
+        send_preset_paths[bus][idx][MAX_PATH_LEN - 1] = '\0';
+        send_preset_count[bus]++;
+    }
+    closedir(dir);
+}
+
+/* Build the wrapped preset JSON for 3 send slots. Buffers sized to match the
+ * master path so large modules round-trip under the 64KB GET limit. */
+static void build_send_preset_json(char *out, int out_len,
+                                   const char *name, const char *json_str) {
+    char fx1[8192], fx2[8192], fx3[8192];
+    extract_fx_section(json_str, "fx1", fx1, sizeof(fx1));
+    extract_fx_section(json_str, "fx2", fx2, sizeof(fx2));
+    extract_fx_section(json_str, "fx3", fx3, sizeof(fx3));
+    snprintf(out, out_len,
+        "{\n"
+        "    \"name\": \"%s\",\n"
+        "    \"version\": 1,\n"
+        "    \"send_fx\": {\n"
+        "        \"fx1\": %s,\n"
+        "        \"fx2\": %s,\n"
+        "        \"fx3\": %s\n"
+        "    }\n"
+        "}\n",
+        name, fx1, fx2, fx3);
+}
+
+static int save_send_preset(int bus, const char *json_str) {
+    if (bus < 0 || bus >= SEND_PRESET_BUSES) return -1;
+    ensure_presets_send_dir(bus);
+
+    char name[MAX_NAME_LEN] = "Send FX";
+    json_get_string(json_str, "custom_name", name, sizeof(name));
+
+    char filename[MAX_NAME_LEN];
+    sanitize_filename(filename, sizeof(filename), name);
+
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s/%s.json", send_presets_dir(bus), filename);
+
+    char final_json[40960];
+    build_send_preset_json(final_json, sizeof(final_json), name, json_str);
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Failed to save send preset: %s", path);
+        chain_log(msg);
+        return -1;
+    }
+    fputs(final_json, f);
+    fclose(f);
+    {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Saved send %c preset: %s", bus == 0 ? 'A' : 'B', name);
+        chain_log(msg);
+    }
+    scan_send_presets(bus);
+    return 0;
+}
+
+static int update_send_preset(int bus, int index, const char *json_str) {
+    if (bus < 0 || bus >= SEND_PRESET_BUSES) return -1;
+    if (index < 0 || index >= send_preset_count[bus]) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Invalid send preset index: %d", index);
+        chain_log(msg);
+        return -1;
+    }
+
+    char name[MAX_NAME_LEN];
+    if (json_get_string(json_str, "custom_name", name, sizeof(name)) != 0) {
+        strncpy(name, send_preset_names[bus][index], sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+    }
+
+    char final_json[40960];
+    build_send_preset_json(final_json, sizeof(final_json), name, json_str);
+
+    FILE *f = fopen(send_preset_paths[bus][index], "w");
+    if (!f) return -1;
+    fputs(final_json, f);
+    fclose(f);
+    {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Updated send %c preset: %s", bus == 0 ? 'A' : 'B', name);
+        chain_log(msg);
+    }
+    scan_send_presets(bus);
+    return 0;
+}
+
+static int delete_send_preset(int bus, int index) {
+    if (bus < 0 || bus >= SEND_PRESET_BUSES) return -1;
+    if (index < 0 || index >= send_preset_count[bus]) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Invalid send preset index: %d", index);
+        chain_log(msg);
+        return -1;
+    }
+    if (remove(send_preset_paths[bus][index]) != 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Failed to delete send preset: %s", send_preset_paths[bus][index]);
+        chain_log(msg);
+        return -1;
+    }
+    {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Deleted send %c preset: %s", bus == 0 ? 'A' : 'B', send_preset_names[bus][index]);
+        chain_log(msg);
+    }
+    scan_send_presets(bus);
+    return 0;
+}
+
+static int load_send_preset_json(int bus, int index, char *buf, int buf_len) {
+    if (bus < 0 || bus >= SEND_PRESET_BUSES) { buf[0] = '\0'; return 0; }
+    if (index < 0 || index >= send_preset_count[bus]) { buf[0] = '\0'; return 0; }
+
+    FILE *f = fopen(send_preset_paths[bus][index], "r");
+    if (!f) { buf[0] = '\0'; return 0; }
+
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0) { fclose(f); buf[0] = '\0'; return 0; }
+    if (len >= buf_len) len = buf_len - 1;
+    size_t nr = fread(buf, 1, len, f);
+    buf[nr] = '\0';
+    fclose(f);
+    return (int)nr;
+}
+
+/* ========== End Send Preset Functions ========== */
+
 /* Debug logging helper for parsing */
 static void parse_debug_log(const char *msg) {
     struct stat st;
@@ -7546,6 +7754,27 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             update_master_preset(index, colon + 1);
         }
     }
+    /* Send preset commands (per bus A/B) */
+    else if (strcmp(key, "save_send_a_preset") == 0) {
+        save_send_preset(0, val);
+    }
+    else if (strcmp(key, "save_send_b_preset") == 0) {
+        save_send_preset(1, val);
+    }
+    else if (strcmp(key, "delete_send_a_preset") == 0) {
+        delete_send_preset(0, atoi(val));
+    }
+    else if (strcmp(key, "delete_send_b_preset") == 0) {
+        delete_send_preset(1, atoi(val));
+    }
+    else if (strcmp(key, "update_send_a_preset") == 0) {
+        const char *colon = strchr(val, ':');
+        if (colon) update_send_preset(0, atoi(val), colon + 1);
+    }
+    else if (strcmp(key, "update_send_b_preset") == 0) {
+        const char *colon = strchr(val, ':');
+        if (colon) update_send_preset(1, atoi(val), colon + 1);
+    }
     else if (strncmp(key, "synth:", 6) == 0) {
         const char *subkey = key + 6;
         /* Intercept module change to swap synth dynamically */
@@ -8366,6 +8595,33 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strncmp(key, "master_preset_json_", 19) == 0) {
         int idx = atoi(key + 19);
         return load_master_preset_json(idx, buf, buf_len);
+    }
+    /* Send preset queries (per bus A/B) */
+    if (strcmp(key, "send_a_preset_count") == 0) {
+        scan_send_presets(0);
+        return snprintf(buf, buf_len, "%d", send_preset_count[0]);
+    }
+    if (strcmp(key, "send_b_preset_count") == 0) {
+        scan_send_presets(1);
+        return snprintf(buf, buf_len, "%d", send_preset_count[1]);
+    }
+    if (strncmp(key, "send_a_preset_name_", 19) == 0) {
+        int idx = atoi(key + 19);
+        if (idx >= 0 && idx < send_preset_count[0])
+            return snprintf(buf, buf_len, "%s", send_preset_names[0][idx]);
+        return -1;
+    }
+    if (strncmp(key, "send_b_preset_name_", 19) == 0) {
+        int idx = atoi(key + 19);
+        if (idx >= 0 && idx < send_preset_count[1])
+            return snprintf(buf, buf_len, "%s", send_preset_names[1][idx]);
+        return -1;
+    }
+    if (strncmp(key, "send_a_preset_json_", 19) == 0) {
+        return load_send_preset_json(0, atoi(key + 19), buf, buf_len);
+    }
+    if (strncmp(key, "send_b_preset_json_", 19) == 0) {
+        return load_send_preset_json(1, atoi(key + 19), buf, buf_len);
     }
     if (strcmp(key, "fx_count") == 0) {
         return snprintf(buf, buf_len, "%d", inst->fx_count);

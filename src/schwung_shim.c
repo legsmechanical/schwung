@@ -2351,13 +2351,17 @@ skip_la_rebuild:
             sf->api->process_block(sf->instance, send_buf, FRAMES_PER_BLOCK);
         }
 
+        /* Per-bus return level scales the FX-processed return into the mix. */
+        float rl = shadow_send_return_level[b];
         for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
-            me_full[i] += (int32_t)send_buf[i];
-            me_unity[i] += (int32_t)send_buf[i];
+            int32_t sv = (int32_t)lroundf((float)send_buf[i] * rl);
+            me_full[i] += sv;
+            me_unity[i] += sv;
         }
         if (rebuild_from_la) {
             for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
-                int32_t mixed = (int32_t)mailbox_audio[i] + (int32_t)send_buf[i];
+                int32_t sv = (int32_t)lroundf((float)send_buf[i] * rl);
+                int32_t mixed = (int32_t)mailbox_audio[i] + sv;
                 if (mixed > 32767) mixed = 32767;
                 if (mixed < -32768) mixed = -32768;
                 mailbox_audio[i] = (int16_t)mixed;
