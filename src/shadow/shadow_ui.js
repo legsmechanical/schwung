@@ -6183,10 +6183,9 @@ function applyMasterFxModuleSelection() {
 
 /* Save master FX chain configuration */
 function saveMasterFxChainConfig() {
-    /* Master-bus-only: persists Master FX to shadow_config.json + per-slot
-     * state files for boot restore. Send buses persist through the DSP send-FX
-     * state path (Phase 1), so this is a no-op for them. */
-    if (!activeFxBus.persistConfig) return;
+    /* Master-bus-only below. Send buses persist via per-set send_fx_<bus>_<slot>
+     * files instead — dispatch to that path so in-editor send edits are saved. */
+    if (!activeFxBus.persistConfig) { saveSendFxChainConfig(); return; }
     /* The shim persists the state, but we also save to shadow config */
     try {
         const configPath = "/data/UserData/schwung/shadow_config.json";
@@ -6716,6 +6715,140 @@ function loadMasterFxChainFromConfig() {
         }
     } catch (e) {
         /* Ignore errors */
+    }
+}
+
+/* ====================================================================
+ * Send FX per-set persistence (auto-recall across set changes).
+ *
+ * Unlike Master FX (whose modules are restored C-side by the shim at
+ * boot from master_fx_<n>.json), the send-FX shim has no boot/set-change
+ * restore. So we persist each send slot to per-set files
+ * (send_fx_<bus>_<slot>.json + send_fx_meta.json for return levels) and
+ * re-load them in JS on set change and init. Format mirrors the master
+ * slot files: { id, path, state | params, bypassed }.
+ * These use explicit send_fx:* keys (NOT activeFxBus), so they are safe
+ * to call regardless of which FX editor is open. JS-only — the Phase-1
+ * send GET/SET handlers already forward :state/:chain_params/params. */
+const SEND_FX_BUSES = ["a", "b"];
+const SEND_FX_SLOTS_JS = 3;
+
+function saveSendFxChainConfig() {
+    if (typeof shadow_get_param !== "function") return;
+    try {
+        for (let bi = 0; bi < SEND_FX_BUSES.length; bi++) {
+            const busId = SEND_FX_BUSES[bi];
+            for (let s = 0; s < SEND_FX_SLOTS_JS; s++) {
+                const key = "send_fx:" + busId + ":fx" + (s + 1);
+                const filePath = activeSlotStateDir + "/send_fx_" + busId + "_" + s + ".json";
+                const moduleId = shadow_get_param(0, key + ":name") || "";
+                if (!moduleId) { host_write_file(filePath, "{}\n"); continue; }
+
+                const opt = (MASTER_FX_OPTIONS || []).find(o => o.id === moduleId);
+                const slotConfig = {
+                    id: moduleId,
+                    module_id: moduleId,
+                    path: opt?.dspPath || "",
+                    bypassed: parseInt(shadow_get_param(0, key + ":bypassed") || "0", 10) === 1 ? 1 : 0
+                };
+
+                /* Prefer opaque module state; fall back to chain_params snapshot. */
+                let stateObj = null;
+                let paramsObj = null;
+                try {
+                    const stateJson = shadow_get_param(0, key + ":state");
+                    if (stateJson) {
+                        try { stateObj = JSON.parse(stateJson); } catch (pe) { stateObj = stateJson; }
+                        slotConfig.state = stateObj;
+                    }
+                } catch (e) {}
+                if (!stateObj) {
+                    try {
+                        paramsObj = {};
+                        const pid = shadow_get_param(0, key + ":plugin_id");
+                        if (pid) paramsObj["plugin_id"] = pid;
+                        const cpJson = shadow_get_param(0, key + ":chain_params");
+                        if (cpJson) {
+                            const cps = JSON.parse(cpJson);
+                            if (Array.isArray(cps)) {
+                                for (const p of cps) {
+                                    if (p && p.key) {
+                                        const v = shadow_get_param(0, key + ":" + p.key);
+                                        if (v !== null && v !== undefined && v !== "") paramsObj[p.key] = v;
+                                    }
+                                }
+                            }
+                        }
+                        if (Object.keys(paramsObj).length > 0) slotConfig.params = paramsObj;
+                    } catch (e) {}
+                }
+
+                /* Guard against clobbering a good file with empty data when the
+                 * shim stalls mid-query (mirrors the master snapshotOk guard). */
+                const realParamKeys = paramsObj ? Object.keys(paramsObj).filter(k => k !== "plugin_id") : [];
+                if (!stateObj && realParamKeys.length === 0) {
+                    /* Got a module id but no usable state — keep any existing file. */
+                    continue;
+                }
+                host_write_file(filePath, JSON.stringify(slotConfig, null, 2) + "\n");
+            }
+        }
+        /* Per-set send return levels. */
+        const rlA = parseFloat(shadow_get_param(0, "send_fx:a:return_level") || "1.0");
+        const rlB = parseFloat(shadow_get_param(0, "send_fx:b:return_level") || "1.0");
+        host_write_file(activeSlotStateDir + "/send_fx_meta.json",
+            JSON.stringify({ return_level: { a: isNaN(rlA) ? 1.0 : rlA, b: isNaN(rlB) ? 1.0 : rlB } }, null, 2) + "\n");
+    } catch (e) {
+        debugLog("saveSendFxChainConfig error: " + e);
+    }
+}
+
+function restoreSendFxFromFiles() {
+    if (typeof shadow_set_param !== "function") return;
+    try {
+        for (let bi = 0; bi < SEND_FX_BUSES.length; bi++) {
+            const busId = SEND_FX_BUSES[bi];
+            for (let s = 0; s < SEND_FX_SLOTS_JS; s++) {
+                const key = "send_fx:" + busId + ":fx" + (s + 1);
+                const filePath = activeSlotStateDir + "/send_fx_" + busId + "_" + s + ".json";
+                let data = null;
+                try {
+                    const raw = host_read_file(filePath);
+                    if (raw && raw.length > 3) data = JSON.parse(raw);
+                } catch (e) {}
+
+                const dspPath = (data && data.path) ? data.path : "";
+                /* Load (or unload when empty) the module first. */
+                shadow_set_param(0, key + ":module", dspPath);
+                if (!dspPath) continue;
+
+                if (data.state) {
+                    const stateStr = (typeof data.state === "string") ? data.state : JSON.stringify(data.state);
+                    shadow_set_param(0, key + ":state", stateStr);
+                } else if (data.params) {
+                    if (data.params.plugin_id) shadow_set_param(0, key + ":plugin_id", data.params.plugin_id);
+                    for (const [pk, pv] of Object.entries(data.params)) {
+                        if (pk !== "plugin_id") shadow_set_param(0, key + ":" + pk, String(pv));
+                    }
+                }
+                if (data.bypassed) shadow_set_param(0, key + ":bypassed", "1");
+            }
+        }
+        /* Restore per-set send return levels (missing → leave shim default). */
+        try {
+            const raw = host_read_file(activeSlotStateDir + "/send_fx_meta.json");
+            if (raw) {
+                const meta = JSON.parse(raw);
+                if (meta && meta.return_level) {
+                    if (typeof meta.return_level.a === "number")
+                        shadow_set_param(0, "send_fx:a:return_level", meta.return_level.a.toFixed(3));
+                    if (typeof meta.return_level.b === "number")
+                        shadow_set_param(0, "send_fx:b:return_level", meta.return_level.b.toFixed(3));
+                }
+            }
+        } catch (e) {}
+    } catch (e) {
+        debugLog("restoreSendFxFromFiles error: " + e);
     }
 }
 
@@ -8550,15 +8683,18 @@ function enterSendFxHierarchyEditor(bus, fxSlot) {
     hierEditorSelectedIdx = 0;
     hierEditorEditMode = false;
     resetHierarchyEditState();
-    hierEditorIsMasterFx = false;
-    hierEditorMasterFxSlot = -1;
+    /* Treat a send slot as an FX-bus component (same as Master FX), NOT a chain
+     * slot. The param engine's isMasterFx path builds keys as `${component}:key`
+     * (here send_fx:bus:fxN:key) and uses the bus-aware getMasterFx* helpers
+     * (activeFxBus is the send bus during send editing) — so it resolves to
+     * send_fx:* correctly. The isMasterFx=false (chain-slot) path used
+     * getComponentParamPrefix + `${prefix}_module`, which doesn't fit send_fx
+     * keys and left modules like dissolver unable to open their params. */
+    hierEditorIsMasterFx = true;
+    hierEditorMasterFxSlot = fxSlot;
     resetDynamicParamPickerState();
 
-    const cpJson = shadow_get_param(0, `${compKey}:chain_params`);
-    hierEditorChainParams = [];
-    if (cpJson) {
-        try { hierEditorChainParams = JSON.parse(cpJson); } catch (e) { /* ignore */ }
-    }
+    hierEditorChainParams = getMasterFxChainParams(fxSlot);
 
     setupModuleParamShims(0, compKey);
     loadHierarchyLevel();
@@ -12214,7 +12350,16 @@ function handleSelect() {
                             }
                         } else {
                             const busIdx = (activeFxBus.id === "sendB") ? 1 : 0;
-                            enterSendFxHierarchyEditor(busIdx, selectedMasterFxComponent);
+                            /* Mirror master exactly: use the PARSED hierarchy (getMasterFxHierarchy
+                             * is activeFxBus-relative, so it reads this send slot). A module whose
+                             * ui_hierarchy is empty/invalid (e.g. dissolver) parses to null → fall
+                             * back to the module browser instead of a silent no-op. */
+                            const hierarchy = getMasterFxHierarchy(selectedMasterFxComponent);
+                            if (hierarchy) {
+                                enterSendFxHierarchyEditor(busIdx, selectedMasterFxComponent);
+                            } else {
+                                enterMasterFxModuleSelect(selectedMasterFxComponent);
+                            }
                         }
                     } else {
                         /* No module loaded - enter module selection */
@@ -13095,7 +13240,11 @@ function handleBack() {
                 view = VIEWS.CHAIN_EDIT;
                 coRunView = VIEWS.CHAIN_EDIT;
             } else {
-                exitShadowUI();
+                /* Back exits the shadow UI back to Move native. (The previous
+                 * exitShadowUI() was undefined and threw, so Back did nothing.) */
+                if (typeof shadow_request_exit === "function") {
+                    shadow_request_exit();
+                }
             }
             break;
         case VIEWS.MASTER_FX:
@@ -14957,6 +15106,8 @@ globalThis.init = function() {
     }
     /* Re-apply Master FX sync after activeSlotStateDir resolves to the active set. */
     loadMasterFxChainFromConfig();
+    /* Send FX has no shim-side boot restore — load the active set's send chains here. */
+    restoreSendFxFromFiles();
 
     /* Sync dirty cache and slot names from autosave files (shim loaded them on startup) */
     for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
@@ -15071,6 +15222,7 @@ globalThis.init = function() {
 globalThis.shadow_save_state_now = function() {
     autosaveAllSlots();
     saveMasterFxChainConfig();
+    saveSendFxChainConfig();  /* persist send FX chains + return levels per set */
     /* Also persist volumes/channels/mute/solo — otherwise the set's
      * shadow_chain_config.json drifts from slot_N.json across reboots,
      * e.g. toggling MPE (recv=All) before shutdown would revert on boot. */
@@ -15467,6 +15619,16 @@ globalThis.tick = function() {
                         const mfx = host_read_file(copySourceDir + "/master_fx_" + i + ".json");
                         if (mfx) host_write_file(newDir + "/master_fx_" + i + ".json", mfx);
                     }
+                    /* Copy send FX per-set files (2 buses × 3 slots) + return-level meta */
+                    for (let bi = 0; bi < SEND_FX_BUSES.length; bi++) {
+                        for (let s = 0; s < SEND_FX_SLOTS_JS; s++) {
+                            const sfxName = "/send_fx_" + SEND_FX_BUSES[bi] + "_" + s + ".json";
+                            const sfx = host_read_file(copySourceDir + sfxName);
+                            if (sfx) host_write_file(newDir + sfxName, sfx);
+                        }
+                    }
+                    const sfxMeta = host_read_file(copySourceDir + "/send_fx_meta.json");
+                    if (sfxMeta) host_write_file(newDir + "/send_fx_meta.json", sfxMeta);
                     /* Also copy chain config */
                     const chainCfg = host_read_file(copySourceDir + "/shadow_chain_config.json");
                     if (chainCfg) host_write_file(newDir + "/shadow_chain_config.json", chainCfg);
@@ -15476,6 +15638,12 @@ globalThis.tick = function() {
                     for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
                         host_write_file(newDir + "/slot_" + i + ".json", "{}\n");
                         host_write_file(newDir + "/master_fx_" + i + ".json", "{}\n");
+                    }
+                    /* Empty send FX files so a new set starts with no send chains. */
+                    for (let bi = 0; bi < SEND_FX_BUSES.length; bi++) {
+                        for (let s = 0; s < SEND_FX_SLOTS_JS; s++) {
+                            host_write_file(newDir + "/send_fx_" + SEND_FX_BUSES[bi] + "_" + s + ".json", "{}\n");
+                        }
                     }
                     /* Seed a default chain config so receive channels reset to
                      * per-track defaults (Ch 1-4). Without this, the upcoming
@@ -15615,6 +15783,11 @@ globalThis.tick = function() {
                 }
                 debugLog("SET_CHANGED: MFX " + mfxi + " -> " + (mfxModuleId || "(none)"));
             }
+
+            /* 7b. Reload send FX chains + return levels for the new set. Uses
+             * explicit send_fx:* keys, so it's independent of activeFxBus. */
+            restoreSendFxFromFiles();
+
             /* 8. Refresh slot names from new autosave files */
             for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
                 slots[i].name = "";
