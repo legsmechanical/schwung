@@ -1,0 +1,521 @@
+From 24639a4c3639585d9b2fe566f56a7f220806808b Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Thu, 4 Jun 2026 10:01:42 -0400
+Subject: [PATCH 4/8] feat(fx): send FX presets, per-bus return level,
+ ui_hierarchy fallback
+
+Checkpoint B (C side) of send FX Phase 2:
+- Send preset CRUD in chain_host.c (bus-parameterized: presets_send_a/_b dirs,
+  3 slots, JSON root "send_fx"; save/update/delete + count/name/json param keys).
+- Per-bus return level: shadow_send_return_level[SEND_BUS_COUNT] with
+  send_fx:{a,b}:return_level SET/GET in both shadow_chain_mgmt.c handler paths,
+  applied to the bus return in schwung_shim.c accumulate/return mix, and a global
+  fallback persisted in shadow_state.c (per-set override lives in the JS sidecar).
+- Send ui_hierarchy GET now falls back to module.json (mirrors the master_fx
+  handler) so modules that declare ui_hierarchy there but not via live get_param
+  (e.g. dissolver) can open their param editor on a send.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/host/shadow_chain_mgmt.c       |  85 ++++++++++
+ src/host/shadow_chain_mgmt.h       |   4 +
+ src/host/shadow_state.c            |  25 ++-
+ src/modules/chain/dsp/chain_host.c | 256 +++++++++++++++++++++++++++++
+ src/schwung_shim.c                 |  10 +-
+ 5 files changed, 376 insertions(+), 4 deletions(-)
+
+diff --git a/src/host/shadow_chain_mgmt.c b/src/host/shadow_chain_mgmt.c
+index 250d4df6..98271225 100644
+--- a/src/host/shadow_chain_mgmt.c
++++ b/src/host/shadow_chain_mgmt.c
+@@ -63,6 +63,9 @@ master_fx_slot_t shadow_master_fx_slots[MASTER_FX_SLOTS];
+ /* Send FX slots */
+ master_fx_slot_t shadow_send_fx_slots[SEND_BUS_COUNT][SEND_FX_SLOTS];
+ 
++/* Per-bus send return level (default unity) */
++float shadow_send_return_level[SEND_BUS_COUNT] = { 1.0f, 1.0f };
++
+ /* Master FX LFOs */
+ lfo_state_t shadow_master_fx_lfos[MASTER_FX_LFO_COUNT];
+ static float mfx_lfo_base_value[MASTER_FX_LFO_COUNT];
+@@ -1868,6 +1871,15 @@ void shadow_direct_set_param(uint8_t slot, const char *key, const char *value) {
+         else if (rest[0] == 'b' && rest[1] == ':') { bus = 1; rest += 2; }
+         if (bus < 0) return;
+ 
++        /* Bus-level params (no fxN prefix) */
++        if (strcmp(rest, "return_level") == 0) {
++            float lv = (value && value[0]) ? atof(value) : 1.0f;
++            if (lv < 0.0f) lv = 0.0f;
++            shadow_send_return_level[bus] = lv;
++            if (host.on_param_changed) host.on_param_changed(slot, key, value);
++            return;
++        }
++
+         int sfx_slot = -1;
+         if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
+         else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
+@@ -2831,6 +2843,24 @@ void shadow_inprocess_handle_param_request(void) {
+             return;
+         }
+ 
++        /* Bus-level params (no fxN prefix) */
++        if (strcmp(rest, "return_level") == 0) {
++            if (req_type == 1) {  /* SET */
++                float lv = (shadow_param->value[0]) ? atof(shadow_param->value) : 1.0f;
++                if (lv < 0.0f) lv = 0.0f;
++                shadow_send_return_level[bus] = lv;
++                shadow_param->error = 0;
++                shadow_param->result_len = 0;
++            } else if (req_type == 2) {  /* GET */
++                snprintf(shadow_param->value, SHADOW_PARAM_VALUE_LEN, "%.3f",
++                         shadow_send_return_level[bus]);
++                shadow_param->error = 0;
++                shadow_param->result_len = strlen(shadow_param->value);
++            }
++            shadow_param_publish_response(req_id);
++            return;
++        }
++
+         int sfx_slot = -1;
+         if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
+         else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
+@@ -2911,6 +2941,61 @@ void shadow_inprocess_handle_param_request(void) {
+                         return;
+                     }
+                 }
++                /* Fall back to reading ui_hierarchy from module.json (mirrors the
++                 * master_fx handler). Modules like dissolver don't expose
++                 * ui_hierarchy via live get_param but declare it in module.json;
++                 * without this fallback the send param editor can't open them. */
++                {
++                    char module_dir[256];
++                    strncpy(module_dir, sfx->module_path, sizeof(module_dir) - 1);
++                    module_dir[sizeof(module_dir) - 1] = '\0';
++                    char *last_slash = strrchr(module_dir, '/');
++                    if (last_slash) *last_slash = '\0';
++
++                    char json_path[512];
++                    snprintf(json_path, sizeof(json_path), "%s/module.json", module_dir);
++
++                    FILE *f = fopen(json_path, "r");
++                    if (f) {
++                        fseek(f, 0, SEEK_END);
++                        long size = ftell(f);
++                        fseek(f, 0, SEEK_SET);
++                        if (size > 0 && size < 65536) {
++                            char *json = malloc(size + 1);
++                            if (json) {
++                                size_t nread = fread(json, 1, size, f);
++                                json[nread] = '\0';
++
++                                const char *ui_hier = strstr(json, "\"ui_hierarchy\"");
++                                if (ui_hier) {
++                                    const char *obj_start = strchr(ui_hier + 14, '{');
++                                    if (obj_start) {
++                                        int depth = 1;
++                                        const char *obj_end = obj_start + 1;
++                                        while (*obj_end && depth > 0) {
++                                            if (*obj_end == '{') depth++;
++                                            else if (*obj_end == '}') depth--;
++                                            obj_end++;
++                                        }
++                                        int hlen = (int)(obj_end - obj_start);
++                                        if (hlen > 0 && hlen < SHADOW_PARAM_VALUE_LEN - 1) {
++                                            memcpy(shadow_param->value, obj_start, hlen);
++                                            shadow_param->value[hlen] = '\0';
++                                            shadow_param->error = 0;
++                                            shadow_param->result_len = hlen;
++                                            free(json);
++                                            fclose(f);
++                                            shadow_param_publish_response(req_id);
++                                            return;
++                                        }
++                                    }
++                                }
++                                free(json);
++                            }
++                        }
++                        fclose(f);
++                    }
++                }
+                 shadow_param->value[0] = '\0';
+                 shadow_param->error = 0;
+                 shadow_param->result_len = 0;
+diff --git a/src/host/shadow_chain_mgmt.h b/src/host/shadow_chain_mgmt.h
+index 2723ddbe..a870c76d 100644
+--- a/src/host/shadow_chain_mgmt.h
++++ b/src/host/shadow_chain_mgmt.h
+@@ -116,6 +116,10 @@ extern master_fx_slot_t shadow_master_fx_slots[MASTER_FX_SLOTS];
+ /* Send FX slots — 2 buses (A, B) × 3 FX slots each */
+ extern master_fx_slot_t shadow_send_fx_slots[SEND_BUS_COUNT][SEND_FX_SLOTS];
+ 
++/* Per-bus send return level (0..1+, default 1.0) applied to the bus's
++ * FX-processed return before it is summed into the mix. */
++extern float shadow_send_return_level[SEND_BUS_COUNT];
++
+ /* Master FX LFOs */
+ #define MASTER_FX_LFO_COUNT 2
+ extern lfo_state_t shadow_master_fx_lfos[MASTER_FX_LFO_COUNT];
+diff --git a/src/host/shadow_state.c b/src/host/shadow_state.c
+index cb1c614b..b89934e1 100644
+--- a/src/host/shadow_state.c
++++ b/src/host/shadow_state.c
+@@ -16,6 +16,10 @@ static void (*host_log)(const char *msg);
+ static shadow_chain_slot_t *host_chain_slots;
+ static int *host_solo_count;
+ 
++/* Per-bus send return level — defined in shadow_chain_mgmt.c (same .so).
++ * Declared locally to avoid pulling in the full chain-mgmt header. */
++extern float shadow_send_return_level[2];
++
+ /* Fix file ownership after writing as root */
+ static void chown_to_ableton(const char *path) {
+     struct passwd *pw = getpwnam("ableton");
+@@ -232,11 +236,14 @@ void shadow_save_state(void)
+             host_chain_slots[1].muted,
+             host_chain_slots[2].muted,
+             host_chain_slots[3].muted);
+-    fprintf(f, "  \"slot_soloed\": [%d, %d, %d, %d]\n",
++    fprintf(f, "  \"slot_soloed\": [%d, %d, %d, %d],\n",
+             host_chain_slots[0].soloed,
+             host_chain_slots[1].soloed,
+             host_chain_slots[2].soloed,
+             host_chain_slots[3].soloed);
++    fprintf(f, "  \"send_return_level\": [%.3f, %.3f]\n",
++            shadow_send_return_level[0],
++            shadow_send_return_level[1]);
+     fprintf(f, "}\n");
+     fclose(f);
+     chown_to_ableton(SHADOW_CONFIG_PATH);
+@@ -351,6 +358,22 @@ void shadow_load_state(void)
+         }
+     }
+ 
++    /* Parse send_return_level array (missing key → leaves the 1.0 default) */
++    const char *srl_key = "\"send_return_level\":";
++    char *srl_pos = strstr(json, srl_key);
++    if (srl_pos) {
++        srl_pos = strchr(srl_pos, '[');
++        if (srl_pos) {
++            float r0, r1;
++            if (sscanf(srl_pos, "[%f, %f]", &r0, &r1) == 2) {
++                if (r0 < 0.0f) r0 = 0.0f;
++                if (r1 < 0.0f) r1 = 0.0f;
++                shadow_send_return_level[0] = r0;
++                shadow_send_return_level[1] = r1;
++            }
++        }
++    }
++
+     /* Parse slot_channels (receive channel) array */
+     const char *ch_key = "\"slot_channels\":";
+     char *ch_pos = strstr(json, ch_key);
+diff --git a/src/modules/chain/dsp/chain_host.c b/src/modules/chain/dsp/chain_host.c
+index 03f8cb7e..11425917 100644
+--- a/src/modules/chain/dsp/chain_host.c
++++ b/src/modules/chain/dsp/chain_host.c
+@@ -6167,6 +6167,214 @@ static int load_master_preset_json(int index, char *buf, int buf_len) {
+ 
+ /* ========== End Master Preset Functions ========== */
+ 
++/* ========== Send Preset Functions ========== */
++/* Mirror of the master preset CRUD, parameterized by bus (0=A, 1=B). Presets
++ * live in per-bus directories and wrap 3 FX slots under a "send_fx" root.
++ * The JS editor is descriptor-driven (presetJsonRoot "send_fx", 3 slots), so
++ * these only need to store/retrieve the files. */
++
++#define PRESETS_SEND_A_DIR "/data/UserData/schwung/presets_send_a"
++#define PRESETS_SEND_B_DIR "/data/UserData/schwung/presets_send_b"
++#define MAX_SEND_PRESETS 64
++#define SEND_PRESET_BUSES 2
++
++static char send_preset_names[SEND_PRESET_BUSES][MAX_SEND_PRESETS][MAX_NAME_LEN];
++static char send_preset_paths[SEND_PRESET_BUSES][MAX_SEND_PRESETS][MAX_PATH_LEN];
++static int send_preset_count[SEND_PRESET_BUSES] = {0, 0};
++
++static const char *send_presets_dir(int bus) {
++    return bus == 0 ? PRESETS_SEND_A_DIR : PRESETS_SEND_B_DIR;
++}
++
++static void ensure_presets_send_dir(int bus) {
++    struct stat st = {0};
++    const char *dir = send_presets_dir(bus);
++    if (stat(dir, &st) == -1) {
++        mkdir(dir, 0755);
++    }
++}
++
++static void scan_send_presets(int bus) {
++    if (bus < 0 || bus >= SEND_PRESET_BUSES) return;
++    send_preset_count[bus] = 0;
++    memset(send_preset_names[bus], 0, sizeof(send_preset_names[bus]));
++    memset(send_preset_paths[bus], 0, sizeof(send_preset_paths[bus]));
++    ensure_presets_send_dir(bus);
++
++    DIR *dir = opendir(send_presets_dir(bus));
++    if (!dir) return;
++
++    struct dirent *entry;
++    while ((entry = readdir(dir)) != NULL && send_preset_count[bus] < MAX_SEND_PRESETS) {
++        if (entry->d_type != DT_REG) continue;
++
++        const char *name = entry->d_name;
++        size_t len = strlen(name);
++        if (len < 6 || strcmp(name + len - 5, ".json") != 0) continue;
++
++        size_t name_len = len - 5;
++        if (name_len >= MAX_NAME_LEN) name_len = MAX_NAME_LEN - 1;
++
++        char path[MAX_PATH_LEN];
++        snprintf(path, sizeof(path), "%s/%s", send_presets_dir(bus), name);
++
++        int idx = send_preset_count[bus];
++        FILE *f = fopen(path, "r");
++        if (f) {
++            char json_buf[2048];
++            size_t read_len = fread(json_buf, 1, sizeof(json_buf) - 1, f);
++            json_buf[read_len] = '\0';
++            fclose(f);
++
++            char parsed_name[MAX_NAME_LEN] = {0};
++            if (json_get_string(json_buf, "name", parsed_name, sizeof(parsed_name)) == 0) {
++                strncpy(send_preset_names[bus][idx], parsed_name, MAX_NAME_LEN - 1);
++                send_preset_names[bus][idx][MAX_NAME_LEN - 1] = '\0';
++            } else {
++                memcpy(send_preset_names[bus][idx], name, name_len);
++                send_preset_names[bus][idx][name_len] = '\0';
++            }
++        } else {
++            memcpy(send_preset_names[bus][idx], name, name_len);
++            send_preset_names[bus][idx][name_len] = '\0';
++        }
++
++        strncpy(send_preset_paths[bus][idx], path, MAX_PATH_LEN - 1);
++        send_preset_paths[bus][idx][MAX_PATH_LEN - 1] = '\0';
++        send_preset_count[bus]++;
++    }
++    closedir(dir);
++}
++
++/* Build the wrapped preset JSON for 3 send slots. Buffers sized to match the
++ * master path so large modules round-trip under the 64KB GET limit. */
++static void build_send_preset_json(char *out, int out_len,
++                                   const char *name, const char *json_str) {
++    char fx1[8192], fx2[8192], fx3[8192];
++    extract_fx_section(json_str, "fx1", fx1, sizeof(fx1));
++    extract_fx_section(json_str, "fx2", fx2, sizeof(fx2));
++    extract_fx_section(json_str, "fx3", fx3, sizeof(fx3));
++    snprintf(out, out_len,
++        "{\n"
++        "    \"name\": \"%s\",\n"
++        "    \"version\": 1,\n"
++        "    \"send_fx\": {\n"
++        "        \"fx1\": %s,\n"
++        "        \"fx2\": %s,\n"
++        "        \"fx3\": %s\n"
++        "    }\n"
++        "}\n",
++        name, fx1, fx2, fx3);
++}
++
++static int save_send_preset(int bus, const char *json_str) {
++    if (bus < 0 || bus >= SEND_PRESET_BUSES) return -1;
++    ensure_presets_send_dir(bus);
++
++    char name[MAX_NAME_LEN] = "Send FX";
++    json_get_string(json_str, "custom_name", name, sizeof(name));
++
++    char filename[MAX_NAME_LEN];
++    sanitize_filename(filename, sizeof(filename), name);
++
++    char path[MAX_PATH_LEN];
++    snprintf(path, sizeof(path), "%s/%s.json", send_presets_dir(bus), filename);
++
++    char final_json[40960];
++    build_send_preset_json(final_json, sizeof(final_json), name, json_str);
++
++    FILE *f = fopen(path, "w");
++    if (!f) {
++        char msg[256];
++        snprintf(msg, sizeof(msg), "Failed to save send preset: %s", path);
++        chain_log(msg);
++        return -1;
++    }
++    fputs(final_json, f);
++    fclose(f);
++    {
++        char msg[256];
++        snprintf(msg, sizeof(msg), "Saved send %c preset: %s", bus == 0 ? 'A' : 'B', name);
++        chain_log(msg);
++    }
++    scan_send_presets(bus);
++    return 0;
++}
++
++static int update_send_preset(int bus, int index, const char *json_str) {
++    if (bus < 0 || bus >= SEND_PRESET_BUSES) return -1;
++    if (index < 0 || index >= send_preset_count[bus]) {
++        char msg[256];
++        snprintf(msg, sizeof(msg), "Invalid send preset index: %d", index);
++        chain_log(msg);
++        return -1;
++    }
++
++    char name[MAX_NAME_LEN];
++    if (json_get_string(json_str, "custom_name", name, sizeof(name)) != 0) {
++        strncpy(name, send_preset_names[bus][index], sizeof(name) - 1);
++        name[sizeof(name) - 1] = '\0';
++    }
++
++    char final_json[40960];
++    build_send_preset_json(final_json, sizeof(final_json), name, json_str);
++
++    FILE *f = fopen(send_preset_paths[bus][index], "w");
++    if (!f) return -1;
++    fputs(final_json, f);
++    fclose(f);
++    {
++        char msg[256];
++        snprintf(msg, sizeof(msg), "Updated send %c preset: %s", bus == 0 ? 'A' : 'B', name);
++        chain_log(msg);
++    }
++    scan_send_presets(bus);
++    return 0;
++}
++
++static int delete_send_preset(int bus, int index) {
++    if (bus < 0 || bus >= SEND_PRESET_BUSES) return -1;
++    if (index < 0 || index >= send_preset_count[bus]) {
++        char msg[256];
++        snprintf(msg, sizeof(msg), "Invalid send preset index: %d", index);
++        chain_log(msg);
++        return -1;
++    }
++    if (remove(send_preset_paths[bus][index]) != 0) {
++        char msg[256];
++        snprintf(msg, sizeof(msg), "Failed to delete send preset: %s", send_preset_paths[bus][index]);
++        chain_log(msg);
++        return -1;
++    }
++    {
++        char msg[256];
++        snprintf(msg, sizeof(msg), "Deleted send %c preset: %s", bus == 0 ? 'A' : 'B', send_preset_names[bus][index]);
++        chain_log(msg);
++    }
++    scan_send_presets(bus);
++    return 0;
++}
++
++static int load_send_preset_json(int bus, int index, char *buf, int buf_len) {
++    if (bus < 0 || bus >= SEND_PRESET_BUSES) { buf[0] = '\0'; return 0; }
++    if (index < 0 || index >= send_preset_count[bus]) { buf[0] = '\0'; return 0; }
++
++    FILE *f = fopen(send_preset_paths[bus][index], "r");
++    if (!f) { buf[0] = '\0'; return 0; }
++
++    fseek(f, 0, SEEK_END);
++    long len = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    if (len <= 0) { fclose(f); buf[0] = '\0'; return 0; }
++    if (len >= buf_len) len = buf_len - 1;
++    size_t nr = fread(buf, 1, len, f);
++    buf[nr] = '\0';
++    fclose(f);
++    return (int)nr;
++}
++
++/* ========== End Send Preset Functions ========== */
++
+ /* Debug logging helper for parsing */
+ static void parse_debug_log(const char *msg) {
+     struct stat st;
+@@ -7546,6 +7754,27 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
+             update_master_preset(index, colon + 1);
+         }
+     }
++    /* Send preset commands (per bus A/B) */
++    else if (strcmp(key, "save_send_a_preset") == 0) {
++        save_send_preset(0, val);
++    }
++    else if (strcmp(key, "save_send_b_preset") == 0) {
++        save_send_preset(1, val);
++    }
++    else if (strcmp(key, "delete_send_a_preset") == 0) {
++        delete_send_preset(0, atoi(val));
++    }
++    else if (strcmp(key, "delete_send_b_preset") == 0) {
++        delete_send_preset(1, atoi(val));
++    }
++    else if (strcmp(key, "update_send_a_preset") == 0) {
++        const char *colon = strchr(val, ':');
++        if (colon) update_send_preset(0, atoi(val), colon + 1);
++    }
++    else if (strcmp(key, "update_send_b_preset") == 0) {
++        const char *colon = strchr(val, ':');
++        if (colon) update_send_preset(1, atoi(val), colon + 1);
++    }
+     else if (strncmp(key, "synth:", 6) == 0) {
+         const char *subkey = key + 6;
+         /* Intercept module change to swap synth dynamically */
+@@ -8367,6 +8596,33 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
+         int idx = atoi(key + 19);
+         return load_master_preset_json(idx, buf, buf_len);
+     }
++    /* Send preset queries (per bus A/B) */
++    if (strcmp(key, "send_a_preset_count") == 0) {
++        scan_send_presets(0);
++        return snprintf(buf, buf_len, "%d", send_preset_count[0]);
++    }
++    if (strcmp(key, "send_b_preset_count") == 0) {
++        scan_send_presets(1);
++        return snprintf(buf, buf_len, "%d", send_preset_count[1]);
++    }
++    if (strncmp(key, "send_a_preset_name_", 19) == 0) {
++        int idx = atoi(key + 19);
++        if (idx >= 0 && idx < send_preset_count[0])
++            return snprintf(buf, buf_len, "%s", send_preset_names[0][idx]);
++        return -1;
++    }
++    if (strncmp(key, "send_b_preset_name_", 19) == 0) {
++        int idx = atoi(key + 19);
++        if (idx >= 0 && idx < send_preset_count[1])
++            return snprintf(buf, buf_len, "%s", send_preset_names[1][idx]);
++        return -1;
++    }
++    if (strncmp(key, "send_a_preset_json_", 19) == 0) {
++        return load_send_preset_json(0, atoi(key + 19), buf, buf_len);
++    }
++    if (strncmp(key, "send_b_preset_json_", 19) == 0) {
++        return load_send_preset_json(1, atoi(key + 19), buf, buf_len);
++    }
+     if (strcmp(key, "fx_count") == 0) {
+         return snprintf(buf, buf_len, "%d", inst->fx_count);
+     }
+diff --git a/src/schwung_shim.c b/src/schwung_shim.c
+index 2f3df270..68e568c9 100644
+--- a/src/schwung_shim.c
++++ b/src/schwung_shim.c
+@@ -2351,13 +2351,17 @@ skip_la_rebuild:
+             sf->api->process_block(sf->instance, send_buf, FRAMES_PER_BLOCK);
+         }
+ 
++        /* Per-bus return level scales the FX-processed return into the mix. */
++        float rl = shadow_send_return_level[b];
+         for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+-            me_full[i] += (int32_t)send_buf[i];
+-            me_unity[i] += (int32_t)send_buf[i];
++            int32_t sv = (int32_t)lroundf((float)send_buf[i] * rl);
++            me_full[i] += sv;
++            me_unity[i] += sv;
+         }
+         if (rebuild_from_la) {
+             for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+-                int32_t mixed = (int32_t)mailbox_audio[i] + (int32_t)send_buf[i];
++                int32_t sv = (int32_t)lroundf((float)send_buf[i] * rl);
++                int32_t mixed = (int32_t)mailbox_audio[i] + sv;
+                 if (mixed > 32767) mixed = 32767;
+                 if (mixed < -32768) mixed = -32768;
+                 mailbox_audio[i] = (int16_t)mixed;
+-- 
+2.53.0
+

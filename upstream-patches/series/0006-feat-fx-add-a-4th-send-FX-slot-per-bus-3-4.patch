@@ -1,0 +1,140 @@
+From cd8ff4ea815a1b24af57bffcbd7ffac8b17f182a Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Thu, 4 Jun 2026 10:11:39 -0400
+Subject: [PATCH 6/8] feat(fx): add a 4th send FX slot per bus (3 -> 4)
+
+Brings sends to parity with Master FX (4 slots). The design was already
+parameterized, so this is mechanical:
+- SEND_FX_SLOTS 3 -> 4 (resizes shadow_send_fx_slots, audio/unload loops).
+- Add fx4 case to both send-key parsers in shadow_chain_mgmt.c.
+- Add fx4 to build_send_preset_json (buffer already sized for 4 slots).
+- JS: 4th entry in SEND_FX_COMPONENTS_A/B, slotCount 3 -> 4 (both buses),
+  SEND_FX_SLOTS_JS 3 -> 4.
+
+No state-version bump: old presets / per-set auto-persist files without fx4
+load it empty (backward compatible).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/host/shadow_chain_mgmt.c       |  2 ++
+ src/host/shadow_chain_mgmt.h       |  2 +-
+ src/modules/chain/dsp/chain_host.c |  8 +++++---
+ src/shadow/shadow_ui.js            | 12 +++++++-----
+ 4 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/src/host/shadow_chain_mgmt.c b/src/host/shadow_chain_mgmt.c
+index 98271225..7452b40d 100644
+--- a/src/host/shadow_chain_mgmt.c
++++ b/src/host/shadow_chain_mgmt.c
+@@ -1884,6 +1884,7 @@ void shadow_direct_set_param(uint8_t slot, const char *key, const char *value) {
+         if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
+         else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
+         else if (strncmp(rest, "fx3:", 4) == 0) { sfx_slot = 2; rest += 4; }
++        else if (strncmp(rest, "fx4:", 4) == 0) { sfx_slot = 3; rest += 4; }
+         if (sfx_slot < 0) return;
+ 
+         master_fx_slot_t *sfx = &shadow_send_fx_slots[bus][sfx_slot];
+@@ -2865,6 +2866,7 @@ void shadow_inprocess_handle_param_request(void) {
+         if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
+         else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
+         else if (strncmp(rest, "fx3:", 4) == 0) { sfx_slot = 2; rest += 4; }
++        else if (strncmp(rest, "fx4:", 4) == 0) { sfx_slot = 3; rest += 4; }
+         if (sfx_slot < 0) {
+             shadow_param->error = 1;
+             shadow_param->result_len = -1;
+diff --git a/src/host/shadow_chain_mgmt.h b/src/host/shadow_chain_mgmt.h
+index a870c76d..64700b55 100644
+--- a/src/host/shadow_chain_mgmt.h
++++ b/src/host/shadow_chain_mgmt.h
+@@ -20,7 +20,7 @@
+ 
+ #define MASTER_FX_SLOTS 4
+ #define SEND_BUS_COUNT 2
+-#define SEND_FX_SLOTS  3
++#define SEND_FX_SLOTS  4
+ #define SHADOW_CHAIN_MODULE_DIR "/data/UserData/schwung/modules/chain"
+ #define SHADOW_CHAIN_DSP_PATH "/data/UserData/schwung/modules/chain/dsp.so"
+ 
+diff --git a/src/modules/chain/dsp/chain_host.c b/src/modules/chain/dsp/chain_host.c
+index 11425917..992d2ff9 100644
+--- a/src/modules/chain/dsp/chain_host.c
++++ b/src/modules/chain/dsp/chain_host.c
+@@ -6250,10 +6250,11 @@ static void scan_send_presets(int bus) {
+  * master path so large modules round-trip under the 64KB GET limit. */
+ static void build_send_preset_json(char *out, int out_len,
+                                    const char *name, const char *json_str) {
+-    char fx1[8192], fx2[8192], fx3[8192];
++    char fx1[8192], fx2[8192], fx3[8192], fx4[8192];
+     extract_fx_section(json_str, "fx1", fx1, sizeof(fx1));
+     extract_fx_section(json_str, "fx2", fx2, sizeof(fx2));
+     extract_fx_section(json_str, "fx3", fx3, sizeof(fx3));
++    extract_fx_section(json_str, "fx4", fx4, sizeof(fx4));
+     snprintf(out, out_len,
+         "{\n"
+         "    \"name\": \"%s\",\n"
+@@ -6261,10 +6262,11 @@ static void build_send_preset_json(char *out, int out_len,
+         "    \"send_fx\": {\n"
+         "        \"fx1\": %s,\n"
+         "        \"fx2\": %s,\n"
+-        "        \"fx3\": %s\n"
++        "        \"fx3\": %s,\n"
++        "        \"fx4\": %s\n"
+         "    }\n"
+         "}\n",
+-        name, fx1, fx2, fx3);
++        name, fx1, fx2, fx3, fx4);
+ }
+ 
+ static int save_send_preset(int bus, const char *json_str) {
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 5ce6b6ce..89cd3f24 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -873,13 +873,15 @@ const SEND_FX_COMPONENTS_A = [
+     { key: "fx1", label: "FX 1", position: 0, paramPrefix: "send_fx:a:fx1:" },
+     { key: "fx2", label: "FX 2", position: 1, paramPrefix: "send_fx:a:fx2:" },
+     { key: "fx3", label: "FX 3", position: 2, paramPrefix: "send_fx:a:fx3:" },
+-    { key: "settings", label: "Settings", position: 3, paramPrefix: "" }
++    { key: "fx4", label: "FX 4", position: 3, paramPrefix: "send_fx:a:fx4:" },
++    { key: "settings", label: "Settings", position: 4, paramPrefix: "" }
+ ];
+ const SEND_FX_COMPONENTS_B = [
+     { key: "fx1", label: "FX 1", position: 0, paramPrefix: "send_fx:b:fx1:" },
+     { key: "fx2", label: "FX 2", position: 1, paramPrefix: "send_fx:b:fx2:" },
+     { key: "fx3", label: "FX 3", position: 2, paramPrefix: "send_fx:b:fx3:" },
+-    { key: "settings", label: "Settings", position: 3, paramPrefix: "" }
++    { key: "fx4", label: "FX 4", position: 3, paramPrefix: "send_fx:b:fx4:" },
++    { key: "settings", label: "Settings", position: 4, paramPrefix: "" }
+ ];
+ const FX_BUS = {
+     master: {
+@@ -897,7 +899,7 @@ const FX_BUS = {
+     },
+     sendA: {
+         id: "sendA", title: "Send FX A", paramPrefix: "send_fx:a:",
+-        slotCount: 3, hasLfo: false, persistConfig: false,
++        slotCount: 4, hasLfo: false, persistConfig: false,
+         volumeKey: "send_fx:a:return_level", components: SEND_FX_COMPONENTS_A,
+         presetPickerTitle: "Send FX A Presets",
+         presetJsonRoot: "send_fx",
+@@ -910,7 +912,7 @@ const FX_BUS = {
+     },
+     sendB: {
+         id: "sendB", title: "Send FX B", paramPrefix: "send_fx:b:",
+-        slotCount: 3, hasLfo: false, persistConfig: false,
++        slotCount: 4, hasLfo: false, persistConfig: false,
+         volumeKey: "send_fx:b:return_level", components: SEND_FX_COMPONENTS_B,
+         presetPickerTitle: "Send FX B Presets",
+         presetJsonRoot: "send_fx",
+@@ -6731,7 +6733,7 @@ function loadMasterFxChainFromConfig() {
+  * to call regardless of which FX editor is open. JS-only — the Phase-1
+  * send GET/SET handlers already forward :state/:chain_params/params. */
+ const SEND_FX_BUSES = ["a", "b"];
+-const SEND_FX_SLOTS_JS = 3;
++const SEND_FX_SLOTS_JS = 4;
+ 
+ function saveSendFxChainConfig() {
+     if (typeof shadow_get_param !== "function") return;
+-- 
+2.53.0
+
