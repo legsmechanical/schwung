@@ -873,13 +873,15 @@ const SEND_FX_COMPONENTS_A = [
     { key: "fx1", label: "FX 1", position: 0, paramPrefix: "send_fx:a:fx1:" },
     { key: "fx2", label: "FX 2", position: 1, paramPrefix: "send_fx:a:fx2:" },
     { key: "fx3", label: "FX 3", position: 2, paramPrefix: "send_fx:a:fx3:" },
-    { key: "settings", label: "Settings", position: 3, paramPrefix: "" }
+    { key: "fx4", label: "FX 4", position: 3, paramPrefix: "send_fx:a:fx4:" },
+    { key: "settings", label: "Settings", position: 4, paramPrefix: "" }
 ];
 const SEND_FX_COMPONENTS_B = [
     { key: "fx1", label: "FX 1", position: 0, paramPrefix: "send_fx:b:fx1:" },
     { key: "fx2", label: "FX 2", position: 1, paramPrefix: "send_fx:b:fx2:" },
     { key: "fx3", label: "FX 3", position: 2, paramPrefix: "send_fx:b:fx3:" },
-    { key: "settings", label: "Settings", position: 3, paramPrefix: "" }
+    { key: "fx4", label: "FX 4", position: 3, paramPrefix: "send_fx:b:fx4:" },
+    { key: "settings", label: "Settings", position: 4, paramPrefix: "" }
 ];
 const FX_BUS = {
     master: {
@@ -897,7 +899,7 @@ const FX_BUS = {
     },
     sendA: {
         id: "sendA", title: "Send FX A", paramPrefix: "send_fx:a:",
-        slotCount: 3, hasLfo: false, persistConfig: false,
+        slotCount: 4, hasLfo: false, persistConfig: false,
         volumeKey: "send_fx:a:return_level", components: SEND_FX_COMPONENTS_A,
         presetPickerTitle: "Send FX A Presets",
         presetJsonRoot: "send_fx",
@@ -910,7 +912,7 @@ const FX_BUS = {
     },
     sendB: {
         id: "sendB", title: "Send FX B", paramPrefix: "send_fx:b:",
-        slotCount: 3, hasLfo: false, persistConfig: false,
+        slotCount: 4, hasLfo: false, persistConfig: false,
         volumeKey: "send_fx:b:return_level", components: SEND_FX_COMPONENTS_B,
         presetPickerTitle: "Send FX B Presets",
         presetJsonRoot: "send_fx",
@@ -6733,7 +6735,7 @@ function loadMasterFxChainFromConfig() {
  * to call regardless of which FX editor is open. JS-only — the Phase-1
  * send GET/SET handlers already forward :state/:chain_params/params. */
 const SEND_FX_BUSES = ["a", "b"];
-const SEND_FX_SLOTS_JS = 3;
+const SEND_FX_SLOTS_JS = 4;
 
 function saveSendFxChainConfig() {
     if (typeof shadow_get_param !== "function") return;
