@@ -15580,7 +15580,23 @@ globalThis.tick = function() {
              * overwrite the freshly-written slot files */
             autosaveSuppressUntil = 150; /* ~5 seconds at 30fps */
 
-            /* 7. Reload master FX modules from per-set state files */
+            /* 7. Reload master FX modules from per-set state files.
+             * This restore is always about the MASTER bus. Two things must be
+             * reset first, because a Send FX editor (3 slots) may have been the
+             * last-active bus when the set changed:
+             *   - activeFxBus: setMasterFxSlotModule() is activeFxBus-relative, so
+             *     a stale send bus would misdirect the master chain's modules to
+             *     send_fx:* keys (loading heavy modules into send slots + firing the
+             *     out-of-range fx4) and flood the blocking set_param channel.
+             *   - masterFxConfig: it is rebuilt to activeFxBus.slotCount on editor
+             *     entry, so after a 3-slot send editor it only has fx1..fx3. The
+             *     loop below writes masterFxConfig["fx4"], which would be undefined
+             *     → TypeError → the handler throws BEFORE clearing SHADOW_UI_FLAG_SET_CHANGED
+             *     (step 11) → SET_CHANGED re-runs every tick → persistent global lag.
+             * Rebuilding it for the 4 master slots makes the restore self-contained. */
+            activeFxBus = FX_BUS.master;
+            masterFxConfig = { fx1: { module: "" }, fx2: { module: "" },
+                               fx3: { module: "" }, fx4: { module: "" } };
             for (let mfxi = 0; mfxi < 4; mfxi++) {
                 const mfxPath = activeSlotStateDir + "/master_fx_" + mfxi + ".json";
                 let mfxDspPath = "";
