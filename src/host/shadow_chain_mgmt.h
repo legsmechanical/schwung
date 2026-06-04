@@ -116,6 +116,10 @@ extern master_fx_slot_t shadow_master_fx_slots[MASTER_FX_SLOTS];
 /* Send FX slots — 2 buses (A, B) × 3 FX slots each */
 extern master_fx_slot_t shadow_send_fx_slots[SEND_BUS_COUNT][SEND_FX_SLOTS];
 
+/* Per-bus send return level (0..1+, default 1.0) applied to the bus's
+ * FX-processed return before it is summed into the mix. */
+extern float shadow_send_return_level[SEND_BUS_COUNT];
+
 /* Master FX LFOs */
 #define MASTER_FX_LFO_COUNT 2
 extern lfo_state_t shadow_master_fx_lfos[MASTER_FX_LFO_COUNT];

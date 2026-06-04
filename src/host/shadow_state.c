@@ -16,6 +16,10 @@ static void (*host_log)(const char *msg);
 static shadow_chain_slot_t *host_chain_slots;
 static int *host_solo_count;
 
+/* Per-bus send return level — defined in shadow_chain_mgmt.c (same .so).
+ * Declared locally to avoid pulling in the full chain-mgmt header. */
+extern float shadow_send_return_level[2];
+
 /* Fix file ownership after writing as root */
 static void chown_to_ableton(const char *path) {
     struct passwd *pw = getpwnam("ableton");
@@ -232,11 +236,14 @@ void shadow_save_state(void)
             host_chain_slots[1].muted,
             host_chain_slots[2].muted,
             host_chain_slots[3].muted);
-    fprintf(f, "  \"slot_soloed\": [%d, %d, %d, %d]\n",
+    fprintf(f, "  \"slot_soloed\": [%d, %d, %d, %d],\n",
             host_chain_slots[0].soloed,
             host_chain_slots[1].soloed,
             host_chain_slots[2].soloed,
             host_chain_slots[3].soloed);
+    fprintf(f, "  \"send_return_level\": [%.3f, %.3f]\n",
+            shadow_send_return_level[0],
+            shadow_send_return_level[1]);
     fprintf(f, "}\n");
     fclose(f);
     chown_to_ableton(SHADOW_CONFIG_PATH);
@@ -347,6 +354,22 @@ void shadow_load_state(void)
                 host_chain_slots[1].send_b = s1;
                 host_chain_slots[2].send_b = s2;
                 host_chain_slots[3].send_b = s3;
+            }
+        }
+    }
+
+    /* Parse send_return_level array (missing key → leaves the 1.0 default) */
+    const char *srl_key = "\"send_return_level\":";
+    char *srl_pos = strstr(json, srl_key);
+    if (srl_pos) {
+        srl_pos = strchr(srl_pos, '[');
+        if (srl_pos) {
+            float r0, r1;
+            if (sscanf(srl_pos, "[%f, %f]", &r0, &r1) == 2) {
+                if (r0 < 0.0f) r0 = 0.0f;
+                if (r1 < 0.0f) r1 = 0.0f;
+                shadow_send_return_level[0] = r0;
+                shadow_send_return_level[1] = r1;
             }
         }
     }
