@@ -3984,7 +3984,9 @@ function saveChainConfigToDir(dir) {
             const fwd = parseInt(getSlotParam(i, "slot:forward_channel") || "-1");
             const muted = parseInt(getSlotParam(i, "slot:muted") || "0");
             const soloed = parseInt(getSlotParam(i, "slot:soloed") || "0");
-            cfgSlots.push({ name: slots[i] ? slots[i].name : "", channel: ch, volume: vol, forward_channel: fwd, muted: muted, soloed: soloed });
+            const sendA = parseFloat(getSlotParam(i, "slot:send_a") || "0");
+            const sendB = parseFloat(getSlotParam(i, "slot:send_b") || "0");
+            cfgSlots.push({ name: slots[i] ? slots[i].name : "", channel: ch, volume: vol, forward_channel: fwd, muted: muted, soloed: soloed, send_a: sendA, send_b: sendB });
         }
         host_write_file(path, JSON.stringify({ slots: cfgSlots }, null, 2) + "\n");
     } catch (e) {
@@ -4165,6 +4167,10 @@ function loadChainConfigFromDir(dir) {
             if (typeof s.forward_channel === "number") setSlotParamWithTimeout(i, "slot:forward_channel", String(s.forward_channel), 500);
             if (typeof s.muted === "number") setSlotParamWithTimeout(i, "slot:muted", String(s.muted), 500);
             if (typeof s.soloed === "number") setSlotParamWithTimeout(i, "slot:soloed", String(s.soloed), 500);
+            /* Per-slot send levels (missing in configs written before sends existed
+             * → leave the shim default of 0, i.e. no send). */
+            if (typeof s.send_a === "number") setSlotParamWithTimeout(i, "slot:send_a", String(s.send_a), 500);
+            if (typeof s.send_b === "number") setSlotParamWithTimeout(i, "slot:send_b", String(s.send_b), 500);
         }
         debugLog("SET_CHANGED: loaded chain config from " + path);
     } catch (e) {
