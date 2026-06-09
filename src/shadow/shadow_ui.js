@@ -4111,7 +4111,9 @@ function saveChainConfigToDir(dir) {
             const fwd = parseInt(getSlotParam(i, "slot:forward_channel") || "-1");
             const muted = parseInt(getSlotParam(i, "slot:muted") || "0");
             const soloed = parseInt(getSlotParam(i, "slot:soloed") || "0");
-            cfgSlots.push({ name: slots[i] ? slots[i].name : "", channel: ch, volume: vol, forward_channel: fwd, muted: muted, soloed: soloed });
+            const sendA = parseFloat(getSlotParam(i, "slot:send_a") || "0");
+            const sendB = parseFloat(getSlotParam(i, "slot:send_b") || "0");
+            cfgSlots.push({ name: slots[i] ? slots[i].name : "", channel: ch, volume: vol, forward_channel: fwd, muted: muted, soloed: soloed, send_a: sendA, send_b: sendB });
         }
         host_write_file(path, JSON.stringify({ slots: cfgSlots }, null, 2) + "\n");
     } catch (e) {
@@ -4292,6 +4294,10 @@ function loadChainConfigFromDir(dir) {
             if (typeof s.forward_channel === "number") setSlotParamWithTimeout(i, "slot:forward_channel", String(s.forward_channel), 500);
             if (typeof s.muted === "number") setSlotParamWithTimeout(i, "slot:muted", String(s.muted), 500);
             if (typeof s.soloed === "number") setSlotParamWithTimeout(i, "slot:soloed", String(s.soloed), 500);
+            /* Per-slot send levels (missing in configs written before sends existed
+             * → leave the shim default of 0, i.e. no send). */
+            if (typeof s.send_a === "number") setSlotParamWithTimeout(i, "slot:send_a", String(s.send_a), 500);
+            if (typeof s.send_b === "number") setSlotParamWithTimeout(i, "slot:send_b", String(s.send_b), 500);
         }
         debugLog("SET_CHANGED: loaded chain config from " + path);
     } catch (e) {
@@ -8726,7 +8732,9 @@ function enterMasterFxHierarchyEditor(fxSlot) {
 }
 
 function enterSendFxHierarchyEditor(bus, fxSlot) {
-    if (fxSlot < 0 || fxSlot >= 3) return;
+    /* Each send bus has 4 FX slots (SEND_FX_SLOTS_JS); the prior >= 3 cap was a
+     * leftover from the 3-slot era and blocked the 4th slot's param editor. */
+    if (fxSlot < 0 || fxSlot >= SEND_FX_SLOTS_JS) return;
     const busKey = bus === 0 ? "a" : "b";
     const busLabel = bus === 0 ? "Send FX A" : "Send FX B";
     const compKey = `send_fx:${busKey}:fx${fxSlot + 1}`;
@@ -15721,7 +15729,7 @@ globalThis.tick = function() {
                         const mfx = host_read_file(copySourceDir + "/master_fx_" + i + ".json");
                         if (mfx) host_write_file(newDir + "/master_fx_" + i + ".json", mfx);
                     }
-                    /* Copy send FX per-set files (2 buses × 3 slots) + return-level meta */
+                    /* Copy send FX per-set files (2 buses × 4 slots) + return-level meta */
                     for (let bi = 0; bi < SEND_FX_BUSES.length; bi++) {
                         for (let s = 0; s < SEND_FX_SLOTS_JS; s++) {
                             const sfxName = "/send_fx_" + SEND_FX_BUSES[bi] + "_" + s + ".json";
