@@ -16,6 +16,14 @@ static void (*host_log)(const char *msg);
 static shadow_chain_slot_t *host_chain_slots;
 static int *host_solo_count;
 
+/* Per-bus send return level — defined in shadow_chain_mgmt.c (same .so).
+ * Declared locally to avoid pulling in the full chain-mgmt header.
+ * NOTE: the dimension MUST equal SEND_BUS_COUNT (== 2) in shadow_chain_mgmt.h.
+ * Kept as a literal here only to avoid that header's heavy deps; if
+ * SEND_BUS_COUNT ever changes, update this extern (and the r0/r1 load/save
+ * below) to match. */
+extern float shadow_send_return_level[2];   /* [SEND_BUS_COUNT] */
+
 /* Fix file ownership after writing as root */
 static void chown_to_ableton(const char *path) {
     struct passwd *pw = getpwnam("ableton");
@@ -202,6 +210,16 @@ void shadow_save_state(void)
             host_chain_slots[1].volume,
             host_chain_slots[2].volume,
             host_chain_slots[3].volume);
+    fprintf(f, "  \"slot_send_a\": [%.3f, %.3f, %.3f, %.3f],\n",
+            host_chain_slots[0].send_a,
+            host_chain_slots[1].send_a,
+            host_chain_slots[2].send_a,
+            host_chain_slots[3].send_a);
+    fprintf(f, "  \"slot_send_b\": [%.3f, %.3f, %.3f, %.3f],\n",
+            host_chain_slots[0].send_b,
+            host_chain_slots[1].send_b,
+            host_chain_slots[2].send_b,
+            host_chain_slots[3].send_b);
     fprintf(f, "  \"slot_channels\": [%d, %d, %d, %d],\n",
             host_chain_slots[0].channel,
             host_chain_slots[1].channel,
@@ -222,11 +240,14 @@ void shadow_save_state(void)
             host_chain_slots[1].muted,
             host_chain_slots[2].muted,
             host_chain_slots[3].muted);
-    fprintf(f, "  \"slot_soloed\": [%d, %d, %d, %d]\n",
+    fprintf(f, "  \"slot_soloed\": [%d, %d, %d, %d],\n",
             host_chain_slots[0].soloed,
             host_chain_slots[1].soloed,
             host_chain_slots[2].soloed,
             host_chain_slots[3].soloed);
+    fprintf(f, "  \"send_return_level\": [%.3f, %.3f]\n",
+            shadow_send_return_level[0],
+            shadow_send_return_level[1]);
     fprintf(f, "}\n");
     fclose(f);
     chown_to_ableton(SHADOW_CONFIG_PATH);
@@ -297,6 +318,62 @@ void shadow_load_state(void)
                 snprintf(msg, sizeof(msg), "Loaded slot volumes: [%.2f, %.2f, %.2f, %.2f]",
                          v0, v1, v2, v3);
                 if (host_log) host_log(msg);
+            }
+        }
+    }
+
+    /* Parse slot_send_a array */
+    const char *sa_key = "\"slot_send_a\":";
+    char *sa_pos = strstr(json, sa_key);
+    if (sa_pos) {
+        sa_pos = strchr(sa_pos, '[');
+        if (sa_pos) {
+            float s0, s1, s2, s3;
+            if (sscanf(sa_pos, "[%f, %f, %f, %f]", &s0, &s1, &s2, &s3) == 4) {
+                if (s0 < 0.0f) s0 = 0.0f; if (s0 > 1.0f) s0 = 1.0f;
+                if (s1 < 0.0f) s1 = 0.0f; if (s1 > 1.0f) s1 = 1.0f;
+                if (s2 < 0.0f) s2 = 0.0f; if (s2 > 1.0f) s2 = 1.0f;
+                if (s3 < 0.0f) s3 = 0.0f; if (s3 > 1.0f) s3 = 1.0f;
+                host_chain_slots[0].send_a = s0;
+                host_chain_slots[1].send_a = s1;
+                host_chain_slots[2].send_a = s2;
+                host_chain_slots[3].send_a = s3;
+            }
+        }
+    }
+
+    /* Parse slot_send_b array */
+    const char *sb_key = "\"slot_send_b\":";
+    char *sb_pos = strstr(json, sb_key);
+    if (sb_pos) {
+        sb_pos = strchr(sb_pos, '[');
+        if (sb_pos) {
+            float s0, s1, s2, s3;
+            if (sscanf(sb_pos, "[%f, %f, %f, %f]", &s0, &s1, &s2, &s3) == 4) {
+                if (s0 < 0.0f) s0 = 0.0f; if (s0 > 1.0f) s0 = 1.0f;
+                if (s1 < 0.0f) s1 = 0.0f; if (s1 > 1.0f) s1 = 1.0f;
+                if (s2 < 0.0f) s2 = 0.0f; if (s2 > 1.0f) s2 = 1.0f;
+                if (s3 < 0.0f) s3 = 0.0f; if (s3 > 1.0f) s3 = 1.0f;
+                host_chain_slots[0].send_b = s0;
+                host_chain_slots[1].send_b = s1;
+                host_chain_slots[2].send_b = s2;
+                host_chain_slots[3].send_b = s3;
+            }
+        }
+    }
+
+    /* Parse send_return_level array (missing key → leaves the 1.0 default) */
+    const char *srl_key = "\"send_return_level\":";
+    char *srl_pos = strstr(json, srl_key);
+    if (srl_pos) {
+        srl_pos = strchr(srl_pos, '[');
+        if (srl_pos) {
+            float r0, r1;
+            if (sscanf(srl_pos, "[%f, %f]", &r0, &r1) == 2) {
+                if (r0 < 0.0f) r0 = 0.0f;
+                if (r1 < 0.0f) r1 = 0.0f;
+                shadow_send_return_level[0] = r0;
+                shadow_send_return_level[1] = r1;
             }
         }
     }
