@@ -851,6 +851,12 @@ let selectedMasterFx = 0;    // Index into MASTER_FX_OPTIONS
 let currentMasterFxId = "";  // Currently loaded master FX module ID
 let currentMasterFxPath = ""; // Full path to currently loaded DSP
 
+/* Move FX dimensions. MOVE_FX_BLOCKS_JS must match the C #define MOVE_FX_BLOCKS;
+ * the fork raises both together (e.g. to 4). Defined here (above FX_BUS) because
+ * the Move FX bus descriptors are built from them just below. */
+const MOVE_FX_SLOTS_JS = 4;
+const MOVE_FX_BLOCKS_JS = 2;
+
 /* Master FX chain components (4 FX slots + settings) */
 const MASTER_FX_CHAIN_COMPONENTS = [
     { key: "fx1", label: "FX 1", position: 0, paramPrefix: "master_fx:fx1:" },
@@ -924,6 +930,30 @@ const FX_BUS = {
         presetDeleteKey: "delete_send_preset"
     }
 };
+/* Move FX buses — one per Move track (channel). Audio-FX-only mini-buses with
+ * MOVE_FX_BLOCKS_JS insert slots, surfaced in the FX bus picker beside the
+ * sends. No presets/LFO; the settings page exposes volume + Send A/B. Built
+ * programmatically so raising MOVE_FX_BLOCKS_JS needs no further edits here. */
+for (let mvSlot = 1; mvSlot <= MOVE_FX_SLOTS_JS; mvSlot++) {
+    const prefix = "move_fx:" + mvSlot + ":";
+    const comps = [];
+    for (let b = 1; b <= MOVE_FX_BLOCKS_JS; b++) {
+        comps.push({ key: "fx" + b, label: "FX " + b, position: b - 1, paramPrefix: prefix + "fx" + b + ":" });
+    }
+    comps.push({ key: "settings", label: "Settings", position: MOVE_FX_BLOCKS_JS, paramPrefix: "" });
+    FX_BUS["moveFx" + mvSlot] = {
+        id: "moveFx" + mvSlot, title: "Move FX " + mvSlot, paramPrefix: prefix,
+        slotCount: MOVE_FX_BLOCKS_JS, hasLfo: false, persistConfig: false,
+        isMoveFx: true, moveSlot: mvSlot - 1,
+        volumeKey: prefix + "volume", components: comps,
+        settingsItems: [
+            { key: "move_volume", label: "Volume", type: "float", min: 0, max: 4, step: 0.05, param: prefix + "volume" },
+            { key: "move_send_a", label: "Send A", type: "float", min: 0, max: 1, step: 0.05, param: prefix + "send_a" },
+            { key: "move_send_b", label: "Send B", type: "float", min: 0, max: 1, step: 0.05, param: prefix + "send_b" },
+        ]
+    };
+}
+
 /* Active bus for the FX editor. Set by the FX bus picker; persists through the
  * editor's sub-views. Defaults to master. */
 let activeFxBus = FX_BUS.master;
@@ -1225,6 +1255,10 @@ function parseResampleBridgeMode(raw) {
 
 /* Get dynamic settings items based on whether preset is loaded */
 function getMasterFxSettingsItems() {
+    /* Move FX buses define their own settings (volume + Send A/B, no presets/LFO). */
+    if (activeFxBus.settingsItems) {
+        return activeFxBus.settingsItems;
+    }
     if (currentMasterPresetName) {
         /* Existing preset: show all items */
         return MASTER_FX_SETTINGS_ITEMS_BASE;
@@ -1687,6 +1721,7 @@ const CHAIN_SETTINGS_ITEMS = [
     { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 4, step: 0.05 },
     { key: "slot:send_a", label: "Send A", type: "float", min: 0, max: 1, step: 0.05 },
     { key: "slot:send_b", label: "Send B", type: "float", min: 0, max: 1, step: 0.05 },
+    { key: "slot:move_to_slot", label: "Move>Slot", type: "int", min: 0, max: 1, step: 1 },  // On = Move track rides this synth slot; Off = peel to Move FX slot
     { key: "slot:muted", label: "Muted", type: "int", min: 0, max: 1, step: 1 },
     { key: "slot:soloed", label: "Soloed", type: "int", min: 0, max: 1, step: 1 },
     { key: "slot:receive_channel", label: "Recv Ch", type: "int", min: 0, max: 16, step: 1 },
@@ -4113,7 +4148,8 @@ function saveChainConfigToDir(dir) {
             const soloed = parseInt(getSlotParam(i, "slot:soloed") || "0");
             const sendA = parseFloat(getSlotParam(i, "slot:send_a") || "0");
             const sendB = parseFloat(getSlotParam(i, "slot:send_b") || "0");
-            cfgSlots.push({ name: slots[i] ? slots[i].name : "", channel: ch, volume: vol, forward_channel: fwd, muted: muted, soloed: soloed, send_a: sendA, send_b: sendB });
+            const moveToSlot = parseInt(getSlotParam(i, "slot:move_to_slot") || "1");
+            cfgSlots.push({ name: slots[i] ? slots[i].name : "", channel: ch, volume: vol, forward_channel: fwd, muted: muted, soloed: soloed, send_a: sendA, send_b: sendB, move_to_slot: moveToSlot });
         }
         host_write_file(path, JSON.stringify({ slots: cfgSlots }, null, 2) + "\n");
     } catch (e) {
@@ -4298,6 +4334,9 @@ function loadChainConfigFromDir(dir) {
              * → leave the shim default of 0, i.e. no send). */
             if (typeof s.send_a === "number") setSlotParamWithTimeout(i, "slot:send_a", String(s.send_a), 500);
             if (typeof s.send_b === "number") setSlotParamWithTimeout(i, "slot:send_b", String(s.send_b), 500);
+            /* Move>Slot routing (missing in older configs → leave shim default 1,
+             * i.e. Move track rides the synth slot). */
+            if (typeof s.move_to_slot === "number") setSlotParamWithTimeout(i, "slot:move_to_slot", String(s.move_to_slot), 500);
         }
         debugLog("SET_CHANGED: loaded chain config from " + path);
     } catch (e) {
@@ -6217,9 +6256,13 @@ function applyMasterFxModuleSelection() {
 
 /* Save master FX chain configuration */
 function saveMasterFxChainConfig() {
-    /* Master-bus-only below. Send buses persist via per-set send_fx_<bus>_<slot>
-     * files instead — dispatch to that path so in-editor send edits are saved. */
-    if (!activeFxBus.persistConfig) { saveSendFxChainConfig(); return; }
+    /* Master-bus-only below. Send/Move buses persist via their own per-set files
+     * instead — dispatch so in-editor edits are saved. */
+    if (!activeFxBus.persistConfig) {
+        if (activeFxBus.isMoveFx) saveMoveFxChainConfig();
+        else saveSendFxChainConfig();
+        return;
+    }
     /* The shim persists the state, but we also save to shadow config */
     try {
         const configPath = "/data/UserData/schwung/shadow_config.json";
@@ -6883,6 +6926,128 @@ function restoreSendFxFromFiles() {
         } catch (e) {}
     } catch (e) {
         debugLog("restoreSendFxFromFiles error: " + e);
+    }
+}
+
+/* Move FX per-set persistence — mirrors the Send FX pair above. Each Move FX
+ * slot's blocks persist to move_fx_<slot>_<block>.json; per-slot strip levels
+ * (volume + Send A/B) go in move_fx_meta.json. MOVE_FX_SLOTS_JS /
+ * MOVE_FX_BLOCKS_JS are defined near the FX bus descriptors above. */
+function saveMoveFxChainConfig() {
+    if (typeof shadow_get_param !== "function") return;
+    try {
+        for (let sl = 0; sl < MOVE_FX_SLOTS_JS; sl++) {
+            for (let b = 0; b < MOVE_FX_BLOCKS_JS; b++) {
+                const key = "move_fx:" + (sl + 1) + ":fx" + (b + 1);
+                const filePath = activeSlotStateDir + "/move_fx_" + sl + "_" + b + ".json";
+                const moduleId = shadow_get_param(0, key + ":name") || "";
+                if (!moduleId) { host_write_file(filePath, "{}\n"); continue; }
+
+                const opt = (MASTER_FX_OPTIONS || []).find(o => o.id === moduleId);
+                const slotConfig = {
+                    id: moduleId,
+                    module_id: moduleId,
+                    path: opt?.dspPath || "",
+                    bypassed: parseInt(shadow_get_param(0, key + ":bypassed") || "0", 10) === 1 ? 1 : 0
+                };
+
+                let stateObj = null;
+                let paramsObj = null;
+                try {
+                    const stateJson = shadow_get_param(0, key + ":state");
+                    if (stateJson) {
+                        try { stateObj = JSON.parse(stateJson); } catch (pe) { stateObj = stateJson; }
+                        slotConfig.state = stateObj;
+                    }
+                } catch (e) {}
+                if (!stateObj) {
+                    try {
+                        paramsObj = {};
+                        const pid = shadow_get_param(0, key + ":plugin_id");
+                        if (pid) paramsObj["plugin_id"] = pid;
+                        const cpJson = shadow_get_param(0, key + ":chain_params");
+                        if (cpJson) {
+                            const cps = JSON.parse(cpJson);
+                            if (Array.isArray(cps)) {
+                                for (const p of cps) {
+                                    if (p && p.key) {
+                                        const v = shadow_get_param(0, key + ":" + p.key);
+                                        if (v !== null && v !== undefined && v !== "") paramsObj[p.key] = v;
+                                    }
+                                }
+                            }
+                        }
+                        if (Object.keys(paramsObj).length > 0) slotConfig.params = paramsObj;
+                    } catch (e) {}
+                }
+
+                const realParamKeys = paramsObj ? Object.keys(paramsObj).filter(k => k !== "plugin_id") : [];
+                if (!stateObj && realParamKeys.length === 0) continue;
+                host_write_file(filePath, JSON.stringify(slotConfig, null, 2) + "\n");
+            }
+        }
+        /* Per-slot strip levels (volume + sends). */
+        const strips = [];
+        for (let sl = 0; sl < MOVE_FX_SLOTS_JS; sl++) {
+            const v  = parseFloat(shadow_get_param(0, "move_fx:" + (sl + 1) + ":volume") || "1.0");
+            const sa = parseFloat(shadow_get_param(0, "move_fx:" + (sl + 1) + ":send_a") || "0.0");
+            const sb = parseFloat(shadow_get_param(0, "move_fx:" + (sl + 1) + ":send_b") || "0.0");
+            strips.push({ volume: isNaN(v) ? 1.0 : v, send_a: isNaN(sa) ? 0.0 : sa, send_b: isNaN(sb) ? 0.0 : sb });
+        }
+        host_write_file(activeSlotStateDir + "/move_fx_meta.json",
+            JSON.stringify({ strips: strips }, null, 2) + "\n");
+    } catch (e) {
+        debugLog("saveMoveFxChainConfig error: " + e);
+    }
+}
+
+function restoreMoveFxFromFiles() {
+    if (typeof shadow_set_param !== "function") return;
+    try {
+        for (let sl = 0; sl < MOVE_FX_SLOTS_JS; sl++) {
+            for (let b = 0; b < MOVE_FX_BLOCKS_JS; b++) {
+                const key = "move_fx:" + (sl + 1) + ":fx" + (b + 1);
+                const filePath = activeSlotStateDir + "/move_fx_" + sl + "_" + b + ".json";
+                let data = null;
+                try {
+                    const raw = host_read_file(filePath);
+                    if (raw && raw.length > 3) data = JSON.parse(raw);
+                } catch (e) {}
+
+                const dspPath = (data && data.path) ? data.path : "";
+                shadow_set_param(0, key + ":module", dspPath);
+                if (!dspPath) continue;
+
+                if (data.state) {
+                    const stateStr = (typeof data.state === "string") ? data.state : JSON.stringify(data.state);
+                    shadow_set_param(0, key + ":state", stateStr);
+                } else if (data.params) {
+                    if (data.params.plugin_id) shadow_set_param(0, key + ":plugin_id", data.params.plugin_id);
+                    for (const [pk, pv] of Object.entries(data.params)) {
+                        if (pk !== "plugin_id") shadow_set_param(0, key + ":" + pk, String(pv));
+                    }
+                }
+                if (data.bypassed) shadow_set_param(0, key + ":bypassed", "1");
+            }
+        }
+        /* Restore per-slot strip levels (missing → leave shim defaults). */
+        try {
+            const raw = host_read_file(activeSlotStateDir + "/move_fx_meta.json");
+            if (raw) {
+                const meta = JSON.parse(raw);
+                if (meta && Array.isArray(meta.strips)) {
+                    for (let sl = 0; sl < meta.strips.length && sl < MOVE_FX_SLOTS_JS; sl++) {
+                        const st = meta.strips[sl];
+                        if (!st) continue;
+                        if (typeof st.volume === "number") shadow_set_param(0, "move_fx:" + (sl + 1) + ":volume", st.volume.toFixed(3));
+                        if (typeof st.send_a === "number") shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_a", st.send_a.toFixed(3));
+                        if (typeof st.send_b === "number") shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_b", st.send_b.toFixed(3));
+                    }
+                }
+            }
+        } catch (e) {}
+    } catch (e) {
+        debugLog("restoreMoveFxFromFiles error: " + e);
     }
 }
 
@@ -7795,6 +7960,11 @@ function getChainSettingValue(slot, setting) {
     }
     if (setting.key === "midi_fx_pre_mode") {
         return parseInt(val) ? "Schw+Move" : "Schw";
+    }
+    if (setting.key === "slot:move_to_slot") {
+        /* On = Move track rides this synth slot (shares FX + sends);
+         * Off = Move track is peeled to its own Move FX slot. */
+        return parseInt(val) ? "On" : "Off";
     }
     return String(val);
 }
@@ -8779,6 +8949,62 @@ function enterSendFxHierarchyEditor(bus, fxSlot) {
     loadHierarchyLevel();
 
     /* Sends now live in the shared generic editor (MASTER_FX view); return there. */
+    hierEditorReturnView = VIEWS.MASTER_FX;
+    setView(VIEWS.HIERARCHY_EDITOR);
+    needsRedraw = true;
+
+    const moduleName = shadow_get_param(0, `${compKey}:name`) || `FX ${fxSlot + 1}`;
+    if (hierEditorParams.length > 0) {
+        const param = hierEditorParams[0];
+        announce(`${busLabel} ${moduleName}, ${param.label || param.key}: ${param.value || ""}`);
+    } else {
+        announce(`${busLabel} ${moduleName}, No parameters`);
+    }
+}
+
+/* Move FX hierarchy editor — mirrors enterSendFxHierarchyEditor. The compKey
+ * (move_fx:<slot+1>:fx<block+1>) IS the param prefix the generic editor uses, so
+ * everything else resolves the same way as Master/Send FX. */
+function enterMoveFxHierarchyEditor(moveSlot, fxSlot) {
+    if (moveSlot < 0 || moveSlot >= MOVE_FX_SLOTS_JS) return;
+    if (fxSlot < 0 || fxSlot >= MOVE_FX_BLOCKS_JS) return;
+    const busLabel = "Move FX " + (moveSlot + 1);
+    const compKey = `move_fx:${moveSlot + 1}:fx${fxSlot + 1}`;
+
+    const hierJson = shadow_get_param(0, `${compKey}:ui_hierarchy`);
+    let hierarchy = null;
+    if (hierJson) {
+        try { hierarchy = JSON.parse(hierJson); } catch (e) { /* ignore */ }
+    }
+    if (!hierarchy) return;
+
+    hideOverlay();
+    invalidateKnobContextCache();
+    pendingHierKnobIndex = -1;
+    pendingHierKnobDelta = 0;
+
+    hierEditorSlot = 0;
+    hierEditorComponent = compKey;
+    hierEditorHierarchy = hierarchy;
+    hierEditorLevel = hierarchy.modes ? null : "root";
+    hierEditorPath = [];
+    hierEditorChildIndex = -1;
+    hierEditorChildCount = 0;
+    hierEditorChildLabel = "";
+    hierEditorSelectedIdx = 0;
+    hierEditorEditMode = false;
+    resetHierarchyEditState();
+    /* Same as Master/Send FX: treat as an FX-bus component so the param engine
+     * builds keys as `${component}:key` (here move_fx:N:fxM:key). */
+    hierEditorIsMasterFx = true;
+    hierEditorMasterFxSlot = fxSlot;
+    resetDynamicParamPickerState();
+
+    hierEditorChainParams = getMasterFxChainParams(fxSlot);
+
+    setupModuleParamShims(0, compKey);
+    loadHierarchyLevel();
+
     hierEditorReturnView = VIEWS.MASTER_FX;
     setView(VIEWS.HIERARCHY_EDITOR);
     needsRedraw = true;
@@ -11498,6 +11724,13 @@ function changeComponentPreset(delta) {
 
 /* Get Master FX setting current value for display */
 function getMasterFxSettingValue(setting) {
+    /* Generic param-backed setting (Move FX volume/sends). Shown as a percentage. */
+    if (setting.param) {
+        const val = shadow_get_param(0, setting.param);
+        if (val === null || val === undefined || val === "") return "0%";
+        const num = parseFloat(val);
+        return isNaN(num) ? val : `${Math.round(num * 100)}%`;
+    }
     if (setting.key === "master_volume") {
         const val = shadow_get_param(0, activeFxBus.volumeKey);
         if (!val) return "100%";
@@ -11610,6 +11843,15 @@ function getMasterFxSettingValue(setting) {
 /* Adjust Master FX setting value by delta */
 function adjustMasterFxSetting(setting, delta) {
     if (setting.type === "action") return;
+
+    /* Generic param-backed setting (Move FX volume/sends). */
+    if (setting.param) {
+        let val = parseFloat(shadow_get_param(0, setting.param) || "0");
+        val += delta * setting.step;
+        val = Math.max(setting.min, Math.min(setting.max, val));
+        shadow_set_param(0, setting.param, val.toFixed(2));
+        return;
+    }
 
     if (setting.key === "master_volume") {
         let val = parseFloat(shadow_get_param(0, activeFxBus.volumeKey) || "1.0");
@@ -11946,8 +12188,10 @@ function handleJog(delta) {
                 announceMenuItem("Module", module.name);
             } else {
                 /* Navigate chain components (-1 = preset selection, like instrument slots)
-                 * Preset picker is only accessible via click, not scroll */
-                selectedMasterFxComponent = Math.max(-1, Math.min(activeFxBus.components.length - 1, selectedMasterFxComponent + delta));
+                 * Preset picker is only accessible via click, not scroll.
+                 * Move FX buses have no presets, so their list starts at 0. */
+                const minComp = activeFxBus.isMoveFx ? 0 : -1;
+                selectedMasterFxComponent = Math.max(minComp, Math.min(activeFxBus.components.length - 1, selectedMasterFxComponent + delta));
                 if (selectedMasterFxComponent === -1) {
                     announce("Preset Selection");
                 } else {
@@ -11962,7 +12206,7 @@ function handleJog(delta) {
             handleSlotSettingsJog(delta);
             break;
         case VIEWS.FX_BUS_PICKER:
-            fxBusPickerIndex = Math.max(0, Math.min(2, fxBusPickerIndex + delta));
+            fxBusPickerIndex = Math.max(0, Math.min(2 + MOVE_FX_SLOTS_JS, fxBusPickerIndex + delta));
             break;
         case VIEWS.PATCHES:
             handlePatchesJog(delta);
@@ -12444,8 +12688,16 @@ function handleSelect() {
 
                     if (moduleData && moduleData.module) {
                         /* Module is loaded - open the param editor. Sends use the
-                         * dedicated send hierarchy editor; master uses its own. */
-                        if (activeFxBus.id === "master") {
+                         * dedicated send hierarchy editor; Move FX its own;
+                         * master uses its own. */
+                        if (activeFxBus.isMoveFx) {
+                            const hierarchy = getMasterFxHierarchy(selectedMasterFxComponent);
+                            if (hierarchy) {
+                                enterMoveFxHierarchyEditor(activeFxBus.moveSlot, selectedMasterFxComponent);
+                            } else {
+                                enterMasterFxModuleSelect(selectedMasterFxComponent);
+                            }
+                        } else if (activeFxBus.id === "master") {
                             const hierarchy = getMasterFxHierarchy(selectedMasterFxComponent);
                             if (hierarchy) {
                                 enterMasterFxHierarchyEditor(selectedMasterFxComponent);
@@ -12478,8 +12730,11 @@ function handleSelect() {
         case VIEWS.FX_BUS_PICKER:
             if (fxBusPickerIndex === 0) {
                 enterFxBusEditor("master");
-            } else {
+            } else if (fxBusPickerIndex === 1 || fxBusPickerIndex === 2) {
                 enterFxBusEditor(fxBusPickerIndex === 1 ? "sendA" : "sendB");
+            } else {
+                /* 3..(2+MOVE_FX_SLOTS_JS) → Move FX 1..N */
+                enterFxBusEditor("moveFx" + (fxBusPickerIndex - 2));
             }
             break;
         case VIEWS.PATCHES:
@@ -14772,6 +15027,9 @@ function drawFxBusPicker() {
         { label: "Send FX A", value: "" },
         { label: "Send FX B", value: "" },
     ];
+    for (let mv = 1; mv <= MOVE_FX_SLOTS_JS; mv++) {
+        items.push({ label: "Move FX " + mv, value: "" });
+    }
     drawMenuList({
         items,
         selectedIndex: fxBusPickerIndex,
@@ -15218,6 +15476,8 @@ globalThis.init = function() {
     loadMasterFxChainFromConfig();
     /* Send FX has no shim-side boot restore — load the active set's send chains here. */
     restoreSendFxFromFiles();
+    /* Move FX likewise has no shim-side boot restore. */
+    restoreMoveFxFromFiles();
 
     /* Sync dirty cache and slot names from autosave files (shim loaded them on startup) */
     for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
@@ -15333,6 +15593,7 @@ globalThis.shadow_save_state_now = function() {
     autosaveAllSlots();
     saveMasterFxChainConfig();
     saveSendFxChainConfig();  /* persist send FX chains + return levels per set */
+    saveMoveFxChainConfig();  /* persist Move FX chains + strip levels per set */
     /* Also persist volumes/channels/mute/solo — otherwise the set's
      * shadow_chain_config.json drifts from slot_N.json across reboots,
      * e.g. toggling MPE (recv=All) before shutdown would revert on boot. */
@@ -15739,6 +16000,16 @@ globalThis.tick = function() {
                     }
                     const sfxMeta = host_read_file(copySourceDir + "/send_fx_meta.json");
                     if (sfxMeta) host_write_file(newDir + "/send_fx_meta.json", sfxMeta);
+                    /* Copy Move FX per-set files (4 slots × blocks) + strip meta */
+                    for (let sl = 0; sl < MOVE_FX_SLOTS_JS; sl++) {
+                        for (let b = 0; b < MOVE_FX_BLOCKS_JS; b++) {
+                            const mvName = "/move_fx_" + sl + "_" + b + ".json";
+                            const mv = host_read_file(copySourceDir + mvName);
+                            if (mv) host_write_file(newDir + mvName, mv);
+                        }
+                    }
+                    const mvMeta = host_read_file(copySourceDir + "/move_fx_meta.json");
+                    if (mvMeta) host_write_file(newDir + "/move_fx_meta.json", mvMeta);
                     /* Also copy chain config */
                     const chainCfg = host_read_file(copySourceDir + "/shadow_chain_config.json");
                     if (chainCfg) host_write_file(newDir + "/shadow_chain_config.json", chainCfg);
@@ -15753,6 +16024,12 @@ globalThis.tick = function() {
                     for (let bi = 0; bi < SEND_FX_BUSES.length; bi++) {
                         for (let s = 0; s < SEND_FX_SLOTS_JS; s++) {
                             host_write_file(newDir + "/send_fx_" + SEND_FX_BUSES[bi] + "_" + s + ".json", "{}\n");
+                        }
+                    }
+                    /* Empty Move FX files so a new set starts with no Move FX chains. */
+                    for (let sl = 0; sl < MOVE_FX_SLOTS_JS; sl++) {
+                        for (let b = 0; b < MOVE_FX_BLOCKS_JS; b++) {
+                            host_write_file(newDir + "/move_fx_" + sl + "_" + b + ".json", "{}\n");
                         }
                     }
                     /* Seed a default chain config so receive channels reset to
@@ -15897,6 +16174,8 @@ globalThis.tick = function() {
             /* 7b. Reload send FX chains + return levels for the new set. Uses
              * explicit send_fx:* keys, so it's independent of activeFxBus. */
             restoreSendFxFromFiles();
+            /* 7c. Reload Move FX chains + strip levels for the new set. */
+            restoreMoveFxFromFiles();
 
             /* 8. Refresh slot names from new autosave files */
             for (let i = 0; i < SHADOW_UI_SLOTS; i++) {

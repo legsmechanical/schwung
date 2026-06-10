@@ -1899,17 +1899,25 @@ static void shadow_latency_delay_apply(int slot, const int16_t *in,
     shadow_latency_delay_wp[slot] = wp + FRAMES_PER_BLOCK * 2;
 }
 
-static inline void accumulate_sends(int slot, const int16_t *fx_buf,
-                                    int32_t send_accum[][FRAMES_PER_BLOCK * 2]) {
-    float vol = shadow_effective_volume(slot) * shadow_chain_slots[slot].fade.gain;
-    float levels[SEND_BUS_COUNT] = { shadow_chain_slots[slot].send_a,
-                                     shadow_chain_slots[slot].send_b };
+/* Tap a post-fader buffer into the global send buses at explicit levels.
+ * Shared by synth slots and Move FX slots (which carry their own vol/sends). */
+static inline void accumulate_sends_ex(const int16_t *fx_buf, float vol,
+                                       float send_a, float send_b,
+                                       int32_t send_accum[][FRAMES_PER_BLOCK * 2]) {
+    float levels[SEND_BUS_COUNT] = { send_a, send_b };
     for (int b = 0; b < SEND_BUS_COUNT; b++) {
         if (levels[b] < 0.001f) continue;
         float g = levels[b] * vol;
         for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++)
             send_accum[b][i] += (int32_t)lroundf((float)fx_buf[i] * g);
     }
+}
+
+static inline void accumulate_sends(int slot, const int16_t *fx_buf,
+                                    int32_t send_accum[][FRAMES_PER_BLOCK * 2]) {
+    float vol = shadow_effective_volume(slot) * shadow_chain_slots[slot].fade.gain;
+    accumulate_sends_ex(fx_buf, vol, shadow_chain_slots[slot].send_a,
+                        shadow_chain_slots[slot].send_b, send_accum);
 }
 
 static void shadow_inprocess_mix_from_buffer(void) {
@@ -2102,6 +2110,10 @@ static void shadow_inprocess_mix_from_buffer(void) {
             int16_t *move_track = la_cache[s];
             int have_move_track = la_cache_valid[s];
 
+            /* Move>Slot: 1 = sum Move track into this synth slot (shares FX +
+             * sends); 0 = peel it off to the dedicated Move FX slot below. */
+            int route_to_synth = shadow_chain_slots[s].move_to_slot;
+
             int slot_active = (shadow_chain_slots[s].active &&
                                shadow_chain_slots[s].instance &&
                                shadow_slot_deferred_valid[s]);
@@ -2165,11 +2177,14 @@ static void shadow_inprocess_mix_from_buffer(void) {
                     }
                 }
 
-                /* Active slot: combine synth + Link Audio, run through FX */
+                /* Active slot: combine synth + Link Audio, run through FX.
+                 * The Move track is summed in only when Move>Slot routes it
+                 * here (route_to_synth); otherwise the synth is processed alone
+                 * and the Move track goes through its Move FX slot below. */
                 int16_t fx_buf[FRAMES_PER_BLOCK * 2];
                 for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
                     int32_t combined = (int32_t)synth_src[i];
-                    if (have_move_track)
+                    if (have_move_track && route_to_synth)
                         combined += (int32_t)move_track[i];
                     if (combined > 32767) combined = 32767;
                     if (combined < -32768) combined = -32768;
@@ -2279,9 +2294,11 @@ static void shadow_inprocess_mix_from_buffer(void) {
                     if (i & 1) shadow_fade_advance(s);
                 }
                 accumulate_sends(s, fx_buf, send_accum);
-            } else if (have_move_track) {
-                /* Inactive slot: pass Link Audio through at unity level.
-                 * Master volume is applied after capture at the end. */
+            } else if (have_move_track && route_to_synth) {
+                /* Inactive slot, Move>Slot on: pass Link Audio through at unity
+                 * level. Master volume is applied after capture at the end.
+                 * (When Move>Slot is off the track is handled by the Move FX
+                 * block below instead.) */
                 for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
                     int32_t mixed = (int32_t)mailbox_audio[i] + (int32_t)move_track[i];
                     if (mixed > 32767) mixed = 32767;
@@ -2299,6 +2316,34 @@ static void shadow_inprocess_mix_from_buffer(void) {
                     __sync_synchronize();
                     ps->write_pos = wp;
                 }
+            }
+
+            /* Move FX slot: when Move>Slot is off, the channel's Move track is
+             * routed through its own ≤MOVE_FX_BLOCKS insert FX chain (independent
+             * of the synth on this channel), then mixed to the master at the
+             * strip's volume and tapped into the global Send A/B buses. Runs
+             * regardless of whether a synth is loaded on the slot. */
+            if (!route_to_synth && have_move_track && s < MOVE_FX_SLOTS) {
+                int16_t mbuf[FRAMES_PER_BLOCK * 2];
+                memcpy(mbuf, move_track, sizeof(mbuf));
+                for (int b = 0; b < MOVE_FX_BLOCKS; b++) {
+                    master_fx_slot_t *mf = &shadow_move_fx_slots[s][b];
+                    if (!(mf->instance && mf->api && mf->api->process_block)) continue;
+                    if (mf->bypassed) continue;
+                    mf->api->process_block(mf->instance, mbuf, FRAMES_PER_BLOCK);
+                }
+                float mvol = shadow_move_fx_strip[s].volume;
+                for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+                    int32_t scaled = (int32_t)lroundf((float)mbuf[i] * mvol);
+                    int32_t mixed = (int32_t)mailbox_audio[i] + scaled;
+                    if (mixed > 32767) mixed = 32767;
+                    if (mixed < -32768) mixed = -32768;
+                    mailbox_audio[i] = (int16_t)mixed;
+                    me_full[i]  += scaled;
+                    me_unity[i] += scaled;
+                }
+                accumulate_sends_ex(mbuf, mvol, shadow_move_fx_strip[s].send_a,
+                                    shadow_move_fx_strip[s].send_b, send_accum);
             }
         }
 
