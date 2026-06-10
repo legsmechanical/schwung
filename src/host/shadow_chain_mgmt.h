@@ -22,7 +22,7 @@
 #define SEND_BUS_COUNT 2
 #define SEND_FX_SLOTS  4
 #define MOVE_FX_SLOTS  4   /* one Move FX mini-bus per Move track / channel */
-#define MOVE_FX_BLOCKS 2   /* up to 2 insert FX per Move FX slot */
+#define MOVE_FX_BLOCKS 4   /* up to 4 insert FX per Move FX slot (fork daily-driver build) */
 #define SHADOW_CHAIN_MODULE_DIR "/data/UserData/schwung/modules/chain"
 #define SHADOW_CHAIN_DSP_PATH "/data/UserData/schwung/modules/chain/dsp.so"
 

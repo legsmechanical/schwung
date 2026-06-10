@@ -855,7 +855,7 @@ let currentMasterFxPath = ""; // Full path to currently loaded DSP
  * the fork raises both together (e.g. to 4). Defined here (above FX_BUS) because
  * the Move FX bus descriptors are built from them just below. */
 const MOVE_FX_SLOTS_JS = 4;
-const MOVE_FX_BLOCKS_JS = 2;
+const MOVE_FX_BLOCKS_JS = 4;
 
 /* Master FX chain components (4 FX slots + settings) */
 const MASTER_FX_CHAIN_COMPONENTS = [
