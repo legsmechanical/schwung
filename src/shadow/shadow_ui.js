@@ -6859,22 +6859,28 @@ function restoreMoveFxFromFiles() {
                 if (data.bypassed) shadow_set_param(0, key + ":bypassed", "1");
             }
         }
-        /* Restore per-slot strip levels (missing → leave shim defaults). */
+        /* Restore per-slot strip levels. Apply ALL slots every time, defaulting
+         * to unity / no-send when the meta file or a slot entry is absent. The
+         * shim's shadow_move_fx_strip[] is global and never reset on set change,
+         * so a new/older set with no meta would otherwise inherit the previous
+         * set's Move FX levels — explicitly writing defaults here resets them. */
+        let moveStrips = null;
         try {
             const raw = host_read_file(activeSlotStateDir + "/move_fx_meta.json");
             if (raw) {
                 const meta = JSON.parse(raw);
-                if (meta && Array.isArray(meta.strips)) {
-                    for (let sl = 0; sl < meta.strips.length && sl < MOVE_FX_SLOTS_JS; sl++) {
-                        const st = meta.strips[sl];
-                        if (!st) continue;
-                        if (typeof st.volume === "number") shadow_set_param(0, "move_fx:" + (sl + 1) + ":volume", st.volume.toFixed(3));
-                        if (typeof st.send_a === "number") shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_a", st.send_a.toFixed(3));
-                        if (typeof st.send_b === "number") shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_b", st.send_b.toFixed(3));
-                    }
-                }
+                if (meta && Array.isArray(meta.strips)) moveStrips = meta.strips;
             }
         } catch (e) {}
+        for (let sl = 0; sl < MOVE_FX_SLOTS_JS; sl++) {
+            const st = (moveStrips && moveStrips[sl]) ? moveStrips[sl] : null;
+            const vol = (st && typeof st.volume === "number") ? st.volume : 1.0;
+            const sa  = (st && typeof st.send_a === "number") ? st.send_a : 0.0;
+            const sb  = (st && typeof st.send_b === "number") ? st.send_b : 0.0;
+            shadow_set_param(0, "move_fx:" + (sl + 1) + ":volume", vol.toFixed(3));
+            shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_a", sa.toFixed(3));
+            shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_b", sb.toFixed(3));
+        }
     } catch (e) {
         debugLog("restoreMoveFxFromFiles error: " + e);
     }

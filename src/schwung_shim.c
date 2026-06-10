@@ -2118,10 +2118,50 @@ static void shadow_inprocess_mix_from_buffer(void) {
                                shadow_chain_slots[s].instance &&
                                shadow_slot_deferred_valid[s]);
 
+            /* Move FX slot: when Move>Slot is off, the channel's Move track is
+             * routed through its own ≤MOVE_FX_BLOCKS insert FX chain (independent
+             * of the synth on this channel), then mixed to the master at the
+             * strip's volume and tapped into the global Send A/B buses. Runs
+             * regardless of whether a synth is loaded on the slot, and BEFORE the
+             * synth block so the synth's idle-continue below can't skip it.
+             * Mixing is additive, so order doesn't change the sum. */
+            if (!route_to_synth && have_move_track && s < MOVE_FX_SLOTS) {
+                /* Skip the copy + FX loop entirely when no FX is loaded — the
+                 * track then mixes straight from la_cache (read-only). */
+                const int16_t *msrc = move_track;
+                int16_t mbuf[FRAMES_PER_BLOCK * 2];
+                if (shadow_move_fx_has_fx(s)) {
+                    memcpy(mbuf, move_track, sizeof(mbuf));
+                    for (int b = 0; b < MOVE_FX_BLOCKS; b++) {
+                        master_fx_slot_t *mf = &shadow_move_fx_slots[s][b];
+                        if (!(mf->instance && mf->api && mf->api->process_block)) continue;
+                        if (mf->bypassed) continue;
+                        mf->api->process_block(mf->instance, mbuf, FRAMES_PER_BLOCK);
+                    }
+                    msrc = mbuf;
+                }
+                /* Strip volume × the channel's mute/solo gate (not the synth
+                 * slot volume — the Move FX strip has its own level). */
+                float mvol = shadow_move_fx_strip[s].volume * shadow_slot_active_gain(s);
+                for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+                    int32_t scaled = (int32_t)lroundf((float)msrc[i] * mvol);
+                    int32_t mixed = (int32_t)mailbox_audio[i] + scaled;
+                    if (mixed > 32767) mixed = 32767;
+                    if (mixed < -32768) mixed = -32768;
+                    mailbox_audio[i] = (int16_t)mixed;
+                    me_full[i]  += scaled;
+                    me_unity[i] += scaled;
+                }
+                accumulate_sends_ex(msrc, mvol, shadow_move_fx_strip[s].send_a,
+                                    shadow_move_fx_strip[s].send_b, send_accum);
+            }
+
             if (slot_active) {
                 /* Phase 2 idle gate: skip FX when synth AND FX output are silent
-                 * AND no Link Audio track data is flowing for this slot */
-                if (shadow_slot_fx_idle[s] && shadow_slot_idle[s] && !have_move_track) continue;
+                 * AND either no Link Audio track is flowing OR it's been peeled to
+                 * the Move FX slot (handled above), so the synth has nothing to do. */
+                if (shadow_slot_fx_idle[s] && shadow_slot_idle[s] &&
+                    (!have_move_track || !route_to_synth)) continue;
 
                 /* Latency comp: delay the local synth output to match the
                  * Link Audio path before combining. The nudge in
@@ -2316,34 +2356,6 @@ static void shadow_inprocess_mix_from_buffer(void) {
                     __sync_synchronize();
                     ps->write_pos = wp;
                 }
-            }
-
-            /* Move FX slot: when Move>Slot is off, the channel's Move track is
-             * routed through its own ≤MOVE_FX_BLOCKS insert FX chain (independent
-             * of the synth on this channel), then mixed to the master at the
-             * strip's volume and tapped into the global Send A/B buses. Runs
-             * regardless of whether a synth is loaded on the slot. */
-            if (!route_to_synth && have_move_track && s < MOVE_FX_SLOTS) {
-                int16_t mbuf[FRAMES_PER_BLOCK * 2];
-                memcpy(mbuf, move_track, sizeof(mbuf));
-                for (int b = 0; b < MOVE_FX_BLOCKS; b++) {
-                    master_fx_slot_t *mf = &shadow_move_fx_slots[s][b];
-                    if (!(mf->instance && mf->api && mf->api->process_block)) continue;
-                    if (mf->bypassed) continue;
-                    mf->api->process_block(mf->instance, mbuf, FRAMES_PER_BLOCK);
-                }
-                float mvol = shadow_move_fx_strip[s].volume;
-                for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
-                    int32_t scaled = (int32_t)lroundf((float)mbuf[i] * mvol);
-                    int32_t mixed = (int32_t)mailbox_audio[i] + scaled;
-                    if (mixed > 32767) mixed = 32767;
-                    if (mixed < -32768) mixed = -32768;
-                    mailbox_audio[i] = (int16_t)mixed;
-                    me_full[i]  += scaled;
-                    me_unity[i] += scaled;
-                }
-                accumulate_sends_ex(mbuf, mvol, shadow_move_fx_strip[s].send_a,
-                                    shadow_move_fx_strip[s].send_b, send_accum);
             }
         }
 
