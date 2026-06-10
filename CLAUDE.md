@@ -322,6 +322,7 @@ Each of the 4 slots has:
 - **Receive channel**: 1–4 (default) or All (−1)
 - **Forward channel**: 1–16 or −1 (auto: remap to receive ch, or passthrough if receive=All) or −2 (THRU: preserve original ch). Modules can declare `default_forward_channel` in capabilities.
 - **Volume**, **state persistence** (synth + FX + MIDI FX).
+- **Move>Slot** (default On): under `rebuild_from_la`, On sums the same-channel Move track into this synth slot (shares the slot's insert FX + Send A/B); Off peels the Move track off to its own **Move FX slot** (see below) so the synth and Move track are processed independently. Persisted per set (`slot:move_to_slot`).
 
 **MPE controllers** (LinnStrument, Roli, Sensel): set Receive=All, Forward=THRU, enable MPE in the synth. Otherwise channel remap destroys per-note bend/pressure/slide.
 
@@ -345,6 +346,10 @@ SHM: `/schwung-ext-midi-remap`, 64 bytes, `schwung_ext_midi_remap_t` in `src/hos
 ### Master FX Chain
 
 4-slot Master FX processes mixed shadow output. Access: Shift+Vol+Menu.
+
+### Move FX Slots
+
+Four audio-FX-only mini-buses (one per Move track / channel, fixed 1:1), surfaced in the shadow slots list and FX bus picker beside Send A/B. Each has up to `MOVE_FX_BLOCKS` (default **2**) insert FX from the same audio-FX modules as Master/Send FX, its own **volume** (default unity), and its own **Send A/B** feeding the same global return buses. Only engaged under `rebuild_from_la` when a channel's **Move>Slot** is Off: that channel's Move track is routed through its Move FX slot instead of being summed into the synth slot. Processed inline in the rebuild mix loop (`schwung_shim.c`); state arrays `shadow_move_fx_slots[MOVE_FX_SLOTS][MOVE_FX_BLOCKS]` + `shadow_move_fx_strip[]` in `shadow_chain_mgmt.c`. Params: `move_fx:N:fxM:*`, `move_fx:N:volume|send_a|send_b` (N=1–4, M=1..blocks). Persisted per set as `move_fx_<slot>_<block>.json` + `move_fx_meta.json`. Raising the per-slot FX count on a fork is a single change to `MOVE_FX_BLOCKS` (C) + `MOVE_FX_BLOCKS_JS` (shadow_ui.js). Limitation: Move FX output mixes to the master/ME-unity path but is not re-published as a per-slot ME-N Link Audio channel.
 
 ### Overtake Modules
 
