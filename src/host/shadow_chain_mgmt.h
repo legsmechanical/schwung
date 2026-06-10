@@ -167,16 +167,6 @@ static inline float shadow_effective_volume(int slot) {
     return shadow_chain_slots[slot].volume;
 }
 
-/* Mute/solo gate (0.0 or 1.0) independent of slot volume. The Move FX strip
- * carries its own volume but should still obey the channel's mute/solo like
- * every other audio path. Solo wins over mute, matching shadow_effective_volume. */
-static inline float shadow_slot_active_gain(int slot) {
-    if (shadow_solo_count > 0) {
-        return shadow_chain_slots[slot].soloed ? 1.0f : 0.0f;
-    }
-    return shadow_chain_slots[slot].muted ? 0.0f : 1.0f;
-}
-
 /* Advance the fade envelope by one sample. Call once per stereo frame in mix loop. */
 static inline void shadow_fade_advance(int slot) {
     slot_fade_t *f = &shadow_chain_slots[slot].fade;

@@ -2140,9 +2140,10 @@ static void shadow_inprocess_mix_from_buffer(void) {
                     }
                     msrc = mbuf;
                 }
-                /* Strip volume × the channel's mute/solo gate (not the synth
-                 * slot volume — the Move FX strip has its own level). */
-                float mvol = shadow_move_fx_strip[s].volume * shadow_slot_active_gain(s);
+                /* The Move FX strip is fully independent of the synth slot on
+                 * this channel — its own volume only, deliberately NOT gated by
+                 * the synth slot's mute/solo (that independence is the feature). */
+                float mvol = shadow_move_fx_strip[s].volume;
                 for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
                     int32_t scaled = (int32_t)lroundf((float)msrc[i] * mvol);
                     int32_t mixed = (int32_t)mailbox_audio[i] + scaled;
