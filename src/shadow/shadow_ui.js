@@ -16988,8 +16988,9 @@ globalThis.onMidiMessageInternal = function(data) {
         /* Back button handling for suspend_keeps_js modules — Wave Editor convention.
          * Back alone: suspend (module parks in background, ticks continue).
          * Shift+Back: full exit (unload module).
-         * Skip while co-run is active: the chain editor claims Back. */
-        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && coRunChainEditSlot < 0) {
+         * Skip while co-run is active (the chain editor claims Back) or while
+         * a co-run view overlay is open (Back closes the overlay below). */
+        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && coRunChainEditSlot < 0 && corunOverlayId == null) {
             if (hostShiftHeld) {
                 debugLog("HOST: Shift+Back → full exit (suspend_keeps_js module)");
                 if (toolOvertakeActive) exitToolOvertake();
@@ -17030,7 +17031,7 @@ globalThis.onMidiMessageInternal = function(data) {
                 needsRedraw = true;
                 return;
             }
-            /* Note/Session (CC 50) while the overlay is open also closes it. */
+            /* Menu (CC 50) while the overlay is open also closes it. */
             if (d1 === 50 && d2 > 0) {
                 shadow_corun_close();
                 needsRedraw = true;
