@@ -342,6 +342,27 @@ let corunOverlayPrevMask = 0;    /* keep_mask to restore on close */
 globalThis.shadow_corun_entries = function() {
     return Object.keys(CORUN_ENTRIES);
 };
+
+globalThis.shadow_corun_open = function(id, keep_mask, args) {
+    const entry = CORUN_ENTRIES[id];
+    if (!entry) return false;
+    const st = (typeof shadow_corun_state === 'function') ? shadow_corun_state() : null;
+    corunOverlayPrevMask = st ? (st.keep_mask | 0) : 0;
+    corunOverlayId = id;
+    /* Flip OLED to shadow_ui + apply the overlay's keep_mask; corun.target stays
+     * put so the consumer tool's state machine is undisturbed. */
+    if (typeof shadow_corun_overlay === 'function') shadow_corun_overlay(1, keep_mask | 0);
+    entry.enter(args);
+    needsRedraw = true;
+    return true;
+};
+
+globalThis.shadow_corun_close = function() {
+    if (corunOverlayId == null) return;
+    corunOverlayId = null;
+    if (typeof shadow_corun_overlay === 'function') shadow_corun_overlay(0, corunOverlayPrevMask | 0);
+    needsRedraw = true;
+};
 /* ==== CO-RUN VIEW ADDRESSING (end) ==== */
 
 /* Special action key for swap module option */

@@ -69,4 +69,41 @@ function makeSandbox(overrides = {}) {
     console.log('ok - fx_picker absent on builds lacking enterFxBusPicker');
 }
 
+// Test 3: open() looks up the entry, remembers prev mask, flips overlay via C helper, runs enter
+{
+    const { sandbox, calls } = makeSandbox();
+    const ok = sandbox.shadow_corun_open('fx_picker', 0x041E);
+    assert.equal(ok, true, 'open known id returns true');
+    assert.deepEqual(calls.overlay.map(x => [...x]), [[1, 0x041E]], 'overlay(1, mask) called');
+    assert.deepEqual(calls.entered.map(x => [...x]), [['fx_picker']], 'enter-function invoked');
+    console.log('ok - open flips overlay + runs enter');
+}
+
+// Test 4: open() of an unknown id is a graceful no-op
+{
+    const { sandbox, calls } = makeSandbox();
+    const ok = sandbox.shadow_corun_open('nope', 0x041E);
+    assert.equal(ok, false, 'open unknown id returns false');
+    assert.equal(calls.overlay.length, 0, 'no overlay flip for unknown id');
+    assert.equal(calls.entered.length, 0, 'no enter for unknown id');
+    console.log('ok - open unknown id is a no-op');
+}
+
+// Test 5: close() restores the remembered prev mask via overlay(0, prevMask)
+{
+    const { sandbox, calls } = makeSandbox();
+    sandbox.shadow_corun_open('fx_picker', 0x041E); // prev mask from state stub = 0x040E
+    sandbox.shadow_corun_close();
+    assert.deepEqual([...calls.overlay[1]], [0, 0x040E], 'close restores prev keep_mask');
+    console.log('ok - close restores prev mask');
+}
+
+// Test 6: close() when no overlay is open is a no-op
+{
+    const { sandbox, calls } = makeSandbox();
+    sandbox.shadow_corun_close();
+    assert.equal(calls.overlay.length, 0, 'close with no overlay does nothing');
+    console.log('ok - close with no overlay is a no-op');
+}
+
 console.log('PASS test_corun_view_registry');
