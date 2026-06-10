@@ -316,6 +316,34 @@ const VIEWS = {
     FX_BUS_PICKER: "fxbuspicker"              // Pick Master FX / Send A / Send B
 };
 
+/* ==== CO-RUN VIEW ADDRESSING (begin) ==== */
+/* A curated registry of addressable Schwung screens a co-running tool may open
+ * as a temporary overlay over its co-run target, then return from. Tool + shadow_ui
+ * share one QuickJS globalThis, so the verbs are plain globals the tool calls
+ * directly. Display-owner / keep_mask SHM writes go through the C helper
+ * shadow_corun_overlay(active, keep_mask), which leaves corun.target untouched.
+ * Entries are curated and added deliberately — NEVER auto-derived from VIEWS. */
+const CORUN_ENTRIES = {
+    slots:           { enter: function() { view = VIEWS.SLOTS; } },
+    chain_editor:    { enter: function(a) { enterChainEdit((a && a.slot) | 0); } },
+    master_fx:       { enter: function() { enterMasterFxSettings(); } },
+    global_settings: { enter: function() { enterGlobalSettings(); } },
+};
+/* Fork-only catalog additions. Guarded on the enter-function so an upstream
+ * build that lacks the FX feature simply doesn't register the id, and tools
+ * gate on shadow_corun_entries(). */
+if (typeof enterFxBusPicker === 'function') {
+    CORUN_ENTRIES.fx_picker = { enter: function() { enterFxBusPicker(); } };
+}
+
+let corunOverlayId = null;       /* active overlay entry id, or null */
+let corunOverlayPrevMask = 0;    /* keep_mask to restore on close */
+
+globalThis.shadow_corun_entries = function() {
+    return Object.keys(CORUN_ENTRIES);
+};
+/* ==== CO-RUN VIEW ADDRESSING (end) ==== */
+
 /* Special action key for swap module option */
 const SWAP_MODULE_ACTION = "__swap_module__";
 
