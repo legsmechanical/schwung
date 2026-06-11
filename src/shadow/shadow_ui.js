@@ -9815,15 +9815,21 @@ function buildKnobContextForKnob(knobIndex) {
         }
     }
 
-    /* Master FX view with FX slot selected. Home-screen knob (71-78) param
-     * control is master-only for now; sends edit FX params via the hierarchy
-     * editor (Checkpoint A). */
-    if (view === VIEWS.MASTER_FX && activeFxBus.id === "master" &&
+    /* FX-bus overview with an FX slot selected: home-screen knobs (71-78) edit
+     * that slot's params for ANY bus (Master / Send A-B / Move FX), using the
+     * bus's own per-component paramPrefix. Previously master-only ("for now");
+     * generalized so every bus behaves like upstream's master — the param engine
+     * (isMasterFx path) + getMasterFx* helpers are already bus-aware via
+     * activeFxBus, so only the component list + key prefixes needed unpinning. */
+    if (view === VIEWS.MASTER_FX &&
         selectedMasterFxComponent >= 0 && selectedMasterFxComponent < activeFxBus.slotCount) {
-        const comp = MASTER_FX_CHAIN_COMPONENTS[selectedMasterFxComponent];
+        const comp = activeFxBus.components[selectedMasterFxComponent];
         if (comp && comp.key !== "settings") {
+            /* Bus-aware overlay tag (master keeps its compact "MFX"; other buses
+             * show their own title) — replaces the old hardcoded master label. */
+            const busTag = activeFxBus.id === "master" ? "MFX" : (activeFxBus.title || "FX");
             const chainParams = getMasterFxChainParams(selectedMasterFxComponent);
-            const pluginName = shadow_get_param(0, `master_fx:${comp.key}:name`) || "";
+            const pluginName = shadow_get_param(0, comp.paramPrefix + "name") || "";
             const hasModule = pluginName && pluginName.length > 0;
 
             /* No module loaded in this slot */
@@ -9835,7 +9841,7 @@ function buildKnobContextForKnob(knobIndex) {
                     meta: null,
                     pluginName: comp.label,
                     displayName: `Knob ${knobIndex + 1}`,
-                    title: `MFX ${comp.label}`,
+                    title: `${busTag} ${comp.label}`,
                     noModule: true,
                     isMasterFx: true,
                     masterFxSlot: selectedMasterFxComponent
@@ -9855,7 +9861,7 @@ function buildKnobContextForKnob(knobIndex) {
                 }
                 if (levelDef && levelDef.knobs && knobIndex < levelDef.knobs.length) {
                     const key = levelDef.knobs[knobIndex];
-                    const fullKey = `master_fx:${comp.key}:${key}`;
+                    const fullKey = comp.paramPrefix + key;
                     const rawMeta = chainParams.find(p => p.key === key);
                     const meta = normalizeExpandedParamMeta(key, rawMeta);
                     const displayName = meta && meta.name ? meta.name : key.replace(/_/g, " ");
@@ -9866,7 +9872,7 @@ function buildKnobContextForKnob(knobIndex) {
                         meta,
                         pluginName,
                         displayName,
-                        title: `MFX ${pluginName} ${displayName}`,
+                        title: `${busTag} ${pluginName} ${displayName}`,
                         isMasterFx: true,
                         masterFxSlot: selectedMasterFxComponent
                     };
@@ -9886,7 +9892,7 @@ function buildKnobContextForKnob(knobIndex) {
                     meta: normalizeExpandedParamMeta(key, param),
                     pluginName,
                     displayName,
-                    title: `MFX ${pluginName} ${displayName}`,
+                    title: `${busTag} ${pluginName} ${displayName}`,
                     isMasterFx: true,
                     masterFxSlot: selectedMasterFxComponent
                 };
@@ -9900,7 +9906,7 @@ function buildKnobContextForKnob(knobIndex) {
                 meta: null,
                 pluginName,
                 displayName: `Knob ${knobIndex + 1}`,
-                title: `MFX ${pluginName}`,
+                title: `${busTag} ${pluginName}`,
                 noMapping: true,
                 isMasterFx: true,
                 masterFxSlot: selectedMasterFxComponent
@@ -9933,6 +9939,11 @@ function rebuildKnobContextCache() {
  * Uses caching to avoid IPC calls on every CC message
  */
 let cachedKnobContextsMasterFxComp = -1;  /* Track Master FX component for cache */
+let cachedKnobContextsFxBus = "";         /* Track active FX bus id for cache —
+                                           * now that every bus (not just master)
+                                           * uses FX-overview knob contexts, a bus
+                                           * switch with the same view/slot must
+                                           * invalidate or knobs leak across buses. */
 
 function getKnobContext(knobIndex) {
     /* Check if cache is valid */
@@ -9941,6 +9952,7 @@ function getKnobContext(knobIndex) {
     const currentLevel = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorLevel : "";
     const currentChildIndex = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorChildIndex : -1;
     const currentMasterFxComp = (view === VIEWS.MASTER_FX) ? selectedMasterFxComponent : -1;
+    const currentFxBus = activeFxBus ? activeFxBus.id : "";
 
     const cacheValid = (
         cachedKnobContexts.length === NUM_KNOBS &&
@@ -9949,12 +9961,14 @@ function getKnobContext(knobIndex) {
         cachedKnobContextsComp === currentComp &&
         cachedKnobContextsLevel === currentLevel &&
         cachedKnobContextsChildIndex === currentChildIndex &&
-        cachedKnobContextsMasterFxComp === currentMasterFxComp
+        cachedKnobContextsMasterFxComp === currentMasterFxComp &&
+        cachedKnobContextsFxBus === currentFxBus
     );
 
     if (!cacheValid) {
         rebuildKnobContextCache();
         cachedKnobContextsMasterFxComp = currentMasterFxComp;
+        cachedKnobContextsFxBus = currentFxBus;
     }
 
     return cachedKnobContexts[knobIndex] || null;
