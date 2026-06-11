@@ -1804,7 +1804,7 @@ const CHAIN_SETTINGS_ITEMS = [
     { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 4, step: 0.05 },
     { key: "slot:send_a", label: "Send A", type: "float", min: 0, max: 1, step: 0.05 },
     { key: "slot:send_b", label: "Send B", type: "float", min: 0, max: 1, step: 0.05 },
-    { key: "slot:move_to_slot", label: "Move>Slot", type: "int", min: 0, max: 1, step: 1 },  // On = Move track rides this synth slot; Off = peel to Move FX slot
+    { key: "slot:move_to_slot", label: "Move>SchwFX", type: "int", min: 0, max: 1, step: 1 },  // On = Move track rides this synth slot (shares its SchwFX chain + sends); Off = peel to Move FX slot
     { key: "slot:muted", label: "Muted", type: "int", min: 0, max: 1, step: 1 },
     { key: "slot:soloed", label: "Soloed", type: "int", min: 0, max: 1, step: 1 },
     { key: "slot:receive_channel", label: "Recv Ch", type: "int", min: 0, max: 16, step: 1 },
