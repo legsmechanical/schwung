@@ -252,15 +252,19 @@ function coRunCedes(grp) {
     return grp !== 0 && (m & grp) === 0;
 }
 
-/* Should shadow_ui's co-run intercept handle this control group?
- *  - chain-edit: yes when the tool CEDES it (peer is shadow_ui, same process).
- *  - overlay over move-native: the tool KEEPS its nav (jog/back) precisely so it
- *    reaches this process instead of being suppressed to Move firmware — so
- *    during an overlay, treat the nav groups as ours regardless of cede status.
- * Groups the overlay does NOT keep (knobs/shift/track) are ceded to Move and
- * never arrive here, so returning true for them is harmless. */
+/* Should shadow_ui's co-run intercept handle this control group? ONE uniform
+ * rule for every UI element — which elements an overlay/editor owns is driven
+ * purely by the tool's keep_mask, with no per-element special-casing:
+ *  - chain-edit: handle it when the tool CEDES it (peer is shadow_ui, same
+ *    process, so ceded events arrive here).
+ *  - overlay over move-native: handle it when the tool KEEPS it — the tool keeps
+ *    exactly the UI elements it wants the overlay to drive (kept events reach
+ *    this process; ceded ones go to Move firmware instead). So "keeps" is the
+ *    overlay's analogue of chain-edit's "cedes".
+ * A tool therefore enables, e.g., FX-knob editing in an overlay simply by
+ * keeping CORUN_GRP_KNOBS — no FX-specific code here. */
 function coRunWants(grp) {
-    return corunOverlayId != null ? true : coRunCedes(grp);
+    return corunOverlayId != null ? !coRunCedes(grp) : coRunCedes(grp);
 }
 
 /* Param-shim originals. When a chain module's UI is "loaded" (or when
@@ -17105,7 +17109,7 @@ globalThis.onMidiMessageInternal = function(data) {
              * the editor's isShiftHeld()-based code paths see the right state.
              * Eating it here prevents the tool from reacting (e.g. its own
              * Shift+button shortcuts while you're navigating the editor). */
-            if (d1 === 49 && coRunCedes(CORUN_GRP_SHIFT)) {
+            if (d1 === 49 && coRunWants(CORUN_GRP_SHIFT)) {
                 needsRedraw = true;
                 return;
             }
@@ -17124,7 +17128,7 @@ globalThis.onMidiMessageInternal = function(data) {
             /* Track buttons: CC 43=Track 1 (slot 0), CC 40=Track 4 (slot 3).
              * Chain-edit only — an overlay has no chain slot; swallow so a stray
              * track press can't flip it into chain-edit co-run. */
-            if (d1 >= 40 && d1 <= 43 && d2 > 0 && coRunCedes(CORUN_GRP_TRACK_BUTTONS)) {
+            if (d1 >= 40 && d1 <= 43 && d2 > 0 && coRunWants(CORUN_GRP_TRACK_BUTTONS)) {
                 if (corunOverlayId != null) { needsRedraw = true; return; }
                 const _slot = 43 - d1;
                 if (_slot >= 0 && _slot < SHADOW_UI_SLOTS && _slot !== coRunChainEditSlot) {
@@ -17147,7 +17151,7 @@ globalThis.onMidiMessageInternal = function(data) {
              * before the tool knob-accumulation below, so the tool no longer
              * receives knob turns while co-run is active. Knob TOUCH notes still
              * forward to the tool — intentional turn-only split. */
-            if (d1 >= KNOB_CC_START && d1 <= KNOB_CC_END && coRunCedes(CORUN_GRP_KNOBS)) {
+            if (d1 >= KNOB_CC_START && d1 <= KNOB_CC_END && coRunWants(CORUN_GRP_KNOBS)) {
                 const _kIdx = d1 - KNOB_CC_START;
                 const _kDelta = decodeDelta(d2);
                 if (_kDelta !== 0) {
@@ -17185,8 +17189,8 @@ globalThis.onMidiMessageInternal = function(data) {
          * notes pre-change; keeping that avoids a stranded knobTouched on exit).
          * Release drains BOTH the hierarchy (pendingHierKnob) and slot-global
          * (pendingKnob) paths, which is what actually clears the value popup. */
-        if (coRunChainEditSlot >= 0 && (status & 0xF0) === MidiNoteOn &&
-                d1 >= MoveKnob1Touch && d1 <= MoveKnob8Touch && coRunCedes(CORUN_GRP_TOUCH)) {
+        if (coRunUiActive() && (status & 0xF0) === MidiNoteOn &&
+                d1 >= MoveKnob1Touch && d1 <= MoveKnob8Touch && coRunWants(CORUN_GRP_TOUCH)) {
             const _tk = d1 - MoveKnob1Touch;
             if (d2 > 0) {
                 runCoRunChainEdit(function() {
