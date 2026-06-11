@@ -12309,7 +12309,7 @@ function handleJog(delta) {
             handleSlotSettingsJog(delta);
             break;
         case VIEWS.FX_BUS_PICKER:
-            fxBusPickerIndex = Math.max(0, Math.min(2 + MOVE_FX_SLOTS_JS, fxBusPickerIndex + delta));
+            fxBusPickerIndex = Math.max(0, Math.min(2 + fxPickerVisibleMoveSlots.length, fxBusPickerIndex + delta));
             break;
         case VIEWS.PATCHES:
             handlePatchesJog(delta);
@@ -12836,8 +12836,9 @@ function handleSelect() {
             } else if (fxBusPickerIndex === 1 || fxBusPickerIndex === 2) {
                 enterFxBusEditor(fxBusPickerIndex === 1 ? "sendA" : "sendB");
             } else {
-                /* 3..(2+MOVE_FX_SLOTS_JS) → Move FX 1..N */
-                enterFxBusEditor("moveFx" + (fxBusPickerIndex - 2));
+                /* 3.. → visible Move FX rows (tracks peeled to their own bus) */
+                const s = fxPickerVisibleMoveSlots[fxBusPickerIndex - 3];
+                if (s !== undefined) enterFxBusEditor("moveFx" + (s + 1));
             }
             break;
         case VIEWS.PATCHES:
@@ -15116,8 +15117,21 @@ function enterFxBusEditor(busId) {
 }
 
 let fxBusPickerIndex = 0;
+/* Slot indices (0-based) whose Move>SchwFX is Off (peeled) → their Move FX bus
+ * gets a row in the FX-bus picker. Recomputed in the render path (get_param is
+ * reliable there, not in input handlers); read by the jog/select handlers. */
+let fxPickerVisibleMoveSlots = [];
+function refreshFxPickerVisibleMoveSlots() {
+    fxPickerVisibleMoveSlots = [];
+    for (let s = 0; s < MOVE_FX_SLOTS_JS; s++) {
+        if (getSlotParam(s, "slot:move_to_slot") === "0") {
+            fxPickerVisibleMoveSlots.push(s);
+        }
+    }
+}
 function enterFxBusPicker() {
     fxBusPickerIndex = 0;
+    refreshFxPickerVisibleMoveSlots();
     view = VIEWS.FX_BUS_PICKER;
     if (coRunChainEditSlot >= 0) coRunView = VIEWS.FX_BUS_PICKER;
     needsRedraw = true;
@@ -15125,14 +15139,18 @@ function enterFxBusPicker() {
 function drawFxBusPicker() {
     clear_screen();
     drawHeader("FX Buses");
+    refreshFxPickerVisibleMoveSlots();
     const items = [
         { label: "Master FX", value: getMasterFxDisplayName() },
         { label: "Send FX A", value: "" },
         { label: "Send FX B", value: "" },
     ];
-    for (let mv = 1; mv <= MOVE_FX_SLOTS_JS; mv++) {
-        items.push({ label: "Move " + mv + " FX", value: "" });
+    for (const s of fxPickerVisibleMoveSlots) {
+        items.push({ label: "Move " + (s + 1) + " FX", value: "" });
     }
+    /* List shrank (a track was set back to On) → keep selection in range. */
+    const maxIdx = 2 + fxPickerVisibleMoveSlots.length;
+    if (fxBusPickerIndex > maxIdx) fxBusPickerIndex = maxIdx;
     drawMenuList({
         items,
         selectedIndex: fxBusPickerIndex,
