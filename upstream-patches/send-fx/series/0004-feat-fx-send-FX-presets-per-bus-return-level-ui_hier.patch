@@ -1,8 +1,8 @@
-From 24639a4c3639585d9b2fe566f56a7f220806808b Mon Sep 17 00:00:00 2001
+From 7d4f7008b5c72d83082ddf383fe7e311f0cf4df0 Mon Sep 17 00:00:00 2001
 From: legsmechanical <joshgaine@gmail.com>
 Date: Thu, 4 Jun 2026 10:01:42 -0400
-Subject: [PATCH 4/8] feat(fx): send FX presets, per-bus return level,
- ui_hierarchy fallback
+Subject: [PATCH] feat(fx): send FX presets, per-bus return level, ui_hierarchy
+ fallback
 
 Checkpoint B (C side) of send FX Phase 2:
 - Send preset CRUD in chain_host.c (bus-parameterized: presets_send_a/_b dirs,
@@ -25,7 +25,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  5 files changed, 376 insertions(+), 4 deletions(-)
 
 diff --git a/src/host/shadow_chain_mgmt.c b/src/host/shadow_chain_mgmt.c
-index 250d4df6..98271225 100644
+index eb9018d2..abc32417 100644
 --- a/src/host/shadow_chain_mgmt.c
 +++ b/src/host/shadow_chain_mgmt.c
 @@ -63,6 +63,9 @@ master_fx_slot_t shadow_master_fx_slots[MASTER_FX_SLOTS];
@@ -54,7 +54,7 @@ index 250d4df6..98271225 100644
          int sfx_slot = -1;
          if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
          else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
-@@ -2831,6 +2843,24 @@ void shadow_inprocess_handle_param_request(void) {
+@@ -2832,6 +2844,24 @@ void shadow_inprocess_handle_param_request(void) {
              return;
          }
  
@@ -79,7 +79,7 @@ index 250d4df6..98271225 100644
          int sfx_slot = -1;
          if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
          else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
-@@ -2911,6 +2941,61 @@ void shadow_inprocess_handle_param_request(void) {
+@@ -2912,6 +2942,61 @@ void shadow_inprocess_handle_param_request(void) {
                          return;
                      }
                  }
@@ -492,10 +492,10 @@ index 03f8cb7e..11425917 100644
          return snprintf(buf, buf_len, "%d", inst->fx_count);
      }
 diff --git a/src/schwung_shim.c b/src/schwung_shim.c
-index 2f3df270..68e568c9 100644
+index a4e45214..0c025064 100644
 --- a/src/schwung_shim.c
 +++ b/src/schwung_shim.c
-@@ -2351,13 +2351,17 @@ skip_la_rebuild:
+@@ -2406,13 +2406,17 @@ skip_la_rebuild:
              sf->api->process_block(sf->instance, send_buf, FRAMES_PER_BLOCK);
          }
  

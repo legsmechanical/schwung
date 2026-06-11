@@ -1,0 +1,135 @@
+From 5f4ca5b72eeb6a1dd18f452d5504f7c6189cb1bc Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 15:25:01 -0400
+Subject: [PATCH] docs(corun): view-addressing mechanism (registry +
+ open/close/entries)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ docs/CORUN.md | 110 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 110 insertions(+)
+
+diff --git a/docs/CORUN.md b/docs/CORUN.md
+index 84dcdfc3..d8349383 100644
+--- a/docs/CORUN.md
++++ b/docs/CORUN.md
+@@ -88,6 +88,116 @@ Schwung should gate the user-facing entry on the API's presence:
+ const corunAvailable = typeof shadow_corun_begin === "function";
+ ```
+ 
++## View addressing — overlays over a co-run target
++
++The two co-run *targets* above are fixed destinations a session points at for
++its whole lifetime. **View addressing** is a layer on top: while a co-run is
++active, a tool can ask Schwung to show one of its *other* screens — the FX
++picker, Global Settings, the slots list — as a temporary **overlay**, then
++return to the underlying target. The overlay borrows the OLED + the nav inputs
++it needs and hands them back on close; the co-run target itself is never
++changed, so the consumer tool's state machine is undisturbed.
++
++The mechanism is **view-agnostic and upstreamable**; the *catalog* of
++addressable screens varies per build (see [Catalog](#catalog) below).
++
++### The three verbs
++
++Defined on the global object in shadow_ui's JS runtime (same place as
++`shadow_corun_begin` et al.), since shadow_ui and the overtake tool share one
++QuickJS context:
++
++```js
++shadow_corun_entries()
++  // Returns an array of string ids this Schwung build can open as overlays.
++  // Discovery call: a tool reads this to learn the catalog and capability-gate
++  // its entry points, so build divergence (fork adds a screen) is a non-issue.
++
++shadow_corun_open(id, keep_mask, args)
++  // Open the registered screen `id` as an overlay over the current co-run
++  // target. Flips the OLED owner to SCHWUNG_UI and applies `keep_mask` (the nav
++  // groups the overlay needs — typically jog/click/Back/Menu) WITHOUT changing
++  // the co-run target, then runs the screen's enter-function. Returns false for
++  // an unknown id (graceful no-op). `args` is passed to the enter-function.
++
++shadow_corun_close()
++  // Dismiss the overlay: restore the underlay's display owner (e.g. MOVE_FIRMWARE
++  // for a Move-native underlay) and keep_mask. Back at the overlay's top level
++  // calls this.
++```
++
++`open`/`close` are pure JS reusing the existing screen enter-functions; the only
++C is one SHM helper, `shadow_corun_overlay(active, keep_mask)`, because JS can't
++write `shadow_control`'s display-owner / keep_mask fields directly.
++`shadow_corun_open` calls that helper, then invokes the entry's `enter(args)`.
++
++### The registry — `CORUN_ENTRIES`
++
++A curated table in `shadow_ui.js` mapping a stable string id to an existing
++screen enter-function:
++
++```js
++// id -> { enter: fn(args), keepDefault: <mask>, overlay: bool }
++const CORUN_ENTRIES = {
++  slots:           { enter: () => { view = VIEWS.SLOTS; }, ... },
++  chain_editor:    { enter: (a) => enterChainEdit(a.slot), ... },
++  master_fx:       { enter: () => enterMasterFxSettings(), ... },
++  global_settings: { enter: () => enterGlobalSettings(), ... },
++  // fork-only (registered in a fork-guarded block):
++  fx_picker:       { enter: () => enterFxBusPicker(), overlay: true, ... },
++};
++```
++
++Entries are added one reviewed item at a time — the registry is **never**
++auto-derived from the `VIEWS` enum. Most `VIEWS` entries are context-dependent
++sub-views or wizard steps that require preloaded state and are not addressable
++destinations; launchers (`tools` / `overtake_menu` / `store`) are deliberately
++excluded. Each enter-function establishes its own prerequisite state.
++
++### Overlay model
++
++While an overlay is open:
++
++- OLED owner = `SCHWUNG_UI`; shadow_ui draws the view.
++- The declared `keep_mask` keeps the overlay's nav inputs at the tool process,
++  where shadow_ui's `onMidi` gets first crack and routes them into the view
++  (extends the chain-edit intercept with an overlay-aware branch).
++- `corun.target` is **untouched** → the consumer tool still sees its original
++  target via `shadow_corun_state()` and does not run its teardown.
++- Back at the overlay's top level applies `shadow_corun_close()` semantics
++  (restore the underlay). Back gating keeps the framework's exit-on-Back from
++  ending the whole co-run while an overlay is up.
++
++This is what lets the FX picker open over a `MOVE_NATIVE` session and return to
++the same synth screen, and it generalizes to "any registered view, over any
++co-run target."
++
++### Catalog
++
++The mechanism is upstreamable; the registered screens differ by build:
++
++| | Upstream Schwung | dAVEBOx fork |
++|---|---|---|
++| Mechanism (`entries`/`open`/`close`, overlay, registry table) | ✅ ships it | same code |
++| Registered screens | `slots`, `chain_editor`, `master_fx`, `global_settings` | same **+ `fx_picker`** |
++
++Because tools discover the catalog at runtime via `shadow_corun_entries()`, a
++build lacking a screen simply doesn't expose that affordance — no breakage
++across the gap.
++
++### Consumer contract
++
++A tool that uses an overlay is expected to:
++
++- Discover availability with `shadow_corun_entries()` and capability-gate its
++  entry point on the id it wants (e.g. `'fx_picker'`).
++- Pass a `keep_mask` that keeps the overlay's nav group (jog/click, Back, Menu)
++  at the tool while the overlay is open — the first dAVEBOx consumer keeps the
++  jog group for the whole time the FX picker is up.
++- Leave its co-run target alone: opening/closing an overlay does not change
++  `shadow_corun_state()`, so the tool keeps pads/steps/transport throughout, the
++  same as ordinary chain-edit co-run.
++
+ ## Move-firmware coupling
+ 
+ `CORUN_TARGET_MOVE_NATIVE` runs as a pure shim-level split: Move firmware
+-- 
+2.53.0
+

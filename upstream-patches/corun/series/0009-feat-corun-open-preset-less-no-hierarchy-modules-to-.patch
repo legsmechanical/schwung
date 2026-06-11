@@ -1,0 +1,131 @@
+From 78975ee48a61ac0006b9ad7a1406a9e6c11ad12e Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Thu, 4 Jun 2026 18:19:04 -0400
+Subject: [PATCH] feat(corun): open preset-less no-hierarchy modules to a param
+ menu
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In co-run, opening a chain-slot sound generator that has no ui_hierarchy
+fell through to the simple preset browser (loadModuleUi is refused in
+co-run to avoid starving the active tool). With no presets that browser
+is a dead end — "No presets", no way to view or edit params.
+
+Synthesize a minimal one-level hierarchy from the module's chain_params
+and enter the (co-run-dispatched) hierarchy editor instead, so the user
+gets the module's real adjustable params with jog-select / push-edit /
+knob mapping. Editing resolves real min/max/type/options from
+hierEditorChainParams via getParamMetadata(), so the injected level only
+needs each param's key. Gated to co-run + the no-preset case: modules
+with presets keep the working preset browser; non-co-run paths and
+modules with a real ui_hierarchy are untouched.
+
+Verified on device: airplay (chain_params=[gain]) now opens to an
+editable "gain" + swap menu in co-run instead of dead-ending.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 65 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 8ddef642..2c0323f1 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -3956,6 +3956,26 @@ function getComponentChainParams(slot, componentKey) {
+     }
+ }
+ 
++/* Synthesize a minimal one-level ui_hierarchy from a component's chain_params
++ * so a module lacking a real ui_hierarchy still gets the full hierarchy param
++ * editor. Used in co-run (loadModuleUi is refused there, so a preset-less
++ * module would otherwise dead-end on the bare "No presets" browser). The level
++ * only needs each param's `key` — getParamMetadata() merges the real
++ * min/max/type/options from hierEditorChainParams at edit time. Returns null
++ * when there are no usable params (caller then keeps the preset-browser path). */
++function buildSynthHierarchyFromChainParams(chainParams) {
++    if (!Array.isArray(chainParams) || chainParams.length === 0) return null;
++    const params = [];
++    const knobs = [];
++    for (const p of chainParams) {
++        if (!p || !p.key) continue;
++        params.push({ key: p.key, label: p.name || p.label || p.key });
++        if (knobs.length < NUM_KNOBS) knobs.push(p.key);
++    }
++    if (params.length === 0) return null;
++    return { levels: { root: { label: "Parameters", params: params, knobs: knobs } } };
++}
++
+ /* Fetch ui_hierarchy from a component */
+ function getComponentHierarchy(slot, componentKey) {
+     const key = componentKey === "synth" ? "synth:ui_hierarchy" :
+@@ -8502,6 +8522,29 @@ function enterComponentEditFallback(slotIndex, componentKey) {
+         return;
+     }
+ 
++    /* CO-RUN: loadModuleUi is refused (it would overwrite globalThis.tick and
++     * starve the running tool), so a module with no ui_hierarchy would dead-end
++     * on the bare preset browser — and with NO presets there is nothing to show
++     * or edit. Before that, give the module its real param menu by synthesizing
++     * a hierarchy from its chain_params and entering the (co-run-dispatched)
++     * hierarchy editor. Gated to the no-preset case so preset-having modules
++     * keep the working preset browser; non-co-run paths are untouched. */
++    if (coRunChainEditSlot >= 0) {
++        const cPrefix = componentKey === "midiFx" ? "midi_fx1" : componentKey;
++        const cCountStr = getSlotParam(slotIndex, `${cPrefix}:preset_count`);
++        const cPresetCount = cCountStr ? parseInt(cCountStr) : 0;
++        if (cPresetCount <= 0) {
++            const synthHier = buildSynthHierarchyFromChainParams(
++                getComponentChainParams(slotIndex, componentKey));
++            debugLog(`enterComponentEditFallback: co-run no-preset synth=${componentKey} ` +
++                     `params=${synthHier ? synthHier.levels.root.params.length : 0}`);
++            if (synthHier) {
++                enterHierarchyEditorWith(slotIndex, componentKey, synthHier);
++                return;
++            }
++        }
++    }
++
+     /* Fall back to simple preset browser */
+     const prefix = componentKey === "midiFx" ? "midi_fx1" : componentKey;
+ 
+@@ -8532,7 +8575,8 @@ function enterComponentEditFallback(slotIndex, componentKey) {
+  * Hierarchy Editor - Generic parameter editing for plugins
+  * ============================================================ */
+ 
+-/* Enter hierarchy-based parameter editor for a component */
++/* Enter hierarchy-based parameter editor for a component. Fetches the
++ * component's real ui_hierarchy; falls back to the preset browser if absent. */
+ function enterHierarchyEditor(slotIndex, componentKey) {
+     const hierarchy = getComponentHierarchy(slotIndex, componentKey);
+     if (!hierarchy) {
+@@ -8540,6 +8584,25 @@ function enterHierarchyEditor(slotIndex, componentKey) {
+         enterComponentEditFallback(slotIndex, componentKey);
+         return;
+     }
++    enterHierarchyEditorWith(slotIndex, componentKey, hierarchy);
++}
++
++/* Enter the hierarchy editor with an explicit hierarchy object. Lets callers
++ * inject a SYNTHESIZED hierarchy (see buildSynthHierarchyFromChainParams) for a
++ * component that lacks a real ui_hierarchy — used in co-run, where loadModuleUi
++ * is refused so a preset-less module would otherwise dead-end on "No presets".
++ * Editing resolves real min/max/type/options from hierEditorChainParams via
++ * getParamMetadata(), so the injected level only needs each param's `key`.
++ * NOTE for future edits: a synthesized hierarchy has no preset level, so
++ * changeHierPreset() early-returns and the loading-transition re-fetch is
++ * guarded by `if (newHier)` — don't "fix" those guards to re-pull the
++ * hierarchy unconditionally or it would clobber the synthesized one with null. */
++function enterHierarchyEditorWith(slotIndex, componentKey, hierarchy) {
++    if (!hierarchy) {
++        /* No hierarchy - fall back to simple preset browser */
++        enterComponentEditFallback(slotIndex, componentKey);
++        return;
++    }
+ 
+     /* Dismiss any active overlay and clear pending knob state */
+     hideOverlay();
+-- 
+2.53.0
+

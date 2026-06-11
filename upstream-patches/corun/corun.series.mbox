@@ -1,0 +1,3340 @@
+From 678faae6bbd43cd391f1ac095f4b4343f36c1607 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Fri, 22 May 2026 12:22:38 -0400
+Subject: [PATCH] =?UTF-8?q?feat(overtake):=20co-run=20=E2=80=94=20let=20an?=
+ =?UTF-8?q?=20overtake=20tool=20share=20the=20surface=20with=20a=20second?=
+ =?UTF-8?q?=20UI?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds co-run: an overtake tool can keep ticking and keep a chosen subset
+of controls while a second UI (Schwung's chain editor, or Move's native
+device/preset pages) uses the rest of the surface. The split is declared
+by the tool as a manifest of named control groups (corun_keep_mask +
+shared corun_group_for_event map), not hard-coded per tool.
+
+- shadow_constants.h: corun_keep_mask + CORUN_GRP_* groups + shared
+  event->group map + CORUN_KEEP_DEFAULT.
+- schwung_shim.c: Move-native target — cable-0 MIDI filter + forward
+  mirror derive cede/keep from the manifest; shadow_swap_display bypass.
+- shadow_ui.c: shadow_corun_begin/end + shadow_get_corun_keep_mask;
+  chain-edit + move-native target gates.
+- shadow_ui.js: chain-edit target (editor renders over the tool frame,
+  receives ceded input); per-control cede guards.
+
+Proven in production by dAVEBOx (8-track sequencer) running both targets.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ src/host/shadow_constants.h |  59 +++++-
+ src/host/shadow_led_queue.c |  29 +++
+ src/schwung_shim.c          |  55 ++++++
+ src/shadow/shadow_ui.c      | 114 +++++++++++
+ src/shadow/shadow_ui.js     | 363 ++++++++++++++++++++++++++++++++++--
+ 5 files changed, 607 insertions(+), 13 deletions(-)
+
+diff --git a/src/host/shadow_constants.h b/src/host/shadow_constants.h
+index 88f89f06..bf00ac8c 100644
+--- a/src/host/shadow_constants.h
++++ b/src/host/shadow_constants.h
+@@ -156,9 +156,66 @@ typedef struct shadow_control_t {
+     volatile uint16_t skipback_seconds; /* Skipback rolling buffer length: 30/60/120/180/240/300 */
+     volatile uint8_t resume_last_tool;  /* 1=JUMP_TO_TOOLS should resume the most-recently-suspended tool instead of opening the menu */
+     volatile uint8_t midi_indicator_enabled; /* 1=draw "ccN" MIDI channel indicator while a note is held */
+-    volatile uint8_t reserved[5];
++    volatile int8_t corun_chain_edit_slot; /* -1=off, 0-3=chain-edit co-runs with the active tool, owning OLED + jog + track buttons */
++    volatile int8_t corun_move_native_track; /* -1=off, 0-7=Move firmware co-runs (OLED + jog + track buttons + knobs) for the active tool's track */
++    volatile uint16_t corun_keep_mask;   /* co-run input manifest: bitfield of CORUN_GRP_* the tool KEEPS; the rest cede to the co-run UI. 0 = use CORUN_KEEP_DEFAULT (back-compat for callers that set only the target gate). */
++    volatile uint8_t reserved[1];
+ } shadow_control_t;
+ 
++/* Co-run control-surface groups. A co-running overtake tool declares which
++ * groups it KEEPS (corun_keep_mask); every other group's input cedes to the
++ * co-run UI (Schwung's chain editor, or Move firmware). One canonical
++ * event->group map (corun_group_for_event) is shared by every routing site so
++ * the let-through and suppress-from-tool decisions can never drift apart. */
++#define CORUN_GRP_OLED          (1u << 0)
++#define CORUN_GRP_PADS          (1u << 1)
++#define CORUN_GRP_STEPS         (1u << 2)
++#define CORUN_GRP_TRANSPORT     (1u << 3)
++#define CORUN_GRP_JOG           (1u << 4)  /* jog turn (CC 14) + jog click (CC 3) */
++#define CORUN_GRP_TRACK_BUTTONS (1u << 5)  /* CC 40-43 */
++#define CORUN_GRP_KNOBS         (1u << 6)  /* CC 71-78 */
++#define CORUN_GRP_MASTER        (1u << 7)  /* CC 79 */
++#define CORUN_GRP_SHIFT         (1u << 8)  /* CC 49 */
++#define CORUN_GRP_BACK          (1u << 9)  /* CC 51 */
++#define CORUN_GRP_MENU          (1u << 10) /* CC 50 — framework exit gesture */
++#define CORUN_GRP_TOUCH         (1u << 11) /* capacitive-touch notes 0-9 */
++
++/* Default keep-set: reproduces the original dAVEBOx co-run split (tool keeps
++ * pads, step buttons, transport, and Menu; cedes the nav surface + screen).
++ * Used whenever corun_keep_mask == 0. */
++#define CORUN_KEEP_DEFAULT (CORUN_GRP_PADS | CORUN_GRP_STEPS | CORUN_GRP_TRANSPORT | CORUN_GRP_MENU)
++
++/* Map a raw cable-0 MIDI event to its control-surface group, or 0 if it isn't a
++ * routable surface control (those always stay with the tool). type is the
++ * status nibble (0xB0 CC, 0x90/0x80 note); d1 the data byte. Steps/transport
++ * are intentionally unclassified for now (always kept) — they have no settled
++ * CC map and no co-run consumer cedes them. */
++static inline uint16_t corun_group_for_event(uint8_t type, uint8_t d1) {
++    if (type == 0xB0) {
++        switch (d1) {
++            case 3:  case 14: return CORUN_GRP_JOG;
++            case 40: case 41: case 42: case 43: return CORUN_GRP_TRACK_BUTTONS;
++            case 49: return CORUN_GRP_SHIFT;
++            case 50: return CORUN_GRP_MENU;
++            case 51: return CORUN_GRP_BACK;
++            case 79: return CORUN_GRP_MASTER;
++            default: if (d1 >= 71 && d1 <= 78) return CORUN_GRP_KNOBS;
++                     return 0;
++        }
++    }
++    if (type == 0x90 || type == 0x80) {
++        if (d1 <= 9) return CORUN_GRP_TOUCH;
++        if (d1 >= 68 && d1 <= 99) return CORUN_GRP_PADS;
++    }
++    return 0;
++}
++
++/* Effective keep-mask: callers that set only the target gate leave keep_mask 0,
++ * which means "use the default split". */
++static inline uint16_t corun_keep_mask_eff(uint16_t keep_mask) {
++    return keep_mask ? keep_mask : CORUN_KEEP_DEFAULT;
++}
++
+ /*
+  * UI state structure for slot information.
+  * Must fit within SHADOW_UI_BUFFER_SIZE bytes.
+diff --git a/src/host/shadow_led_queue.c b/src/host/shadow_led_queue.c
+index 5a27b46f..783a57a1 100644
+--- a/src/host/shadow_led_queue.c
++++ b/src/host/shadow_led_queue.c
+@@ -370,6 +370,35 @@ void shadow_clear_move_leds_if_overtake(void) {
+      * If skip_led_clear is set, let Move's LEDs pass through (e.g. song-mode
+      * wants Move's pad colors to update as clips play). */
+     if (!cur_overtake) return;
++
++    /* Move-native co-run (dAVEBOx Edit Synth...): the tool sets skip_led_clear=1
++     * so Move's CC + sysex LED writes pass through (track buttons, knob rings,
++     * master). But Move also re-asserts the pad grid (note-on/off) and other
++     * native button/transport CCs, which would clobber the surfaces the tool
++     * keeps. Strip pads + track buttons + steps/transport CCs; leave sysex
++     * untouched (knob-ring + master colors are sysex idx 71-79). Keep only the
++     * master CC latch (79). Track buttons (40-43) are tool-owned in co-run — the
++     * tool blinks them itself — so strip Move's track-button CC writes too; we no
++     * longer surface Move's native track colors (they were unreliable to cache/
++     * land). Runs BEFORE the skip_led_clear early-return so it takes priority. */
++    if (ctrl && ctrl->corun_move_native_track >= 0) {
++        for (int i = 0; i < HW_MIDI_OUT_SIZE; i += 4) {
++            uint8_t cable = (midi_out[i] >> 4) & 0x0F;
++            if (cable != 0) continue;
++            uint8_t type = midi_out[i+1] & 0xF0;
++            if (type == 0x90 || type == 0x80) {
++                /* Move's pad LEDs (on via note-on, off via note-off) — tool keeps pads. */
++                midi_out[i] = 0; midi_out[i+1] = 0; midi_out[i+2] = 0; midi_out[i+3] = 0;
++            } else if (type == 0xB0) {
++                uint8_t d1 = midi_out[i+2];
++                if (d1 == 79) continue;  /* keep master; everything else tool-owned */
++                /* Strip track buttons (40-43) + steps/transport/other native CCs. */
++                midi_out[i] = 0; midi_out[i+1] = 0; midi_out[i+2] = 0; midi_out[i+3] = 0;
++            }
++        }
++        return;
++    }
++
+     if (ctrl && ctrl->skip_led_clear) return;
+ 
+     /* Per-module passthrough list: CCs the module yielded to Move
+diff --git a/src/schwung_shim.c b/src/schwung_shim.c
+index 67f30b34..e2f7f572 100644
+--- a/src/schwung_shim.c
++++ b/src/schwung_shim.c
+@@ -3044,6 +3044,9 @@ static void init_shadow_shm(void)
+             shadow_control->suspend_overtake = 0;
+             shadow_control->selected_slot    = 0;
+             shadow_control->skip_led_clear   = 0;
++            shadow_control->corun_chain_edit_slot = -1;  /* chain-edit co-run inactive at boot */
++            shadow_control->corun_move_native_track = -1;  /* Move-native co-run inactive at boot */
++            shadow_control->corun_keep_mask = 0;  /* 0 = default split when a co-run target is set without a manifest */
+             /* Initialize TTS defaults */
+             shadow_control->tts_enabled = 0;    /* Screen Reader off by default */
+             shadow_control->tts_volume = 70;    /* 70% volume */
+@@ -3518,6 +3521,15 @@ static void shadow_swap_display(void)
+         display_phase = 0;
+         return;
+     }
++    /* Move-native co-run: yield OLED to Move firmware (preset browser /
++     * device-edit pages) while keeping shadow_display_mode = 1 so the MIDI
++     * filter at the sh_midi sync site stays active. Without this bypass we'd
++     * have to drop display_mode = 0 to expose Move's framebuffer, which would
++     * also disable the filter and let pads/transport leak through to Move. */
++    if (shadow_control->corun_move_native_track >= 0) {
++        display_phase = 0;
++        return;
++    }
+     if (!shadow_volume_knob_touched) {
+         shadow_block_plain_volume_hide_until_release = 0;
+     }
+@@ -6060,6 +6072,33 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+                     if (cin == 0x0B && type == 0xB0 && d1 < 128 && overtake_passthrough_ccs[d1]) {
+                         filter = 0;
+                     }
++                    /* Move-native co-run: while corun_move_native_track >= 0,
++                     * let Move firmware see the navigation surface it needs to
++                     * drive its preset browser / device-edit pages, while the
++                     * tool keeps the rest. Cable-0 only (handled by the outer
++                     * `if (cable == 0x00)`). Touch notes 0-9 (jog + knob cap)
++                     * also flow through so Move can detect engagement.
++                     *  - CC 3   = jog click
++                     *  - CC 14  = jog turn
++                     *  - CC 40-43 = track buttons
++                     *  - CC 49  = Shift
++                     *  - CC 51  = Back
++                     *  - CC 71-78 = device-edit knobs (8 knobs)
++                     *  - CC 79  = master knob (already in passthrough for dAVEBOx,
++                     *             listed here for clarity in case a tool doesn't
++                     *             include it in button_passthrough). */
++                    if (shadow_control->corun_move_native_track >= 0) {
++                        /* Cede this event to Move firmware iff its control-surface
++                         * group is NOT in the tool's keep-mask. corun_group_for_event
++                         * + corun_keep_mask_eff (shadow_constants.h) are the single
++                         * shared source for this decision, mirrored at the
++                         * shadow_ui_midi_shm forward-filter below. keep_mask == 0
++                         * falls back to the default split. */
++                        uint16_t grp = corun_group_for_event(type, d1);
++                        if (grp && !(corun_keep_mask_eff(shadow_control->corun_keep_mask) & grp)) {
++                            filter = 0;
++                        }
++                    }
+                 } else if (overtake_mode == 1) {
+                     filter = 1;
+                     if (cin == 0x0B && type == 0xB0 && d1 == CC_MASTER_KNOB) {
+@@ -7081,6 +7120,22 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+                     if (!is_ui_event) continue;  /* Skip non-UI events in menu mode */
+                 }
+ 
++                /* Move-native co-run: suppress from the tool the same nav CCs
++                 * + touch notes that we let through to Move firmware above
++                 * (sh_midi filter). Cable-0 only — cable-2 external MIDI is
++                 * unaffected. Mirror of the let-through list at the sh_midi
++                 * filter site; keep them in sync. */
++                if (overtake_mode == 2 && cable == 0x00 &&
++                    shadow_control->corun_move_native_track >= 0) {
++                    /* Mirror of the sh_midi let-through above: suppress from the
++                     * tool exactly the groups it cedes to Move firmware. Shared
++                     * event->group map keeps the two sites in lockstep. */
++                    uint16_t grp = corun_group_for_event(type, d1);
++                    if (grp && !(corun_keep_mask_eff(shadow_control->corun_keep_mask) & grp)) {
++                        continue;
++                    }
++                }
++
+                 /* BLOCK channels: hardware_mmap_addr is NOT modified (writing
+                  * MIDI_IN hardware crashes Move), so src here has the original
+                  * velocity.  Forward the note-on normally so SEQ8 can route it.
+diff --git a/src/shadow/shadow_ui.c b/src/shadow/shadow_ui.c
+index 3ded9629..9d8c809b 100644
+--- a/src/shadow/shadow_ui.c
++++ b/src/shadow/shadow_ui.c
+@@ -347,6 +347,113 @@ static JSValue js_shadow_overtake_send_external_async_active(JSContext *ctx, JSV
+     return JS_NewInt32(ctx, 1);
+ }
+ 
++/* shadow_set_corun_chain_edit(slot) -> void
++ * Enables co-run mode: the chain editor for `slot` (0-3) renders to the OLED
++ * and consumes jog/jog-click/track-button input while the active tool module
++ * keeps everything else (pads, step buttons, knobs, transport). Pass -1 to
++ * disable. Also updates ui_slot for downstream consumers.
++ */
++static JSValue js_shadow_set_corun_chain_edit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++    (void)this_val;
++    if (!shadow_control || argc < 1) return JS_UNDEFINED;
++    int slot = -1;
++    if (JS_ToInt32(ctx, &slot, argv[0])) return JS_UNDEFINED;
++    if (slot < -1 || slot >= SHADOW_UI_SLOTS) return JS_UNDEFINED;
++    shadow_control->corun_chain_edit_slot = (int8_t)slot;
++    if (slot >= 0) shadow_control->ui_slot = (uint8_t)slot;
++    shadow_control->corun_keep_mask = 0;  /* legacy setter = default split (clears any prior manifest) */
++    return JS_UNDEFINED;
++}
++
++/* shadow_get_corun_chain_edit() -> int (-1=off, 0-3=co-run slot) */
++static JSValue js_shadow_get_corun_chain_edit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++    (void)this_val; (void)argc; (void)argv;
++    if (!shadow_control) return JS_NewInt32(ctx, -1);
++    return JS_NewInt32(ctx, (int)(int8_t)shadow_control->corun_chain_edit_slot);
++}
++
++/* shadow_set_corun_move_native(track) -> void
++ * Enables Move-native co-run: Move firmware renders to the OLED and consumes
++ * jog/jog-click/track-button/Shift/Back/knob/master-knob input + capacitive
++ * touch notes 0-9, while the active tool module keeps pads/step buttons/
++ * transport/Menu. Pass -1 to disable. Unlike chain-edit co-run, this is a
++ * pure shim-level split: Move firmware reads the shadow_mailbox MIDI_IN
++ * buffer directly (separate process), so there's no JS-side intercept and
++ * no host-API swap to manage.
++ */
++static JSValue js_shadow_set_corun_move_native(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++    (void)this_val;
++    if (!shadow_control || argc < 1) return JS_UNDEFINED;
++    int track = -1;
++    if (JS_ToInt32(ctx, &track, argv[0])) return JS_UNDEFINED;
++    /* Caller's track space (e.g. dAVEBOx 0-7), not Schwung chain slots; the
++     * shim only uses this value as a gate (>= 0 = co-run active). Bounded by
++     * int8_t storage; clamp by hand to a reasonable upper limit so a typo
++     * doesn't enable co-run on track 99. */
++    if (track < -1 || track > 7) return JS_UNDEFINED;
++    shadow_control->corun_move_native_track = (int8_t)track;
++    shadow_control->corun_keep_mask = 0;  /* legacy setter = default split (clears any prior manifest) */
++    return JS_UNDEFINED;
++}
++
++/* shadow_get_corun_move_native() -> int (-1=off, 0-3=co-run track) */
++static JSValue js_shadow_get_corun_move_native(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++    (void)this_val; (void)argc; (void)argv;
++    if (!shadow_control) return JS_NewInt32(ctx, -1);
++    return JS_NewInt32(ctx, (int)(int8_t)shadow_control->corun_move_native_track);
++}
++
++/* shadow_corun_begin(target, id, keep_mask) -> void
++ * Generalized co-run entry for any overtake tool.
++ *   target   : 0 = chain_edit (id = chain slot 0-3),
++ *              1 = move_native (id = tool track 0-7).
++ *   id       : the target's identity (chain slot or tool track).
++ *   keep_mask: bitfield of CORUN_GRP_* the tool KEEPS; the rest cede to the
++ *              co-run UI. Omit or 0 = CORUN_KEEP_DEFAULT (original split).
++ * Atomicity: keep_mask is written before the target gate so the shim never sees
++ * an active gate paired with a stale mask. (A mid-update read of gate>=0 with
++ * mask still 0 just yields the default split — safe either way.) */
++static JSValue js_shadow_corun_begin(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++    (void)this_val;
++    if (!shadow_control || argc < 2) return JS_UNDEFINED;
++    int target = -1, id = -1, keep = 0;
++    if (JS_ToInt32(ctx, &target, argv[0])) return JS_UNDEFINED;
++    if (JS_ToInt32(ctx, &id, argv[1])) return JS_UNDEFINED;
++    if (argc >= 3 && JS_ToInt32(ctx, &keep, argv[2])) return JS_UNDEFINED;
++    if (keep < 0 || keep > 0xFFFF) return JS_UNDEFINED;
++    shadow_control->corun_keep_mask = (uint16_t)keep;
++    if (target == 0) {            /* chain_edit */
++        if (id < 0 || id >= SHADOW_UI_SLOTS) return JS_UNDEFINED;
++        shadow_control->corun_chain_edit_slot = (int8_t)id;
++        shadow_control->ui_slot = (uint8_t)id;
++    } else if (target == 1) {     /* move_native */
++        if (id < 0 || id > 7) return JS_UNDEFINED;
++        shadow_control->corun_move_native_track = (int8_t)id;
++    } else {
++        return JS_UNDEFINED;
++    }
++    return JS_UNDEFINED;
++}
++
++/* shadow_corun_end() -> void
++ * Exit co-run for both targets; restore full overtake ownership to the tool.
++ * Gates are cleared before the mask so the shim sees co-run off first. */
++static JSValue js_shadow_corun_end(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++    (void)this_val; (void)argc; (void)argv;
++    if (!shadow_control) return JS_UNDEFINED;
++    shadow_control->corun_chain_edit_slot = -1;
++    shadow_control->corun_move_native_track = -1;
++    shadow_control->corun_keep_mask = 0;
++    return JS_UNDEFINED;
++}
++
++/* shadow_get_corun_keep_mask() -> int (current keep-mask; 0 = default split) */
++static JSValue js_shadow_get_corun_keep_mask(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++    (void)this_val; (void)argc; (void)argv;
++    if (!shadow_control) return JS_NewInt32(ctx, 0);
++    return JS_NewInt32(ctx, (int)shadow_control->corun_keep_mask);
++}
++
+ /* shadow_get_selected_slot() -> int
+  * Returns the track-selected slot (0-3) for playback/knobs.
+  */
+@@ -3174,6 +3281,13 @@ static void init_javascript(JSRuntime **prt, JSContext **pctx) {
+     JS_SetPropertyStr(ctx, global_obj, "shadow_clear_ui_flags", JS_NewCFunction(ctx, js_shadow_clear_ui_flags, "shadow_clear_ui_flags", 1));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_inbound_pad_midi_active", JS_NewCFunction(ctx, js_shadow_inbound_pad_midi_active, "shadow_inbound_pad_midi_active", 0));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_overtake_send_external_async_active", JS_NewCFunction(ctx, js_shadow_overtake_send_external_async_active, "shadow_overtake_send_external_async_active", 0));
++    JS_SetPropertyStr(ctx, global_obj, "shadow_set_corun_chain_edit", JS_NewCFunction(ctx, js_shadow_set_corun_chain_edit, "shadow_set_corun_chain_edit", 1));
++    JS_SetPropertyStr(ctx, global_obj, "shadow_get_corun_chain_edit", JS_NewCFunction(ctx, js_shadow_get_corun_chain_edit, "shadow_get_corun_chain_edit", 0));
++    JS_SetPropertyStr(ctx, global_obj, "shadow_set_corun_move_native", JS_NewCFunction(ctx, js_shadow_set_corun_move_native, "shadow_set_corun_move_native", 1));
++    JS_SetPropertyStr(ctx, global_obj, "shadow_get_corun_move_native", JS_NewCFunction(ctx, js_shadow_get_corun_move_native, "shadow_get_corun_move_native", 0));
++    JS_SetPropertyStr(ctx, global_obj, "shadow_corun_begin", JS_NewCFunction(ctx, js_shadow_corun_begin, "shadow_corun_begin", 3));
++    JS_SetPropertyStr(ctx, global_obj, "shadow_corun_end", JS_NewCFunction(ctx, js_shadow_corun_end, "shadow_corun_end", 0));
++    JS_SetPropertyStr(ctx, global_obj, "shadow_get_corun_keep_mask", JS_NewCFunction(ctx, js_shadow_get_corun_keep_mask, "shadow_get_corun_keep_mask", 0));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_get_open_tool_cmd",
+         JS_NewCFunction(ctx, js_shadow_get_open_tool_cmd, "shadow_get_open_tool_cmd", 0));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_get_selected_slot", JS_NewCFunction(ctx, js_shadow_get_selected_slot, "shadow_get_selected_slot", 0));
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 35023ddb..08d14166 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -220,6 +220,45 @@ const NUM_KNOBS = 8;
+ let overtakeKnobDelta = [0, 0, 0, 0, 0, 0, 0, 0];  // Accumulated delta per knob (CC 71-78)
+ let overtakeJogDelta = 0;                             // Accumulated delta for jog wheel (CC 14)
+ 
++/* Co-run mode: chain editor runs alongside an active tool module. Tool keeps
++ * pads/steps/knobs/transport; jog + jog-click + track buttons + OLED route to
++ * the chain editor. coRunView tracks the chain editor's own navigation state
++ * so deeper views (patch browser, component edit, etc.) work without touching
++ * the outer `view`, which stays at VIEWS.OVERTAKE_MODULE so the tool ticks. */
++let coRunChainEditSlot = -1;
++let coRunView = -1;  // initialized to VIEWS.CHAIN_EDIT on first co-run entry
++
++/* Co-run control-surface groups — JS mirror of the canonical map in
++ * shadow_constants.h (corun_group_for_event). The tool declares which groups it
++ * KEEPS via shadow_corun_begin; the chain-edit intercept below routes a control
++ * to the editor only when its group CEDES (not kept). The shim owns the same
++ * decision for move_native; this mirror is just for the in-process chain editor. */
++const CORUN_GRP_OLED = 1 << 0, CORUN_GRP_PADS = 1 << 1, CORUN_GRP_STEPS = 1 << 2,
++      CORUN_GRP_TRANSPORT = 1 << 3, CORUN_GRP_JOG = 1 << 4, CORUN_GRP_TRACK_BUTTONS = 1 << 5,
++      CORUN_GRP_KNOBS = 1 << 6, CORUN_GRP_MASTER = 1 << 7, CORUN_GRP_SHIFT = 1 << 8,
++      CORUN_GRP_BACK = 1 << 9, CORUN_GRP_MENU = 1 << 10, CORUN_GRP_TOUCH = 1 << 11;
++const CORUN_KEEP_DEFAULT = CORUN_GRP_PADS | CORUN_GRP_STEPS | CORUN_GRP_TRANSPORT | CORUN_GRP_MENU;
++let coRunKeepMask = 0;  // polled from shadow_control; 0 = default split
++/* True when the tool CEDES this group to the co-run UI (so the editor handles it). */
++function coRunCedes(grp) {
++    const m = coRunKeepMask ? coRunKeepMask : CORUN_KEEP_DEFAULT;
++    return grp !== 0 && (m & grp) === 0;
++}
++
++/* Param-shim originals. When a chain module's UI is "loaded" (or when
++ * enterHierarchyEditor / setupModuleParamShims fires), the shadow_ui
++ * shims host_module_get_param / host_module_set_param so chain-editor
++ * queries route to the slot's DSP. That's correct for native chain
++ * editing — but during co-run, the active tool module ALSO calls those
++ * globals expecting to talk to ITS OWN DSP. Without a swap, the tool
++ * silently misroutes every IPC at the chain slot, which manifests as
++ * pads not emitting MIDI, transport not working, and audio glitches.
++ * setupModuleParamShims now caches the originals and we restore them
++ * around every tool callback (tick + onMidiMessageInternal). */
++let originalHostGetParam = null;
++let originalHostSetParam = null;
++let paramShimsInstalled = false;
++
+ const CONFIG_PATH = "/data/UserData/schwung/shadow_chain_config.json";
+ const PATCH_DIR = "/data/UserData/schwung/patches";
+ const SLOT_STATE_DIR_DEFAULT = "/data/UserData/schwung/slot_state";
+@@ -2463,6 +2502,13 @@ function getComponentParamPrefix(componentKey) {
+ /* Set up shims for host_module_get_param and host_module_set_param
+  * These route to the correct slot and component in shadow mode */
+ function setupModuleParamShims(slot, componentKey) {
++    /* Cache the real host APIs on first install so co-run can swap them
++     * back around active-tool callbacks. */
++    if (!paramShimsInstalled) {
++        originalHostGetParam = globalThis.host_module_get_param;
++        originalHostSetParam = globalThis.host_module_set_param;
++        paramShimsInstalled = true;
++    }
+     const prefix = getComponentParamPrefix(componentKey);
+ 
+     globalThis.host_module_get_param = function(key) {
+@@ -2500,16 +2546,54 @@ function setupModuleParamShims(slot, componentKey) {
+ 
+ /* Clear the param shims */
+ function clearModuleParamShims() {
+-    delete globalThis.host_module_get_param;
+-    delete globalThis.host_module_set_param;
++    /* Restore the real host APIs we cached on first shim install. */
++    if (paramShimsInstalled) {
++        if (originalHostGetParam) globalThis.host_module_get_param = originalHostGetParam;
++        else delete globalThis.host_module_get_param;
++        if (originalHostSetParam) globalThis.host_module_set_param = originalHostSetParam;
++        else delete globalThis.host_module_set_param;
++        paramShimsInstalled = false;
++    } else {
++        delete globalThis.host_module_get_param;
++        delete globalThis.host_module_set_param;
++    }
+     delete globalThis.host_module_set_param_blocking;
+     delete globalThis.host_exit_module;
+     delete globalThis.host_swap_module;
+     delete globalThis.host_open_file_in_tool;
+ }
+ 
++/* Run a tool callback (tick / onMidiMessageInternal) with the real host
++ * APIs restored. While chain-editor shims are installed, every direct
++ * reference to globalThis.host_module_get_param / _set_param goes to
++ * the chain slot DSP — wrong for the active tool. This swap-and-restore
++ * keeps the tool talking to its own DSP. */
++function runToolCallback(fn) {
++    if (!paramShimsInstalled) {
++        return fn();
++    }
++    const shimGet = globalThis.host_module_get_param;
++    const shimSet = globalThis.host_module_set_param;
++    if (originalHostGetParam) globalThis.host_module_get_param = originalHostGetParam;
++    if (originalHostSetParam) globalThis.host_module_set_param = originalHostSetParam;
++    try {
++        return fn();
++    } finally {
++        globalThis.host_module_get_param = shimGet;
++        globalThis.host_module_set_param = shimSet;
++    }
++}
++
+ /* Load a module's UI for editing */
+ function loadModuleUi(slot, componentKey, moduleId) {
++    /* CO-RUN refuse: loading a chain module's UI overwrites globalThis.tick
++     * (and onMidiMessageInternal), which silences the active tool. The caller
++     * (enterComponentEditFallback) falls back to the simple preset browser
++     * when this returns false — that path doesn't touch globals. */
++    if (coRunChainEditSlot >= 0) {
++        moduleUiLoadError = true;
++        return false;
++    }
+     const uiPath = getModuleUiPath(moduleId);
+     if (!uiPath) {
+         moduleUiLoadError = true;
+@@ -14723,6 +14807,69 @@ globalThis.shadow_save_state_now = function() {
+     return true;
+ };
+ 
++/* Co-run helpers — see coRunChainEditSlot / coRunView declarations near top.
++ *
++ * runCoRunChainEdit(fn): temporarily set the outer `view` to coRunView so any
++ * code that dispatches on view (handleJog/handleSelect/draws) lands in the
++ * chain-editor branch. Captures view-change side-effects back into coRunView
++ * so navigation into deeper views (patch browser, component edit, etc.)
++ * sticks across frames. Always restores the outer view to its prior value so
++ * the main tick's view-switch still routes to VIEWS.OVERTAKE_MODULE. */
++function runCoRunChainEdit(fn) {
++    const _saved = view;
++    view = coRunView;
++    try { fn(); } finally {
++        coRunView = view;
++        view = _saved;
++    }
++}
++
++/* dispatchCoRunDraw(): mirror of the chain-edit subtree of the main draw
++ * switch (~line 14874). Called from co-run with view already set to coRunView
++ * by runCoRunChainEdit. The chain editor's navigation lands on many views
++ * (PATCHES, COMPONENT_PARAMS, COMPONENT_SELECT, etc.), each with its own
++ * draw function. drawSlots() only renders the top-level slot LIST — we must
++ * dispatch every reachable view explicitly. */
++function dispatchCoRunDraw() {
++    switch (view) {
++        case VIEWS.CHAIN_EDIT:           drawChainEdit(); break;
++        case VIEWS.PATCHES:              drawPatches(); break;
++        case VIEWS.PATCH_DETAIL:         drawPatchDetail(); break;
++        case VIEWS.COMPONENT_PARAMS:     drawComponentParams(); break;
++        case VIEWS.COMPONENT_SELECT:     drawComponentSelect(); break;
++        case VIEWS.CHAIN_SETTINGS:       drawChainSettings(); break;
++        case VIEWS.SLOT_SETTINGS:        drawSlotSettings(); break;
++        case VIEWS.COMPONENT_EDIT:
++            /* In co-run, never invoke loadedModuleUi.tick(): the chain module's
++             * own UI module takes over shadow_ui's drawing/MIDI/IPC and starves
++             * the active tool. drawComponentEdit() is the simple preset-browser
++             * fallback that lets the user pick patches without the deep
++             * module-specific editor — still useful, and keeps dAVEBOx alive. */
++            drawComponentEdit();
++            break;
++        case VIEWS.HIERARCHY_EDITOR:     drawHierarchyEditor(); break;
++        case VIEWS.KNOB_EDITOR:          drawKnobEditor(); break;
++        case VIEWS.KNOB_PARAM_PICKER:    drawKnobParamPicker(); break;
++        case VIEWS.DYNAMIC_PARAM_PICKER: drawDynamicParamPicker(); break;
++        case VIEWS.LFO_EDIT:             drawLfoEdit(); break;
++        case VIEWS.LFO_TARGET_COMPONENT: drawLfoTargetComponent(); break;
++        case VIEWS.LFO_TARGET_PARAM:     drawLfoTargetParam(); break;
++        case VIEWS.STORE_PICKER_CATEGORIES: drawStorePickerCategories(); break;
++        case VIEWS.STORE_PICKER_LIST:    drawStorePickerList(); break;
++        case VIEWS.STORE_PICKER_DETAIL:  drawStorePickerDetail(); break;
++        case VIEWS.STORE_PICKER_LOADING: drawStorePickerLoading(); break;
++        case VIEWS.STORE_PICKER_RESULT:  drawStorePickerResult(); break;
++        case VIEWS.STORE_PICKER_POST_INSTALL:
++            drawMessageOverlay('Install Complete', storePostInstallLines);
++            break;
++        case VIEWS.FILEPATH_BROWSER:     drawFilepathBrowser(); break;
++        default:
++            /* Unknown view in co-run — render slot list as a recoverable
++             * fallback so user can navigate back. */
++            drawSlots();
++    }
++}
++
+ globalThis.tick = function() {
+     /* Background tick for JS-suspended overtake modules.
+      * Each parked module's tick() keeps firing so it can emit MIDI or advance
+@@ -15360,8 +15507,15 @@ globalThis.tick = function() {
+     /* Throttled knob overlay refresh - once per frame instead of per CC */
+     refreshPendingKnobOverlay();
+ 
+-    /* Throttled hierarchy knob adjustment - once per frame */
+-    processPendingHierKnob();
++    /* Throttled hierarchy knob adjustment - once per frame. During co-run the
++     * outer view is OVERTAKE_MODULE; wrap so getKnobContext (cache keyed on
++     * view) resolves against the chain editor's view and the accumulated knob
++     * delta isn't silently dropped under the wrong context. */
++    if (coRunChainEditSlot >= 0) {
++        runCoRunChainEdit(processPendingHierKnob);
++    } else {
++        processPendingHierKnob();
++    }
+ 
+     if (view === VIEWS.CANVAS) {
+         tickCanvasPreview();
+@@ -15449,6 +15603,30 @@ globalThis.tick = function() {
+     /* Flush deferred wav player file_path after DSP load */
+     wavPlayerTick();
+ 
++    /* CO-RUN: sync chain-edit slot from SHM. Active tool module sets this via
++     * shadow_set_corun_chain_edit() to share OLED + jog + track buttons with
++     * the chain editor while keeping pads/steps/knobs/transport for itself. */
++    if (typeof shadow_get_corun_keep_mask === "function") {
++        coRunKeepMask = shadow_get_corun_keep_mask() | 0;
++    }
++    if (typeof shadow_get_corun_chain_edit === "function") {
++        const _new = shadow_get_corun_chain_edit();
++        if (_new !== coRunChainEditSlot) {
++            coRunChainEditSlot = _new;
++            if (_new >= 0) {
++                /* Entering co-run: prime the chain editor's state for slot N.
++                 * Mirrors enterChainEdit() but does NOT touch the outer view
++                 * (must stay VIEWS.OVERTAKE_MODULE so the tool keeps ticking). */
++                selectedSlot = _new;
++                if (typeof updateFocusedSlot === "function") updateFocusedSlot(_new);
++                selectedChainComponent = lastChainComponent[_new] || 0;
++                if (typeof loadChainConfigFromSlot === "function") loadChainConfigFromSlot(_new);
++                coRunView = VIEWS.CHAIN_EDIT;
++                needsRedraw = true;
++            }
++        }
++    }
++
+     switch (view) {
+         case VIEWS.SLOTS:
+             drawSlots();
+@@ -15628,7 +15806,9 @@ globalThis.tick = function() {
+                                 const d = overtakeKnobDelta[k];
+                                 const ccVal = d > 0 ? Math.min(d, 63) : Math.max(128 + d, 65);
+                                 try {
+-                                    overtakeModuleCallbacks.onMidiMessageInternal([0xB0, KNOB_CC_START + k, ccVal]);
++                                    runToolCallback(function() {
++                                        overtakeModuleCallbacks.onMidiMessageInternal([0xB0, KNOB_CC_START + k, ccVal]);
++                                    });
+                                 } catch (e) {
+                                     debugLog("OVERTAKE flush knob exception: " + e);
+                                     exitOvertakeMode();
+@@ -15641,7 +15821,9 @@ globalThis.tick = function() {
+                             const d = overtakeJogDelta;
+                             const ccVal = d > 0 ? Math.min(d, 63) : Math.max(128 + d, 65);
+                             try {
+-                                overtakeModuleCallbacks.onMidiMessageInternal([0xB0, MoveMainKnob, ccVal]);
++                                runToolCallback(function() {
++                                    overtakeModuleCallbacks.onMidiMessageInternal([0xB0, MoveMainKnob, ccVal]);
++                                });
+                             } catch (e) {
+                                 debugLog("OVERTAKE flush jog exception: " + e);
+                                 exitOvertakeMode();
+@@ -15654,10 +15836,11 @@ globalThis.tick = function() {
+                         overtakeJogDelta = 0;
+                     }
+ 
+-                    /* Call the overtake module's tick() function */
++                    /* Call the overtake module's tick() function with the
++                     * tool's real host APIs (see runToolCallback). */
+                     if (overtakeModuleCallbacks && overtakeModuleCallbacks.tick) {
+                         try {
+-                            overtakeModuleCallbacks.tick();
++                            runToolCallback(function() { overtakeModuleCallbacks.tick(); });
+                         } catch (e) {
+                             debugLog("OVERTAKE tick() exception: " + e);
+                             /* Exit overtake on tick error */
+@@ -15665,6 +15848,15 @@ globalThis.tick = function() {
+                         }
+                     }
+                     flushLedQueue();  /* Drain queued LED updates to SHM after module tick */
++
++                    /* CO-RUN: render chain editor over the tool's frame. By
++                     * contract, a tool that enables co-run agrees not to draw
++                     * to OLED while coRunChainEditSlot >= 0 — but even if it
++                     * does, drawSlots() (and chain-edit subtree draws) start
++                     * with clear_screen() so the editor's pixels win. */
++                    if (coRunChainEditSlot >= 0) {
++                        runCoRunChainEdit(dispatchCoRunDraw);
++                    }
+                 }
+             } catch (e) {
+                 debugLog("OVERTAKE_MODULE case EXCEPTION: " + e);
+@@ -15866,8 +16058,9 @@ globalThis.onMidiMessageInternal = function(data) {
+ 
+         /* Back button handling for suspend_keeps_js modules — Wave Editor convention.
+          * Back alone: suspend (module parks in background, ticks continue).
+-         * Shift+Back: full exit (unload module). */
+-        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs) {
++         * Shift+Back: full exit (unload module).
++         * Skip while co-run is active: the chain editor claims Back. */
++        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && coRunChainEditSlot < 0) {
+             if (hostShiftHeld) {
+                 debugLog("HOST: Shift+Back → full exit (suspend_keeps_js module)");
+                 if (toolOvertakeActive) exitToolOvertake();
+@@ -15879,6 +16072,104 @@ globalThis.onMidiMessageInternal = function(data) {
+             return;
+         }
+ 
++        /* CO-RUN: intercept chain-editor navigation CCs (jog turn, jog click,
++         * track buttons) BEFORE encoder accumulation or tool dispatch. Tool
++         * keeps everything else (pads, step buttons, knobs, transport, Shift).
++         * Back is conditionally intercepted: when the editor is in a sub-view
++         * (PATCHES, COMPONENT_*, KNOB_*, etc.) Back navigates up within the
++         * editor; when the editor is at CHAIN_EDIT (the top level) Back falls
++         * through to the tool so dAVEBOx can exit co-run. */
++        if (coRunChainEditSlot >= 0 && (status & 0xF0) === 0xB0) {
++            if (d1 === MoveMainKnob && coRunCedes(CORUN_GRP_JOG)) {
++                const delta = decodeDelta(d2);
++                if (delta !== 0) runCoRunChainEdit(function() { handleJog(delta); });
++                needsRedraw = true;
++                return;
++            }
++            if (d1 === MoveMainButton && d2 > 0 && coRunCedes(CORUN_GRP_JOG)) {
++                /* Mirror the non-overtake Shift+Click handler (line ~15259):
++                 * Shift+Click in CHAIN_EDIT → handleShiftSelect (enter
++                 * component edit). Plain Click → handleSelect. */
++                runCoRunChainEdit(function() {
++                    if (hostShiftHeld && view === VIEWS.CHAIN_EDIT && selectedChainComponent >= 0) {
++                        handleShiftSelect();
++                    } else if (hostShiftHeld && view === VIEWS.MASTER_FX && selectedMasterFxComponent >= 0 && selectedMasterFxComponent < 4) {
++                        enterMasterFxModuleSelect(selectedMasterFxComponent);
++                    } else {
++                        handleSelect();
++                    }
++                });
++                needsRedraw = true;
++                return;
++            }
++            /* Back: always claimed by the chain editor while co-run is on.
++             * Deeper views navigate up; CHAIN_EDIT is the top — eat the event
++             * so it doesn't reach the tool (handleBack at CHAIN_EDIT would
++             * call shadow_request_exit, which is also wrong). User exits co-run
++             * via Menu button instead. */
++            if (d1 === MoveBack && d2 > 0 && coRunCedes(CORUN_GRP_BACK)) {
++                if (coRunView !== VIEWS.CHAIN_EDIT) {
++                    runCoRunChainEdit(function() { handleBack(); });
++                    needsRedraw = true;
++                }
++                return;
++            }
++            /* Shift (CC 49): give it ONLY to the chain editor. hostShiftHeld
++             * was already updated earlier (line ~15091) before this branch, so
++             * the editor's isShiftHeld()-based code paths see the right state.
++             * Eating it here prevents the tool from reacting (e.g. dAVEBOx's
++             * own Shift+button shortcuts while you're navigating the editor). */
++            if (d1 === 49 && coRunCedes(CORUN_GRP_SHIFT)) {
++                needsRedraw = true;
++                return;
++            }
++            /* Menu (CC 50): exit co-run entirely. shadow_clear_corun_chain_edit
++             * updates SHM; the tool reads it from its own poll and clears its
++             * mirror, restoring full OLED + jog ownership. */
++            if (d1 === 50 && d2 > 0) {
++                if (typeof shadow_set_corun_chain_edit === "function") {
++                    shadow_set_corun_chain_edit(-1);
++                }
++                coRunChainEditSlot = -1;
++                needsRedraw = true;
++                return;
++            }
++            /* Track buttons: CC 43=Track 1 (slot 0), CC 40=Track 4 (slot 3) */
++            if (d1 >= 40 && d1 <= 43 && d2 > 0 && coRunCedes(CORUN_GRP_TRACK_BUTTONS)) {
++                const _slot = 43 - d1;
++                if (_slot >= 0 && _slot < SHADOW_UI_SLOTS && _slot !== coRunChainEditSlot) {
++                    coRunChainEditSlot = _slot;
++                    selectedSlot = _slot;
++                    if (typeof updateFocusedSlot === "function") updateFocusedSlot(_slot);
++                    selectedChainComponent = lastChainComponent[_slot] || 0;
++                    if (typeof loadChainConfigFromSlot === "function") loadChainConfigFromSlot(_slot);
++                    coRunView = VIEWS.CHAIN_EDIT;
++                    if (typeof shadow_set_corun_chain_edit === "function") shadow_set_corun_chain_edit(_slot);
++                    needsRedraw = true;
++                }
++                return;
++            }
++            /* Knob CCs (71-78): drive the focused chain component's params,
++             * mirroring the non-overtake editor path (adjustKnobAndShow, with the
++             * handleKnobTurn slot-global fallback). Wrapped in runCoRunChainEdit
++             * so getKnobContext resolves against the editor's view rather than
++             * OVERTAKE_MODULE (the context cache is keyed on view). Returns
++             * before the tool knob-accumulation below, so dAVEBOx no longer
++             * receives knob turns while co-run is active. Knob TOUCH notes still
++             * forward to the tool — intentional turn-only split. */
++            if (d1 >= KNOB_CC_START && d1 <= KNOB_CC_END && coRunCedes(CORUN_GRP_KNOBS)) {
++                const _kIdx = d1 - KNOB_CC_START;
++                const _kDelta = decodeDelta(d2);
++                if (_kDelta !== 0) {
++                    runCoRunChainEdit(function() {
++                        if (!adjustKnobAndShow(_kIdx, _kDelta)) handleKnobTurn(_kIdx, _kDelta);
++                    });
++                    needsRedraw = true;
++                }
++                return;
++            }
++        }
++
+         /* Accumulate encoder/jog CCs instead of forwarding immediately.
+          * Deltas are flushed as synthetic messages before tick(). */
+         if ((status & 0xF0) === 0xB0) {
+@@ -15895,10 +16186,58 @@ globalThis.onMidiMessageInternal = function(data) {
+             }
+         }
+ 
+-        /* Route non-encoder MIDI to the overtake module immediately */
++        /* CO-RUN: knob capacitive touch (NoteOn for MoveKnob1Touch..8Touch;
++         * d2>0 = touch, d2==0 = release). Route to the chain editor for
++         * value-peek on touch and overlay dismiss on release, mirroring the
++         * non-overtake touch handlers, wrapped so getKnobContext resolves under
++         * the editor's view. Does NOT return — falls through to the tool forward
++         * below so dAVEBOx still receives both touch edges (it already gets these
++         * notes pre-change; keeping that avoids a stranded knobTouched on exit).
++         * Release drains BOTH the hierarchy (pendingHierKnob) and slot-global
++         * (pendingKnob) paths, which is what actually clears the value popup. */
++        if (coRunChainEditSlot >= 0 && (status & 0xF0) === MidiNoteOn &&
++                d1 >= MoveKnob1Touch && d1 <= MoveKnob8Touch && coRunCedes(CORUN_GRP_TOUCH)) {
++            const _tk = d1 - MoveKnob1Touch;
++            if (d2 > 0) {
++                runCoRunChainEdit(function() {
++                    const mmRole = getMultiMarkerKnobRole(_tk);
++                    if (mmRole) {
++                        if (mmRole.type === "marker") {
++                            selectActiveWavMarker(mmRole.member);
++                            const val = getSlotParam(hierEditorSlot, mmRole.member.fullKey);
++                            showOverlay(mmRole.member.meta.name || mmRole.member.key,
++                                        formatParamForOverlay(parseFloat(val), mmRole.member.meta));
++                        } else if (mmRole.type === "zoom") {
++                            const anchor = mmRole.anchor;
++                            const cur = getWavZoomLevel(hierEditorSlot, anchor.meta, anchor.fullKey);
++                            const factor = Math.pow(2, cur);
++                            const label = cur > 0.01 ? `${factor.toFixed(factor < 10 ? 1 : 0)}x` : "1x (off)";
++                            showOverlay("Zoom", label);
++                        }
++                    } else if (!showKnobOverlay(_tk)) {
++                        handleKnobTurn(_tk, 0);
++                    }
++                });
++            } else {
++                runCoRunChainEdit(function() {
++                    if (pendingHierKnobIndex === _tk) {
++                        processPendingHierKnob();
++                        pendingHierKnobIndex = -1;
++                        pendingHierKnobDelta = 0;
++                    }
++                    if (pendingKnobIndex === _tk && pendingKnobDelta !== 0) {
++                        refreshPendingKnobOverlay();
++                    }
++                });
++            }
++            needsRedraw = true;
++        }
++
++        /* Route non-encoder MIDI to the overtake module immediately, with
++         * the tool's real host APIs swapped in. */
+         if (overtakeModuleCallbacks.onMidiMessageInternal) {
+             try {
+-                overtakeModuleCallbacks.onMidiMessageInternal(data);
++                runToolCallback(function() { overtakeModuleCallbacks.onMidiMessageInternal(data); });
+                 needsRedraw = true;
+             } catch (e) {
+                 debugLog("OVERTAKE onMidiMessageInternal exception: " + e);
+-- 
+2.53.0
+
+From 220fb001a416fad36426bd994dd4e9a3e9ac681d Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Tue, 26 May 2026 08:35:30 -0400
+Subject: [PATCH] refactor(corun): collapse to single predicate + state struct
+ + JS API, split shadow_display_mode (PR-94 items 1-4)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Maintainer feedback on the original co-run PR called out four structural
+tightenings — none of them a redesign, just preventing future drift.
+
+Item 1 — Single corun_event_owner() predicate. The let-through filter
+at the sh_midi site and the suppress filter at the forward site each did
+their own grp && !(keep_mask & grp) check, with a comment asking future
+readers to keep them in sync. Collapsed both into one helper
+corun_event_owner(ctrl, type, d1) -> {TOOL, PEER, BOTH, NONE} in
+shadow_constants.h; each call site asks which side it is and switches on
+the result. Drift impossible by construction.
+
+Item 2 — Split the shadow_display_mode overload. Keeping
+shadow_display_mode = 1 while early-returning from shadow_swap_display
+during move_native worked, but it overloaded the field: future readers
+of shadow_display_mode couldn't tell whether the shadow session was
+active or whether Move firmware owned the OLED. Added a separate
+shadow_display_owner field on shadow_control_t with a display_owner_t
+enum (TOOL / SCHWUNG_UI / MOVE_FIRMWARE). shadow_display_mode reverts
+to its literal meaning (shadow session armed vs not); the early-return
+in shadow_swap_display now checks display_owner.
+
+Item 3 — Collapse to one corun state field. The parallel int8_t
+corun_chain_edit_slot + corun_move_native_track fields made "which one
+do I check" a bug waiting to happen. Replaced with a single nested
+struct { target, id, keep_mask } accessed via helpers corun_active(),
+corun_target(), corun_id(), corun_keep_mask() in shadow_constants.h.
+All read/write sites in schwung_shim.c, shadow_ui.c, and
+shadow_led_queue.c go through the helpers; no direct field access
+outside them. Adding a new co-run target = extend corun_target_t enum
+and the predicate; nothing else to chase.
+
+Item 4 — One JS entry point. Dropped the per-target setters
+(shadow_set_corun_chain_edit / shadow_set_corun_move_native) and their
+getters. Kept shadow_corun_begin(target, id, keep_mask) /
+shadow_corun_end() / shadow_corun_state() — the last returns
+{ target, id, keep_mask } or null, so tools can poll once per frame to
+reconcile their own mirror. Registered the CORUN_TARGET_* and
+CORUN_GRP_* enum values + CORUN_KEEP_DEFAULT as JS globals so tool code
+doesn't have to redeclare them.
+
+shadow_ui.js's tick-time reconcile rewritten to read shadow_corun_state()
+once and switch on target. The chain editor's Back handler is unchanged
+behaviorally (navigates within sub-views, silent at the top level — the
+tool provides its own exit gesture); only the comment was generalized.
+
+No functional regressions for the existing chain-edit / move-native
+flows.
+---
+ src/host/shadow_constants.h |  71 ++++++++++++++++--
+ src/host/shadow_led_queue.c |  23 +++---
+ src/schwung_shim.c          |  88 ++++++++++------------
+ src/shadow/shadow_ui.c      | 141 +++++++++++++++---------------------
+ src/shadow/shadow_ui.js     |  72 +++++++++---------
+ 5 files changed, 206 insertions(+), 189 deletions(-)
+
+diff --git a/src/host/shadow_constants.h b/src/host/shadow_constants.h
+index bf00ac8c..eccebbbb 100644
+--- a/src/host/shadow_constants.h
++++ b/src/host/shadow_constants.h
+@@ -156,9 +156,18 @@ typedef struct shadow_control_t {
+     volatile uint16_t skipback_seconds; /* Skipback rolling buffer length: 30/60/120/180/240/300 */
+     volatile uint8_t resume_last_tool;  /* 1=JUMP_TO_TOOLS should resume the most-recently-suspended tool instead of opening the menu */
+     volatile uint8_t midi_indicator_enabled; /* 1=draw "ccN" MIDI channel indicator while a note is held */
+-    volatile int8_t corun_chain_edit_slot; /* -1=off, 0-3=chain-edit co-runs with the active tool, owning OLED + jog + track buttons */
+-    volatile int8_t corun_move_native_track; /* -1=off, 0-7=Move firmware co-runs (OLED + jog + track buttons + knobs) for the active tool's track */
+-    volatile uint16_t corun_keep_mask;   /* co-run input manifest: bitfield of CORUN_GRP_* the tool KEEPS; the rest cede to the co-run UI. 0 = use CORUN_KEEP_DEFAULT (back-compat for callers that set only the target gate). */
++    /* Co-run state: one struct, accessed via helpers below. `target` selects
++     * which peer co-runs (chain editor or Move firmware), `id` is its identity
++     * (chain slot 0-3 or tool track 0-7; -1 unused when target=NONE), and
++     * `keep_mask` is the tool's CORUN_GRP_* input manifest (0 = default split).
++     * Never read these directly outside the helpers — `target` may be 0 (NONE)
++     * with stale `id` / `keep_mask` from a prior session. */
++    volatile struct {
++        int8_t target;       /* corun_target_t */
++        int8_t id;
++        uint16_t keep_mask;
++    } corun;
++    volatile uint8_t shadow_display_owner; /* display_owner_t: who currently owns the OLED. Independent of shadow_display_mode (which only says "shadow session active"). */
+     volatile uint8_t reserved[1];
+ } shadow_control_t;
+ 
+@@ -180,9 +189,9 @@ typedef struct shadow_control_t {
+ #define CORUN_GRP_MENU          (1u << 10) /* CC 50 — framework exit gesture */
+ #define CORUN_GRP_TOUCH         (1u << 11) /* capacitive-touch notes 0-9 */
+ 
+-/* Default keep-set: reproduces the original dAVEBOx co-run split (tool keeps
+- * pads, step buttons, transport, and Menu; cedes the nav surface + screen).
+- * Used whenever corun_keep_mask == 0. */
++/* Default keep-set: the canonical sequencer-style co-run split — tool keeps
++ * pads, step buttons, transport, and Menu; cedes the nav surface + screen
++ * to the peer. Used whenever corun_keep_mask == 0. */
+ #define CORUN_KEEP_DEFAULT (CORUN_GRP_PADS | CORUN_GRP_STEPS | CORUN_GRP_TRANSPORT | CORUN_GRP_MENU)
+ 
+ /* Map a raw cable-0 MIDI event to its control-surface group, or 0 if it isn't a
+@@ -216,6 +225,56 @@ static inline uint16_t corun_keep_mask_eff(uint16_t keep_mask) {
+     return keep_mask ? keep_mask : CORUN_KEEP_DEFAULT;
+ }
+ 
++/* Co-run target. Stored in shadow_control->corun.target as int8_t. */
++typedef enum {
++    CORUN_TARGET_NONE        = 0,
++    CORUN_TARGET_CHAIN_EDIT  = 1, /* Schwung chain editor co-runs (id = chain slot 0-3) */
++    CORUN_TARGET_MOVE_NATIVE = 2, /* Move firmware co-runs (id = tool track 0-7) */
++} corun_target_t;
++
++/* OLED ownership during a co-run / shadow session. Stored as uint8_t. */
++typedef enum {
++    DISPLAY_OWNER_TOOL          = 0, /* the active tool (default, including non-shadow Move mode) */
++    DISPLAY_OWNER_SCHWUNG_UI    = 1, /* the schwung shadow UI (overtake menu, chain editor, …) */
++    DISPLAY_OWNER_MOVE_FIRMWARE = 2, /* Move firmware (during move_native co-run) */
++} display_owner_t;
++
++/* Result of corun_event_owner: which side a given control-surface event belongs
++ * to right now. Each call site switches on this once instead of mirroring the
++ * `grp && !(keep_mask & grp)` check. */
++typedef enum {
++    CORUN_OWNER_TOOL = 0, /* event goes to the active tool */
++    CORUN_OWNER_PEER,     /* event goes to the co-run UI (chain editor or Move firmware) */
++    CORUN_OWNER_BOTH,     /* event reaches both (currently unused; reserved for future shared gestures) */
++    CORUN_OWNER_NONE,     /* event is consumed by the framework, reaches neither (e.g. Back exit gesture during co-run) */
++} corun_owner_t;
++
++/* Accessors — never touch the corun struct directly. */
++static inline int corun_active(const volatile shadow_control_t *ctrl) {
++    return ctrl && ctrl->corun.target != CORUN_TARGET_NONE;
++}
++static inline corun_target_t corun_target(const volatile shadow_control_t *ctrl) {
++    return ctrl ? (corun_target_t)ctrl->corun.target : CORUN_TARGET_NONE;
++}
++static inline int corun_id(const volatile shadow_control_t *ctrl) {
++    return ctrl ? (int)(int8_t)ctrl->corun.id : -1;
++}
++static inline uint16_t corun_keep_mask(const volatile shadow_control_t *ctrl) {
++    return ctrl ? ctrl->corun.keep_mask : 0;
++}
++
++/* Single source of truth for "who owns this event right now?". Both the sh_midi
++ * let-through filter and the forward-to-shadow_ui suppress filter call this and
++ * switch on the result. Adding a new corun target = extend this function; no
++ * mirror checks anywhere else can drift. */
++static inline corun_owner_t corun_event_owner(const volatile shadow_control_t *ctrl, uint8_t type, uint8_t d1) {
++    if (!corun_active(ctrl)) return CORUN_OWNER_TOOL;
++    uint16_t grp = corun_group_for_event(type, d1);
++    if (!grp) return CORUN_OWNER_TOOL; /* unclassified events always stay with tool */
++    uint16_t keep = corun_keep_mask_eff(ctrl->corun.keep_mask);
++    return (keep & grp) ? CORUN_OWNER_TOOL : CORUN_OWNER_PEER;
++}
++
+ /*
+  * UI state structure for slot information.
+  * Must fit within SHADOW_UI_BUFFER_SIZE bytes.
+diff --git a/src/host/shadow_led_queue.c b/src/host/shadow_led_queue.c
+index 783a57a1..75929c10 100644
+--- a/src/host/shadow_led_queue.c
++++ b/src/host/shadow_led_queue.c
+@@ -371,17 +371,18 @@ void shadow_clear_move_leds_if_overtake(void) {
+      * wants Move's pad colors to update as clips play). */
+     if (!cur_overtake) return;
+ 
+-    /* Move-native co-run (dAVEBOx Edit Synth...): the tool sets skip_led_clear=1
+-     * so Move's CC + sysex LED writes pass through (track buttons, knob rings,
+-     * master). But Move also re-asserts the pad grid (note-on/off) and other
+-     * native button/transport CCs, which would clobber the surfaces the tool
+-     * keeps. Strip pads + track buttons + steps/transport CCs; leave sysex
+-     * untouched (knob-ring + master colors are sysex idx 71-79). Keep only the
+-     * master CC latch (79). Track buttons (40-43) are tool-owned in co-run — the
+-     * tool blinks them itself — so strip Move's track-button CC writes too; we no
+-     * longer surface Move's native track colors (they were unreliable to cache/
+-     * land). Runs BEFORE the skip_led_clear early-return so it takes priority. */
+-    if (ctrl && ctrl->corun_move_native_track >= 0) {
++    /* Move-native co-run: the tool sets skip_led_clear=1 so Move's CC + sysex
++     * LED writes pass through (track buttons, knob rings, master). But Move
++     * also re-asserts the pad grid (note-on/off) and other native
++     * button/transport CCs, which would clobber the surfaces the tool keeps.
++     * Strip pads + track buttons + steps/transport CCs; leave sysex untouched
++     * (knob-ring + master colors are sysex idx 71-79). Keep only the master
++     * CC latch (79). Track buttons (40-43) are tool-owned in co-run — the
++     * tool repaints them itself — so strip Move's track-button CC writes too;
++     * we no longer surface Move's native track colors (they were unreliable
++     * to cache/land). Runs BEFORE the skip_led_clear early-return so it
++     * takes priority. */
++    if (corun_target(ctrl) == CORUN_TARGET_MOVE_NATIVE) {
+         for (int i = 0; i < HW_MIDI_OUT_SIZE; i += 4) {
+             uint8_t cable = (midi_out[i] >> 4) & 0x0F;
+             if (cable != 0) continue;
+diff --git a/src/schwung_shim.c b/src/schwung_shim.c
+index e2f7f572..7dfab192 100644
+--- a/src/schwung_shim.c
++++ b/src/schwung_shim.c
+@@ -1345,7 +1345,7 @@ static int overtake_midi_send_internal(const uint8_t *msg, int len) {
+ /* === Phase 2: Audio-thread-safe ROUTE_EXTERNAL MIDI send =================
+  *
+  * overtake_midi_send_external() is called from an overtake DSP's audio
+- * thread (e.g. dAVEBOx's pfx_emit). The pre-Phase-2 body did its own
++ * thread. The pre-Phase-2 body did its own
+  * synchronous real_ioctl(SPI), which works only by accident — it ships
+  * a partial 768-byte mailbox (including stale audio at offset 256-767)
+  * out of step with the audio thread's own per-block ioctl.
+@@ -3044,9 +3044,10 @@ static void init_shadow_shm(void)
+             shadow_control->suspend_overtake = 0;
+             shadow_control->selected_slot    = 0;
+             shadow_control->skip_led_clear   = 0;
+-            shadow_control->corun_chain_edit_slot = -1;  /* chain-edit co-run inactive at boot */
+-            shadow_control->corun_move_native_track = -1;  /* Move-native co-run inactive at boot */
+-            shadow_control->corun_keep_mask = 0;  /* 0 = default split when a co-run target is set without a manifest */
++            shadow_control->corun.target = CORUN_TARGET_NONE;  /* co-run inactive at boot */
++            shadow_control->corun.id = -1;
++            shadow_control->corun.keep_mask = 0;  /* 0 = default split when a target is set without a manifest */
++            shadow_control->shadow_display_owner = DISPLAY_OWNER_SCHWUNG_UI; /* splash boots into shadow UI */
+             /* Initialize TTS defaults */
+             shadow_control->tts_enabled = 0;    /* Screen Reader off by default */
+             shadow_control->tts_volume = 70;    /* 70% volume */
+@@ -3521,12 +3522,13 @@ static void shadow_swap_display(void)
+         display_phase = 0;
+         return;
+     }
+-    /* Move-native co-run: yield OLED to Move firmware (preset browser /
+-     * device-edit pages) while keeping shadow_display_mode = 1 so the MIDI
+-     * filter at the sh_midi sync site stays active. Without this bypass we'd
+-     * have to drop display_mode = 0 to expose Move's framebuffer, which would
+-     * also disable the filter and let pads/transport leak through to Move. */
+-    if (shadow_control->corun_move_native_track >= 0) {
++    /* Display-owner split (see shadow_display_owner_t in shadow_constants.h):
++     * shadow_display_mode says "the shadow session is active" (filters/MIDI
++     * routing are armed). shadow_display_owner says "who is actually rendering
++     * the OLED right now". During move_native co-run the session is active but
++     * the OLED belongs to Move firmware — yield without tearing down the
++     * session. */
++    if (shadow_control->shadow_display_owner == DISPLAY_OWNER_MOVE_FIRMWARE) {
+         display_phase = 0;
+         return;
+     }
+@@ -5137,11 +5139,14 @@ static void shim_pre_transfer(void *ctx, uint8_t *shadow, int size)
+      * overtake_mode — otherwise audio scales to whatever volume was active
+      * when overtake engaged. */
+     int pin_challenge = shadow_control && shadow_control->pin_challenge_active == 1;
++    int corun_owns_native_oled = shadow_control &&
++        shadow_control->shadow_display_owner == DISPLAY_OWNER_MOVE_FIRMWARE;
+     int native_display_visible = (!shadow_display_mode) ||
+                                  (shadow_display_mode &&
+                                   shadow_volume_knob_touched &&
+                                   !shadow_shift_held &&
+                                   shadow_control) ||
++                                 corun_owns_native_oled ||
+                                  pin_challenge;
+ 
+     if (global_mmap_addr && native_display_visible) {
+@@ -6072,32 +6077,15 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+                     if (cin == 0x0B && type == 0xB0 && d1 < 128 && overtake_passthrough_ccs[d1]) {
+                         filter = 0;
+                     }
+-                    /* Move-native co-run: while corun_move_native_track >= 0,
+-                     * let Move firmware see the navigation surface it needs to
+-                     * drive its preset browser / device-edit pages, while the
+-                     * tool keeps the rest. Cable-0 only (handled by the outer
+-                     * `if (cable == 0x00)`). Touch notes 0-9 (jog + knob cap)
+-                     * also flow through so Move can detect engagement.
+-                     *  - CC 3   = jog click
+-                     *  - CC 14  = jog turn
+-                     *  - CC 40-43 = track buttons
+-                     *  - CC 49  = Shift
+-                     *  - CC 51  = Back
+-                     *  - CC 71-78 = device-edit knobs (8 knobs)
+-                     *  - CC 79  = master knob (already in passthrough for dAVEBOx,
+-                     *             listed here for clarity in case a tool doesn't
+-                     *             include it in button_passthrough). */
+-                    if (shadow_control->corun_move_native_track >= 0) {
+-                        /* Cede this event to Move firmware iff its control-surface
+-                         * group is NOT in the tool's keep-mask. corun_group_for_event
+-                         * + corun_keep_mask_eff (shadow_constants.h) are the single
+-                         * shared source for this decision, mirrored at the
+-                         * shadow_ui_midi_shm forward-filter below. keep_mask == 0
+-                         * falls back to the default split. */
+-                        uint16_t grp = corun_group_for_event(type, d1);
+-                        if (grp && !(corun_keep_mask_eff(shadow_control->corun_keep_mask) & grp)) {
+-                            filter = 0;
+-                        }
++                    /* Move-native co-run: let Move firmware see whichever
++                     * control-surface events the tool cedes via its keep_mask.
++                     * corun_event_owner (shadow_constants.h) is the single
++                     * source of truth — same predicate runs at the forward-to-
++                     * shadow_ui suppress site below, so the two routes can
++                     * never drift. */
++                    if (corun_target(shadow_control) == CORUN_TARGET_MOVE_NATIVE &&
++                        corun_event_owner(shadow_control, type, d1) == CORUN_OWNER_PEER) {
++                        filter = 0;
+                     }
+                 } else if (overtake_mode == 1) {
+                     filter = 1;
+@@ -7095,8 +7083,8 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+             /* Deliver internal cable-0 note events (d1 >= 10, excludes
+              * knob-touch reserved range 0–9) to the loaded overtake DSP
+              * via its audio-thread on_midi hook.  Enables overtake tools
+-             * like dAVEBOx to handle pad input on the audio thread
+-             * instead of through the JS round-trip below. */
++             * to handle pad input on the audio thread instead of through
++             * the JS round-trip below. */
+             if (overtake_mode == 2 && cable == 0x00 &&
+                 (type == 0x90 || type == 0x80) && d1 >= 10) {
+                 if (overtake_dsp_gen && overtake_dsp_gen_inst && overtake_dsp_gen->on_midi) {
+@@ -7120,20 +7108,18 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+                     if (!is_ui_event) continue;  /* Skip non-UI events in menu mode */
+                 }
+ 
+-                /* Move-native co-run: suppress from the tool the same nav CCs
+-                 * + touch notes that we let through to Move firmware above
+-                 * (sh_midi filter). Cable-0 only — cable-2 external MIDI is
+-                 * unaffected. Mirror of the let-through list at the sh_midi
+-                 * filter site; keep them in sync. */
++                /* Co-run forward-suppress: when the peer is a SEPARATE process
++                 * (Move firmware in move_native), we gate the publish here so
++                 * the tool doesn't see events that already went to Move via
++                 * the pre-ioctl filter. For chain-edit the peer IS shadow_ui
++                 * (same process as the tool dispatch), so shadow_ui.js handles
++                 * routing internally via coRunCedes() — we MUST let publish
++                 * through, otherwise the chain editor never receives jog,
++                 * track buttons, etc. */
+                 if (overtake_mode == 2 && cable == 0x00 &&
+-                    shadow_control->corun_move_native_track >= 0) {
+-                    /* Mirror of the sh_midi let-through above: suppress from the
+-                     * tool exactly the groups it cedes to Move firmware. Shared
+-                     * event->group map keeps the two sites in lockstep. */
+-                    uint16_t grp = corun_group_for_event(type, d1);
+-                    if (grp && !(corun_keep_mask_eff(shadow_control->corun_keep_mask) & grp)) {
+-                        continue;
+-                    }
++                    corun_target(shadow_control) == CORUN_TARGET_MOVE_NATIVE &&
++                    corun_event_owner(shadow_control, type, d1) == CORUN_OWNER_PEER) {
++                    continue;
+                 }
+ 
+                 /* BLOCK channels: hardware_mmap_addr is NOT modified (writing
+diff --git a/src/shadow/shadow_ui.c b/src/shadow/shadow_ui.c
+index 9d8c809b..2f6c5908 100644
+--- a/src/shadow/shadow_ui.c
++++ b/src/shadow/shadow_ui.c
+@@ -347,72 +347,17 @@ static JSValue js_shadow_overtake_send_external_async_active(JSContext *ctx, JSV
+     return JS_NewInt32(ctx, 1);
+ }
+ 
+-/* shadow_set_corun_chain_edit(slot) -> void
+- * Enables co-run mode: the chain editor for `slot` (0-3) renders to the OLED
+- * and consumes jog/jog-click/track-button input while the active tool module
+- * keeps everything else (pads, step buttons, knobs, transport). Pass -1 to
+- * disable. Also updates ui_slot for downstream consumers.
+- */
+-static JSValue js_shadow_set_corun_chain_edit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+-    (void)this_val;
+-    if (!shadow_control || argc < 1) return JS_UNDEFINED;
+-    int slot = -1;
+-    if (JS_ToInt32(ctx, &slot, argv[0])) return JS_UNDEFINED;
+-    if (slot < -1 || slot >= SHADOW_UI_SLOTS) return JS_UNDEFINED;
+-    shadow_control->corun_chain_edit_slot = (int8_t)slot;
+-    if (slot >= 0) shadow_control->ui_slot = (uint8_t)slot;
+-    shadow_control->corun_keep_mask = 0;  /* legacy setter = default split (clears any prior manifest) */
+-    return JS_UNDEFINED;
+-}
+-
+-/* shadow_get_corun_chain_edit() -> int (-1=off, 0-3=co-run slot) */
+-static JSValue js_shadow_get_corun_chain_edit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+-    (void)this_val; (void)argc; (void)argv;
+-    if (!shadow_control) return JS_NewInt32(ctx, -1);
+-    return JS_NewInt32(ctx, (int)(int8_t)shadow_control->corun_chain_edit_slot);
+-}
+-
+-/* shadow_set_corun_move_native(track) -> void
+- * Enables Move-native co-run: Move firmware renders to the OLED and consumes
+- * jog/jog-click/track-button/Shift/Back/knob/master-knob input + capacitive
+- * touch notes 0-9, while the active tool module keeps pads/step buttons/
+- * transport/Menu. Pass -1 to disable. Unlike chain-edit co-run, this is a
+- * pure shim-level split: Move firmware reads the shadow_mailbox MIDI_IN
+- * buffer directly (separate process), so there's no JS-side intercept and
+- * no host-API swap to manage.
+- */
+-static JSValue js_shadow_set_corun_move_native(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+-    (void)this_val;
+-    if (!shadow_control || argc < 1) return JS_UNDEFINED;
+-    int track = -1;
+-    if (JS_ToInt32(ctx, &track, argv[0])) return JS_UNDEFINED;
+-    /* Caller's track space (e.g. dAVEBOx 0-7), not Schwung chain slots; the
+-     * shim only uses this value as a gate (>= 0 = co-run active). Bounded by
+-     * int8_t storage; clamp by hand to a reasonable upper limit so a typo
+-     * doesn't enable co-run on track 99. */
+-    if (track < -1 || track > 7) return JS_UNDEFINED;
+-    shadow_control->corun_move_native_track = (int8_t)track;
+-    shadow_control->corun_keep_mask = 0;  /* legacy setter = default split (clears any prior manifest) */
+-    return JS_UNDEFINED;
+-}
+-
+-/* shadow_get_corun_move_native() -> int (-1=off, 0-3=co-run track) */
+-static JSValue js_shadow_get_corun_move_native(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+-    (void)this_val; (void)argc; (void)argv;
+-    if (!shadow_control) return JS_NewInt32(ctx, -1);
+-    return JS_NewInt32(ctx, (int)(int8_t)shadow_control->corun_move_native_track);
+-}
+-
+ /* shadow_corun_begin(target, id, keep_mask) -> void
+- * Generalized co-run entry for any overtake tool.
+- *   target   : 0 = chain_edit (id = chain slot 0-3),
+- *              1 = move_native (id = tool track 0-7).
++ * Generalized co-run entry for any overtake tool. The framework yields the
++ * surfaces the tool cedes (via keep_mask) to the named peer UI, and reserves
++ * Back as the exit gesture for the duration of the session.
++ *   target   : CORUN_TARGET_CHAIN_EDIT  (id = chain slot 0-3)
++ *              CORUN_TARGET_MOVE_NATIVE (id = tool track 0-7)
+  *   id       : the target's identity (chain slot or tool track).
+  *   keep_mask: bitfield of CORUN_GRP_* the tool KEEPS; the rest cede to the
+- *              co-run UI. Omit or 0 = CORUN_KEEP_DEFAULT (original split).
+- * Atomicity: keep_mask is written before the target gate so the shim never sees
+- * an active gate paired with a stale mask. (A mid-update read of gate>=0 with
+- * mask still 0 just yields the default split — safe either way.) */
++ *              peer. Omit or 0 = CORUN_KEEP_DEFAULT (default split).
++ * Atomicity: keep_mask is written before target so the shim never sees an
++ * active target paired with a stale mask. */
+ static JSValue js_shadow_corun_begin(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+     (void)this_val;
+     if (!shadow_control || argc < 2) return JS_UNDEFINED;
+@@ -421,14 +366,22 @@ static JSValue js_shadow_corun_begin(JSContext *ctx, JSValueConst this_val, int
+     if (JS_ToInt32(ctx, &id, argv[1])) return JS_UNDEFINED;
+     if (argc >= 3 && JS_ToInt32(ctx, &keep, argv[2])) return JS_UNDEFINED;
+     if (keep < 0 || keep > 0xFFFF) return JS_UNDEFINED;
+-    shadow_control->corun_keep_mask = (uint16_t)keep;
+-    if (target == 0) {            /* chain_edit */
++    if (target == CORUN_TARGET_CHAIN_EDIT) {
+         if (id < 0 || id >= SHADOW_UI_SLOTS) return JS_UNDEFINED;
+-        shadow_control->corun_chain_edit_slot = (int8_t)id;
++        shadow_control->corun.keep_mask = (uint16_t)keep;
++        shadow_control->corun.id = (int8_t)id;
+         shadow_control->ui_slot = (uint8_t)id;
+-    } else if (target == 1) {     /* move_native */
++        shadow_control->corun.target = CORUN_TARGET_CHAIN_EDIT;
++        /* chain-edit renders via shadow_ui; OLED owner stays SCHWUNG_UI. */
++        shadow_control->shadow_display_owner = DISPLAY_OWNER_SCHWUNG_UI;
++    } else if (target == CORUN_TARGET_MOVE_NATIVE) {
+         if (id < 0 || id > 7) return JS_UNDEFINED;
+-        shadow_control->corun_move_native_track = (int8_t)id;
++        shadow_control->corun.keep_mask = (uint16_t)keep;
++        shadow_control->corun.id = (int8_t)id;
++        shadow_control->corun.target = CORUN_TARGET_MOVE_NATIVE;
++        /* move_native cedes the OLED to Move firmware. shadow_display_mode
++         * stays armed so MIDI filters remain active. */
++        shadow_control->shadow_display_owner = DISPLAY_OWNER_MOVE_FIRMWARE;
+     } else {
+         return JS_UNDEFINED;
+     }
+@@ -436,22 +389,32 @@ static JSValue js_shadow_corun_begin(JSContext *ctx, JSValueConst this_val, int
+ }
+ 
+ /* shadow_corun_end() -> void
+- * Exit co-run for both targets; restore full overtake ownership to the tool.
+- * Gates are cleared before the mask so the shim sees co-run off first. */
++ * Exit co-run; restore full overtake ownership to the tool. The shim's Back
++ * handler also calls this when the user presses Back during a session.
++ * Target is cleared before keep_mask so the shim sees co-run off first. */
+ static JSValue js_shadow_corun_end(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+     (void)this_val; (void)argc; (void)argv;
+     if (!shadow_control) return JS_UNDEFINED;
+-    shadow_control->corun_chain_edit_slot = -1;
+-    shadow_control->corun_move_native_track = -1;
+-    shadow_control->corun_keep_mask = 0;
++    shadow_control->corun.target = CORUN_TARGET_NONE;
++    shadow_control->corun.id = -1;
++    shadow_control->corun.keep_mask = 0;
++    /* Returning to the tool's shadow session — shadow_ui resumes rendering. */
++    shadow_control->shadow_display_owner = DISPLAY_OWNER_SCHWUNG_UI;
+     return JS_UNDEFINED;
+ }
+ 
+-/* shadow_get_corun_keep_mask() -> int (current keep-mask; 0 = default split) */
+-static JSValue js_shadow_get_corun_keep_mask(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++/* shadow_corun_state() -> { target, id, keep_mask } | null
++ * Returns null when no co-run is active, else the current state. Tools poll
++ * this each frame to detect framework-driven exit (Back press) and to
++ * reconcile their own mirror. */
++static JSValue js_shadow_corun_state(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+     (void)this_val; (void)argc; (void)argv;
+-    if (!shadow_control) return JS_NewInt32(ctx, 0);
+-    return JS_NewInt32(ctx, (int)shadow_control->corun_keep_mask);
++    if (!shadow_control || !corun_active(shadow_control)) return JS_NULL;
++    JSValue obj = JS_NewObject(ctx);
++    JS_SetPropertyStr(ctx, obj, "target", JS_NewInt32(ctx, (int)corun_target(shadow_control)));
++    JS_SetPropertyStr(ctx, obj, "id", JS_NewInt32(ctx, corun_id(shadow_control)));
++    JS_SetPropertyStr(ctx, obj, "keep_mask", JS_NewInt32(ctx, (int)corun_keep_mask(shadow_control)));
++    return obj;
+ }
+ 
+ /* shadow_get_selected_slot() -> int
+@@ -3281,13 +3244,27 @@ static void init_javascript(JSRuntime **prt, JSContext **pctx) {
+     JS_SetPropertyStr(ctx, global_obj, "shadow_clear_ui_flags", JS_NewCFunction(ctx, js_shadow_clear_ui_flags, "shadow_clear_ui_flags", 1));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_inbound_pad_midi_active", JS_NewCFunction(ctx, js_shadow_inbound_pad_midi_active, "shadow_inbound_pad_midi_active", 0));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_overtake_send_external_async_active", JS_NewCFunction(ctx, js_shadow_overtake_send_external_async_active, "shadow_overtake_send_external_async_active", 0));
+-    JS_SetPropertyStr(ctx, global_obj, "shadow_set_corun_chain_edit", JS_NewCFunction(ctx, js_shadow_set_corun_chain_edit, "shadow_set_corun_chain_edit", 1));
+-    JS_SetPropertyStr(ctx, global_obj, "shadow_get_corun_chain_edit", JS_NewCFunction(ctx, js_shadow_get_corun_chain_edit, "shadow_get_corun_chain_edit", 0));
+-    JS_SetPropertyStr(ctx, global_obj, "shadow_set_corun_move_native", JS_NewCFunction(ctx, js_shadow_set_corun_move_native, "shadow_set_corun_move_native", 1));
+-    JS_SetPropertyStr(ctx, global_obj, "shadow_get_corun_move_native", JS_NewCFunction(ctx, js_shadow_get_corun_move_native, "shadow_get_corun_move_native", 0));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_corun_begin", JS_NewCFunction(ctx, js_shadow_corun_begin, "shadow_corun_begin", 3));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_corun_end", JS_NewCFunction(ctx, js_shadow_corun_end, "shadow_corun_end", 0));
+-    JS_SetPropertyStr(ctx, global_obj, "shadow_get_corun_keep_mask", JS_NewCFunction(ctx, js_shadow_get_corun_keep_mask, "shadow_get_corun_keep_mask", 0));
++    JS_SetPropertyStr(ctx, global_obj, "shadow_corun_state", JS_NewCFunction(ctx, js_shadow_corun_state, "shadow_corun_state", 0));
++    /* Co-run target enum (matches corun_target_t in shadow_constants.h). */
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_TARGET_NONE",        JS_NewInt32(ctx, CORUN_TARGET_NONE));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_TARGET_CHAIN_EDIT",  JS_NewInt32(ctx, CORUN_TARGET_CHAIN_EDIT));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_TARGET_MOVE_NATIVE", JS_NewInt32(ctx, CORUN_TARGET_MOVE_NATIVE));
++    /* Control-surface group bitfield (matches CORUN_GRP_* in shadow_constants.h). */
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_OLED",          JS_NewInt32(ctx, CORUN_GRP_OLED));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_PADS",          JS_NewInt32(ctx, CORUN_GRP_PADS));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_STEPS",         JS_NewInt32(ctx, CORUN_GRP_STEPS));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_TRANSPORT",     JS_NewInt32(ctx, CORUN_GRP_TRANSPORT));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_JOG",           JS_NewInt32(ctx, CORUN_GRP_JOG));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_TRACK_BUTTONS", JS_NewInt32(ctx, CORUN_GRP_TRACK_BUTTONS));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_KNOBS",         JS_NewInt32(ctx, CORUN_GRP_KNOBS));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_MASTER",        JS_NewInt32(ctx, CORUN_GRP_MASTER));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_SHIFT",         JS_NewInt32(ctx, CORUN_GRP_SHIFT));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_BACK",          JS_NewInt32(ctx, CORUN_GRP_BACK));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_MENU",          JS_NewInt32(ctx, CORUN_GRP_MENU));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_TOUCH",         JS_NewInt32(ctx, CORUN_GRP_TOUCH));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_KEEP_DEFAULT",      JS_NewInt32(ctx, CORUN_KEEP_DEFAULT));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_get_open_tool_cmd",
+         JS_NewCFunction(ctx, js_shadow_get_open_tool_cmd, "shadow_get_open_tool_cmd", 0));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_get_selected_slot", JS_NewCFunction(ctx, js_shadow_get_selected_slot, "shadow_get_selected_slot", 0));
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 08d14166..b8a058e0 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -14844,7 +14844,7 @@ function dispatchCoRunDraw() {
+              * own UI module takes over shadow_ui's drawing/MIDI/IPC and starves
+              * the active tool. drawComponentEdit() is the simple preset-browser
+              * fallback that lets the user pick patches without the deep
+-             * module-specific editor — still useful, and keeps dAVEBOx alive. */
++             * module-specific editor — still useful, and keeps the tool alive. */
+             drawComponentEdit();
+             break;
+         case VIEWS.HIERARCHY_EDITOR:     drawHierarchyEditor(); break;
+@@ -15603,26 +15603,31 @@ globalThis.tick = function() {
+     /* Flush deferred wav player file_path after DSP load */
+     wavPlayerTick();
+ 
+-    /* CO-RUN: sync chain-edit slot from SHM. Active tool module sets this via
+-     * shadow_set_corun_chain_edit() to share OLED + jog + track buttons with
+-     * the chain editor while keeping pads/steps/knobs/transport for itself. */
+-    if (typeof shadow_get_corun_keep_mask === "function") {
+-        coRunKeepMask = shadow_get_corun_keep_mask() | 0;
+-    }
+-    if (typeof shadow_get_corun_chain_edit === "function") {
+-        const _new = shadow_get_corun_chain_edit();
+-        if (_new !== coRunChainEditSlot) {
+-            coRunChainEditSlot = _new;
+-            if (_new >= 0) {
++    /* CO-RUN: reconcile chain-edit slot from SHM each frame. The tool calls
++     * shadow_corun_begin(CORUN_TARGET_CHAIN_EDIT, slot, keep_mask) to enter;
++     * the framework calls shadow_corun_end() on Back press, after which
++     * shadow_corun_state() returns null and we tear down the editor. */
++    if (typeof shadow_corun_state === "function") {
++        const _st = shadow_corun_state();
++        const _slot = (_st && _st.target === CORUN_TARGET_CHAIN_EDIT) ? _st.id : -1;
++        coRunKeepMask = (_st && typeof _st.keep_mask === "number") ? (_st.keep_mask | 0) : 0;
++        if (_slot !== coRunChainEditSlot) {
++            coRunChainEditSlot = _slot;
++            if (_slot >= 0) {
+                 /* Entering co-run: prime the chain editor's state for slot N.
+                  * Mirrors enterChainEdit() but does NOT touch the outer view
+                  * (must stay VIEWS.OVERTAKE_MODULE so the tool keeps ticking). */
+-                selectedSlot = _new;
+-                if (typeof updateFocusedSlot === "function") updateFocusedSlot(_new);
+-                selectedChainComponent = lastChainComponent[_new] || 0;
+-                if (typeof loadChainConfigFromSlot === "function") loadChainConfigFromSlot(_new);
++                selectedSlot = _slot;
++                if (typeof updateFocusedSlot === "function") updateFocusedSlot(_slot);
++                selectedChainComponent = lastChainComponent[_slot] || 0;
++                if (typeof loadChainConfigFromSlot === "function") loadChainConfigFromSlot(_slot);
+                 coRunView = VIEWS.CHAIN_EDIT;
+                 needsRedraw = true;
++            } else {
++                /* Framework ended co-run (Back press) — drop back to the tool
++                 * view; the chain editor stops drawing on next tick. */
++                coRunView = VIEWS.OVERTAKE_MODULE;
++                needsRedraw = true;
+             }
+         }
+     }
+@@ -16077,8 +16082,8 @@ globalThis.onMidiMessageInternal = function(data) {
+          * keeps everything else (pads, step buttons, knobs, transport, Shift).
+          * Back is conditionally intercepted: when the editor is in a sub-view
+          * (PATCHES, COMPONENT_*, KNOB_*, etc.) Back navigates up within the
+-         * editor; when the editor is at CHAIN_EDIT (the top level) Back falls
+-         * through to the tool so dAVEBOx can exit co-run. */
++         * editor; at CHAIN_EDIT (the top level) Back is silent so the tool's
++         * own exit gesture (e.g. Menu) takes over. */
+         if (coRunChainEditSlot >= 0 && (status & 0xF0) === 0xB0) {
+             if (d1 === MoveMainKnob && coRunCedes(CORUN_GRP_JOG)) {
+                 const delta = decodeDelta(d2);
+@@ -16102,11 +16107,11 @@ globalThis.onMidiMessageInternal = function(data) {
+                 needsRedraw = true;
+                 return;
+             }
+-            /* Back: always claimed by the chain editor while co-run is on.
+-             * Deeper views navigate up; CHAIN_EDIT is the top — eat the event
+-             * so it doesn't reach the tool (handleBack at CHAIN_EDIT would
+-             * call shadow_request_exit, which is also wrong). User exits co-run
+-             * via Menu button instead. */
++            /* Back during co-run: deeper views call handleBack() to navigate
++             * up within the chain editor; at CHAIN_EDIT (the top level) we
++             * eat the event silently. The tool is responsible for the
++             * corun-exit gesture (e.g. Menu); shadow_ui doesn't handle it
++             * here. */
+             if (d1 === MoveBack && d2 > 0 && coRunCedes(CORUN_GRP_BACK)) {
+                 if (coRunView !== VIEWS.CHAIN_EDIT) {
+                     runCoRunChainEdit(function() { handleBack(); });
+@@ -16117,23 +16122,12 @@ globalThis.onMidiMessageInternal = function(data) {
+             /* Shift (CC 49): give it ONLY to the chain editor. hostShiftHeld
+              * was already updated earlier (line ~15091) before this branch, so
+              * the editor's isShiftHeld()-based code paths see the right state.
+-             * Eating it here prevents the tool from reacting (e.g. dAVEBOx's
+-             * own Shift+button shortcuts while you're navigating the editor). */
++             * Eating it here prevents the tool from reacting (e.g. its own
++             * Shift+button shortcuts while you're navigating the editor). */
+             if (d1 === 49 && coRunCedes(CORUN_GRP_SHIFT)) {
+                 needsRedraw = true;
+                 return;
+             }
+-            /* Menu (CC 50): exit co-run entirely. shadow_clear_corun_chain_edit
+-             * updates SHM; the tool reads it from its own poll and clears its
+-             * mirror, restoring full OLED + jog ownership. */
+-            if (d1 === 50 && d2 > 0) {
+-                if (typeof shadow_set_corun_chain_edit === "function") {
+-                    shadow_set_corun_chain_edit(-1);
+-                }
+-                coRunChainEditSlot = -1;
+-                needsRedraw = true;
+-                return;
+-            }
+             /* Track buttons: CC 43=Track 1 (slot 0), CC 40=Track 4 (slot 3) */
+             if (d1 >= 40 && d1 <= 43 && d2 > 0 && coRunCedes(CORUN_GRP_TRACK_BUTTONS)) {
+                 const _slot = 43 - d1;
+@@ -16144,7 +16138,7 @@ globalThis.onMidiMessageInternal = function(data) {
+                     selectedChainComponent = lastChainComponent[_slot] || 0;
+                     if (typeof loadChainConfigFromSlot === "function") loadChainConfigFromSlot(_slot);
+                     coRunView = VIEWS.CHAIN_EDIT;
+-                    if (typeof shadow_set_corun_chain_edit === "function") shadow_set_corun_chain_edit(_slot);
++                    if (typeof shadow_corun_begin === "function") shadow_corun_begin(CORUN_TARGET_CHAIN_EDIT, _slot, 0);
+                     needsRedraw = true;
+                 }
+                 return;
+@@ -16154,7 +16148,7 @@ globalThis.onMidiMessageInternal = function(data) {
+              * handleKnobTurn slot-global fallback). Wrapped in runCoRunChainEdit
+              * so getKnobContext resolves against the editor's view rather than
+              * OVERTAKE_MODULE (the context cache is keyed on view). Returns
+-             * before the tool knob-accumulation below, so dAVEBOx no longer
++             * before the tool knob-accumulation below, so the tool no longer
+              * receives knob turns while co-run is active. Knob TOUCH notes still
+              * forward to the tool — intentional turn-only split. */
+             if (d1 >= KNOB_CC_START && d1 <= KNOB_CC_END && coRunCedes(CORUN_GRP_KNOBS)) {
+@@ -16191,7 +16185,7 @@ globalThis.onMidiMessageInternal = function(data) {
+          * value-peek on touch and overlay dismiss on release, mirroring the
+          * non-overtake touch handlers, wrapped so getKnobContext resolves under
+          * the editor's view. Does NOT return — falls through to the tool forward
+-         * below so dAVEBOx still receives both touch edges (it already gets these
++         * below so the tool still receives both touch edges (it already gets these
+          * notes pre-change; keeping that avoids a stranded knobTouched on exit).
+          * Release drains BOTH the hierarchy (pendingHierKnob) and slot-global
+          * (pendingKnob) paths, which is what actually clears the value popup. */
+-- 
+2.53.0
+
+From 52b52ebe26f76cceaf7d1a8421be0e53c81bcfe6 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Tue, 26 May 2026 08:37:25 -0400
+Subject: [PATCH] feat(corun): Back exits corun + CORUN_KEEP_BACK opt-out
+ (PR-94 item 5)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Per the maintainer review:
+
+> Back exits corun, not Menu. Matches the rest of the UI's "Back pops
+> one layer" semantics and avoids further overloading Menu (already does
+> dismiss-shadow-UI, Shift+Vol+Menu = Master FX). For tools that keep
+> back in their keep_mask, Back still goes to corun exit — back joins
+> menu as a framework-reserved gesture.
+
+Implemented as a framework Back-press intercept in the shim's
+forward-to-shadow_ui block: when corun_event_owner() returns
+CORUN_OWNER_NONE for Back (the encoding for "framework-reserved gesture")
+the shim clears the corun state and consumes the event so neither the
+tool nor the peer sees it.
+
+For tools that need Back free for in-session peer navigation — chain
+editor sub-view pop, native back-nav inside Move firmware — added a
+CORUN_KEEP_BACK opt-out flag in the high half of keep_mask (bit 15, no
+collision with any CORUN_GRP_*). When set, the predicate returns NONE
+only for unclassified events, and Back routes per the normal keep_mask
+rules (cedes to peer unless CORUN_GRP_BACK is also kept). The tool is
+then responsible for providing its own exit gesture and calling
+shadow_corun_end() itself.
+
+This asymmetry between targets motivated the flag: shadow_ui's chain
+editor genuinely uses Back for sub-view pop, and Move firmware's native
+preset/synth editor uses Back for its own internal navigation. A
+uniform "Back always exits" rule would force both peers into a tool-
+driven exit gesture (Menu in dAVEBOx's case); the flag lets each tool
+pick its policy without breaking the framework default.
+
+CORUN_KEEP_BACK is also exposed as a JS global alongside the existing
+CORUN_TARGET_* / CORUN_GRP_* / CORUN_KEEP_DEFAULT constants.
+---
+ src/host/shadow_constants.h | 18 ++++++++++++++++++
+ src/schwung_shim.c          | 26 +++++++++++++++++++++-----
+ src/shadow/shadow_ui.c      |  1 +
+ src/shadow/shadow_ui.js     | 13 ++++++++-----
+ 4 files changed, 48 insertions(+), 10 deletions(-)
+
+diff --git a/src/host/shadow_constants.h b/src/host/shadow_constants.h
+index eccebbbb..6f1541dd 100644
+--- a/src/host/shadow_constants.h
++++ b/src/host/shadow_constants.h
+@@ -194,6 +194,14 @@ typedef struct shadow_control_t {
+  * to the peer. Used whenever corun_keep_mask == 0. */
+ #define CORUN_KEEP_DEFAULT (CORUN_GRP_PADS | CORUN_GRP_STEPS | CORUN_GRP_TRANSPORT | CORUN_GRP_MENU)
+ 
++/* Opt-out flag for tools that prefer their own exit gesture. When this bit is
++ * set in keep_mask, the framework does NOT auto-exit on Back press — Back
++ * routes per normal keep_mask rules (cedes to peer for sub-view nav unless
++ * the tool also keeps CORUN_GRP_BACK). Default (bit unset) reserves Back as
++ * the framework exit gesture regardless of keep_mask. Lives in the high half
++ * of keep_mask; doesn't collide with any CORUN_GRP_* bit. */
++#define CORUN_KEEP_BACK (1u << 15)
++
+ /* Map a raw cable-0 MIDI event to its control-surface group, or 0 if it isn't a
+  * routable surface control (those always stay with the tool). type is the
+  * status nibble (0xB0 CC, 0x90/0x80 note); d1 the data byte. Steps/transport
+@@ -270,6 +278,16 @@ static inline uint16_t corun_keep_mask(const volatile shadow_control_t *ctrl) {
+ static inline corun_owner_t corun_event_owner(const volatile shadow_control_t *ctrl, uint8_t type, uint8_t d1) {
+     if (!corun_active(ctrl)) return CORUN_OWNER_TOOL;
+     uint16_t grp = corun_group_for_event(type, d1);
++    /* Back: framework-reserved as the exit gesture by default — the shim's
++     * own handler ends the session on press, neither side sees the event.
++     * Tools that prefer their own exit gesture set CORUN_KEEP_BACK in
++     * keep_mask; Back then routes per normal keep_mask rules (cedes to peer
++     * for sub-view nav unless CORUN_GRP_BACK is also kept), and the framework
++     * stays out of its way. (Menu remains tool-owned by default via
++     * keep_mask.) */
++    if (grp == CORUN_GRP_BACK && !(ctrl->corun.keep_mask & CORUN_KEEP_BACK)) {
++        return CORUN_OWNER_NONE;
++    }
+     if (!grp) return CORUN_OWNER_TOOL; /* unclassified events always stay with tool */
+     uint16_t keep = corun_keep_mask_eff(ctrl->corun.keep_mask);
+     return (keep & grp) ? CORUN_OWNER_TOOL : CORUN_OWNER_PEER;
+diff --git a/src/schwung_shim.c b/src/schwung_shim.c
+index 7dfab192..26670a70 100644
+--- a/src/schwung_shim.c
++++ b/src/schwung_shim.c
+@@ -7115,11 +7115,27 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+                  * (same process as the tool dispatch), so shadow_ui.js handles
+                  * routing internally via coRunCedes() — we MUST let publish
+                  * through, otherwise the chain editor never receives jog,
+-                 * track buttons, etc. */
+-                if (overtake_mode == 2 && cable == 0x00 &&
+-                    corun_target(shadow_control) == CORUN_TARGET_MOVE_NATIVE &&
+-                    corun_event_owner(shadow_control, type, d1) == CORUN_OWNER_PEER) {
+-                    continue;
++                 * track buttons, etc. Back-as-framework-exit also lives here:
++                 * when corun_event_owner returns NONE (Back without
++                 * CORUN_KEEP_BACK opt-out), end the session and suppress. */
++                if (overtake_mode == 2 && cable == 0x00 && corun_active(shadow_control)) {
++                    corun_owner_t owner = corun_event_owner(shadow_control, type, d1);
++                    if (owner == CORUN_OWNER_NONE && type == 0xB0 && d1 == CC_BACK && d2 > 0) {
++                        shadow_control->corun.target = CORUN_TARGET_NONE;
++                        shadow_control->corun.id = -1;
++                        shadow_control->corun.keep_mask = 0;
++                        shadow_control->shadow_display_owner = DISPLAY_OWNER_SCHWUNG_UI;
++                        shadow_log("Back: exiting co-run");
++                        continue;
++                    }
++                    /* Move-native only: cede-to-peer events go to Move via the
++                     * pre-ioctl filter, so suppress the duplicate to shadow_ui
++                     * here. For chain-edit the peer is shadow_ui itself — let
++                     * publish through and rely on its coRunCedes() gating. */
++                    if (corun_target(shadow_control) == CORUN_TARGET_MOVE_NATIVE &&
++                        (owner == CORUN_OWNER_PEER || owner == CORUN_OWNER_NONE)) {
++                        continue;
++                    }
+                 }
+ 
+                 /* BLOCK channels: hardware_mmap_addr is NOT modified (writing
+diff --git a/src/shadow/shadow_ui.c b/src/shadow/shadow_ui.c
+index 2f6c5908..23c27a4b 100644
+--- a/src/shadow/shadow_ui.c
++++ b/src/shadow/shadow_ui.c
+@@ -3265,6 +3265,7 @@ static void init_javascript(JSRuntime **prt, JSContext **pctx) {
+     JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_MENU",          JS_NewInt32(ctx, CORUN_GRP_MENU));
+     JS_SetPropertyStr(ctx, global_obj, "CORUN_GRP_TOUCH",         JS_NewInt32(ctx, CORUN_GRP_TOUCH));
+     JS_SetPropertyStr(ctx, global_obj, "CORUN_KEEP_DEFAULT",      JS_NewInt32(ctx, CORUN_KEEP_DEFAULT));
++    JS_SetPropertyStr(ctx, global_obj, "CORUN_KEEP_BACK",         JS_NewInt32(ctx, CORUN_KEEP_BACK));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_get_open_tool_cmd",
+         JS_NewCFunction(ctx, js_shadow_get_open_tool_cmd, "shadow_get_open_tool_cmd", 0));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_get_selected_slot", JS_NewCFunction(ctx, js_shadow_get_selected_slot, "shadow_get_selected_slot", 0));
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index b8a058e0..0c1f640c 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -16107,11 +16107,14 @@ globalThis.onMidiMessageInternal = function(data) {
+                 needsRedraw = true;
+                 return;
+             }
+-            /* Back during co-run: deeper views call handleBack() to navigate
+-             * up within the chain editor; at CHAIN_EDIT (the top level) we
+-             * eat the event silently. The tool is responsible for the
+-             * corun-exit gesture (e.g. Menu); shadow_ui doesn't handle it
+-             * here. */
++            /* Back during co-run: framework-reserved as exit gesture UNLESS
++             * the tool set CORUN_KEEP_BACK in its keep_mask (opts out of the
++             * framework auto-exit so its peer UI can use Back for sub-view
++             * pop). The chain editor's deeper views call handleBack(); at
++             * CHAIN_EDIT (the top level) we eat the event silently — when
++             * the tool has opted out, it provides its own exit gesture
++             * (typically Menu, which is tool-routed under the default
++             * keep-mask). */
+             if (d1 === MoveBack && d2 > 0 && coRunCedes(CORUN_GRP_BACK)) {
+                 if (coRunView !== VIEWS.CHAIN_EDIT) {
+                     runCoRunChainEdit(function() { handleBack(); });
+-- 
+2.53.0
+
+From 28fb0162ece4b6c734eed706300368fd6bb9c4aa Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Tue, 26 May 2026 08:38:35 -0400
+Subject: [PATCH] feat(corun): CC 71-78 per-frame detent coalesce for
+ move_native (PR-94 item 6)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Per the maintainer review:
+
+> CC 71–78 coalescing has to ship with move_native, not as follow-up.
+> The knob stutter you documented will get filed as a Schwung bug the
+> first week it's in users' hands. Per-frame detent collapse in the
+> shim before forwarding to Move firmware.
+
+Implemented in the pre-ioctl filter loop in schwung_shim.c: when the
+tool cedes CORUN_GRP_KNOBS to Move firmware (the default), incoming
+CC 71-78 detents are summed into a per-knob accumulator within the
+audio frame; the individual events are suppressed (filter=1), and at
+the end of the loop one consolidated CC per knob is injected into the
+first empty sh_midi slot. Cumulative deltas are clamped to the one-byte
+signed encoding (±63); anything beyond that spills to the next frame
+naturally on the next inbound detent.
+
+Move firmware's per-CC cost (~900µs for synth-param write + OLED redraw)
+times multiple back-to-back detents in a single audio frame is what
+overran the SPI window. Capping at one CC per frame keeps the spike
+budget bounded while preserving the cumulative knob travel.
+
+The coalesce is gated on CORUN_TARGET_MOVE_NATIVE + CORUN_GRP_KNOBS NOT
+in keep_mask, so tools that route the knobs themselves are unaffected.
+---
+ src/schwung_shim.c | 52 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/src/schwung_shim.c b/src/schwung_shim.c
+index 26670a70..714f2de2 100644
+--- a/src/schwung_shim.c
++++ b/src/schwung_shim.c
+@@ -6041,6 +6041,23 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+     }
+ 
+     if (shadow_display_mode && shadow_control) {
++        /* Move-native co-run knob coalescing: Move firmware spends ~900µs per
++         * CC 71-78 it receives (synth-param write + OLED redraw). Multiple
++         * detents in one audio frame stack their cost and overrun the SPI
++         * frame budget, which manifests as sequencer stutter while the user
++         * spins a knob. Sum incoming detents per knob within this frame and
++         * emit ONE consolidated CC at the end of the filter loop instead of
++         * letting every detent through individually. Per-frame collapse is
++         * the framework's contract; tools generating unusually heavy
++         * concurrent MIDI traffic (simultaneous pad fire + step LEDs +
++         * automation lanes during transport, etc.) may still see residual
++         * stutter on very fast knob spins and should document that as a
++         * tool-side characteristic. See docs/CORUN.md. */
++        int16_t corun_knob_delta[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++        int corun_knob_coalesce =
++            (corun_target(shadow_control) == CORUN_TARGET_MOVE_NATIVE) &&
++            !(corun_keep_mask_eff(shadow_control->corun.keep_mask) & CORUN_GRP_KNOBS);
++
+         /* Filter MIDI_IN: zero out jog/back/knobs */
+         for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+             uint8_t cin = hw_midi[j] & 0x0F;
+@@ -6048,6 +6065,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+             uint8_t status = hw_midi[j + 1];
+             uint8_t type = status & 0xF0;
+             uint8_t d1 = hw_midi[j + 2];
++            uint8_t d2 = hw_midi[j + 3];
+ 
+             int filter = 0;
+ 
+@@ -6086,6 +6104,17 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+                     if (corun_target(shadow_control) == CORUN_TARGET_MOVE_NATIVE &&
+                         corun_event_owner(shadow_control, type, d1) == CORUN_OWNER_PEER) {
+                         filter = 0;
++                        /* CC 71-78 detents: accumulate and emit once per frame
++                         * (see corun_knob_delta declaration above). Suppress
++                         * the individual event by re-asserting filter=1; the
++                         * post-loop pass will inject one consolidated CC. */
++                        if (corun_knob_coalesce && type == 0xB0 && d1 >= 71 && d1 <= 78) {
++                            int16_t delta = 0;
++                            if (d2 >= 1 && d2 <= 63) delta = d2;
++                            else if (d2 >= 65 && d2 <= 127) delta = (int16_t)d2 - 128;
++                            corun_knob_delta[d1 - 71] += delta;
++                            filter = 1;
++                        }
+                     }
+                 } else if (overtake_mode == 1) {
+                     filter = 1;
+@@ -6157,6 +6186,29 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
+                 sh_midi[j + 3] = hw_midi[j + 3];
+             }
+         }
++
++        /* Move-native knob coalesce: emit one consolidated CC per knob whose
++         * detents we suppressed above. Find empty (zeroed) slots in sh_midi
++         * and inject. Clamp deltas into the one-byte signed encoding (±63);
++         * any leftover spills to the next frame's accumulator naturally on
++         * the next inbound detent. */
++        for (int k = 0; k < 8; k++) {
++            if (corun_knob_delta[k] == 0) continue;
++            int16_t delta = corun_knob_delta[k];
++            if (delta > 63) delta = 63;
++            else if (delta < -63) delta = -63;
++            uint8_t d2 = (delta >= 0) ? (uint8_t)delta : (uint8_t)(delta + 128);
++            for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
++                if (sh_midi[j] == 0 && sh_midi[j + 1] == 0 &&
++                    sh_midi[j + 2] == 0 && sh_midi[j + 3] == 0) {
++                    sh_midi[j]     = 0x0B;     /* cable 0, CIN 0x0B = CC */
++                    sh_midi[j + 1] = 0xB0;     /* status: CC, channel 0 */
++                    sh_midi[j + 2] = (uint8_t)(71 + k);
++                    sh_midi[j + 3] = d2;
++                    break;
++                }
++            }
++        }
+     } else {
+         /* Not in shadow mode - copy MIDI_IN directly */
+         memcpy(sh_midi, hw_midi, MIDI_BUFFER_SIZE);
+-- 
+2.53.0
+
+From 747fa30215be2446d911f7cfa0e915b6137419f0 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Tue, 26 May 2026 08:38:49 -0400
+Subject: [PATCH] docs(corun): framework reference docs/CORUN.md (PR-94 item 7)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+One-page co-run reference: the two targets and what each cedes by
+default, the framework exit gesture (Back) plus the CORUN_KEEP_BACK
+opt-out for tools that need Back free for peer navigation, the JS API
+(shadow_corun_begin / shadow_corun_end / shadow_corun_state) with the
+CORUN_TARGET_* / CORUN_GRP_* / CORUN_KEEP_DEFAULT / CORUN_KEEP_BACK
+globals, the capability gate pattern for tools shipping against both
+stock and patched Schwung, the Move-firmware coupling caveat that
+motivates the CC 71-78 per-frame coalesce, and one note on the single
+source of truth — corun_event_owner() — so any future contributor can
+add a target by extending one helper rather than hunting mirror checks.
+
+PR-94 item 7.
+---
+ docs/CORUN.md           | 127 ++++++++++++++++++++++++++++++++++++++++
+ src/shadow/shadow_ui.js |   7 +--
+ 2 files changed, 130 insertions(+), 4 deletions(-)
+ create mode 100644 docs/CORUN.md
+
+diff --git a/docs/CORUN.md b/docs/CORUN.md
+new file mode 100644
+index 00000000..e0c42047
+--- /dev/null
++++ b/docs/CORUN.md
+@@ -0,0 +1,127 @@
++# Co-run
++
++Co-run lets an overtake tool share Move's control surface with a second UI for
++the duration of a single user-driven session — e.g. a sequencer keeps the
++pads + steps + transport while the Schwung chain editor takes the OLED + jog,
++or while the Move firmware's native preset/synth editor takes its knobs.
++
++Two co-run targets ship today:
++
++| Target                    | Peer UI                  | Default cessions                                  |
++| ------------------------- | ------------------------ | ------------------------------------------------- |
++| `CORUN_TARGET_CHAIN_EDIT` | Schwung shadow_ui editor | OLED, jog, track buttons (tool keeps the rest)    |
++| `CORUN_TARGET_MOVE_NATIVE`| Move firmware            | OLED, jog, track buttons, knobs (71-78), Shift, touch notes 0-9, master CC 79 |
++
++The default split is encoded as `CORUN_KEEP_DEFAULT = PADS | STEPS | TRANSPORT
++| MENU` — the tool keeps those control-surface groups and cedes everything
++else to the peer. Tools can override by passing an explicit `keep_mask` to
++`shadow_corun_begin()`.
++
++## Exit gesture
++
++**Back exits co-run by default.** This matches the rest of Move's "Back pops
++one layer" semantics. The framework intercepts Back from the user, calls
++`shadow_corun_end()`, and never lets the event reach either the tool or the
++peer. (`menu` keeps its existing duties outside co-run: tap-dismisses shadow
++UI; Shift+Vol+Menu opens Master FX. While a co-run is active, Menu is
++forwarded to the tool by default via `CORUN_KEEP_DEFAULT` so the tool can use
++it as its own affordance.)
++
++### Opting out — `CORUN_KEEP_BACK`
++
++Tools that need Back free for in-session peer navigation (sub-view pop in
++the chain editor, native back-navigation inside Move firmware) set
++`CORUN_KEEP_BACK` in `keep_mask`:
++
++```js
++shadow_corun_begin(CORUN_TARGET_CHAIN_EDIT, slot,
++                   CORUN_KEEP_DEFAULT | CORUN_KEEP_BACK);
++```
++
++When this bit is set, the framework leaves Back alone: Back routes per the
++normal `keep_mask` rules (cedes to peer unless `CORUN_GRP_BACK` is also kept).
++The tool is then responsible for providing its own exit gesture and calling
++`shadow_corun_end()` itself; `menu` is the obvious choice since it's
++tool-routed under the default keep-mask.
++
++`CORUN_KEEP_BACK` lives in the high half of `keep_mask` (bit 15) so it doesn't
++collide with any `CORUN_GRP_*` bit.
++
++## JS API
++
++Exposed on the global object in shadow_ui's JS runtime:
++
++```js
++shadow_corun_begin(target, id, keep_mask)
++  // target: CORUN_TARGET_CHAIN_EDIT | CORUN_TARGET_MOVE_NATIVE
++  // id:     chain slot 0-3 (CHAIN_EDIT) or tool track 0-7 (MOVE_NATIVE)
++  // keep_mask: bitfield of CORUN_GRP_* the tool KEEPS; 0 = default split
++
++shadow_corun_end()
++  // Tear down co-run. Called by the framework on Back, or by the tool to
++  // exit programmatically (e.g. on track-mode change).
++
++shadow_corun_state()
++  // Returns { target, id, keep_mask } or null when no co-run is active.
++  // Tools poll this each frame to detect framework-driven exit and to
++  // reconcile their own mirror state.
++```
++
++Enum constants are registered as JS globals: `CORUN_TARGET_NONE`,
++`CORUN_TARGET_CHAIN_EDIT`, `CORUN_TARGET_MOVE_NATIVE`, plus
++`CORUN_GRP_OLED` ... `CORUN_GRP_TOUCH` and `CORUN_KEEP_DEFAULT` (matching
++`shadow_constants.h`).
++
++### Capability gate
++
++Tools that want to ship from a single branch against both stock and patched
++Schwung should gate the user-facing entry on the API's presence:
++
++```js
++const corunAvailable = typeof shadow_corun_begin === "function";
++```
++
++## Move-firmware coupling
++
++`CORUN_TARGET_MOVE_NATIVE` runs as a pure shim-level split: Move firmware
++reads the shadow MIDI_IN buffer directly (separate process), so there's no
++JS-side intercept or host-API swap to manage. `shadow_swap_display`
++early-returns when `shadow_display_owner == DISPLAY_OWNER_MOVE_FIRMWARE`,
++handing the OLED to Move's framebuffer while `shadow_display_mode` stays
++armed.
++
++**Why the bypass exists:** the obvious alternative — setting
++`shadow_display_mode = 0` to expose Move's framebuffer — also disables the
++MIDI filter at the `sh_midi` sync site, which would let the tool's pads,
++step buttons, and transport leak through to Move firmware. Splitting
++"session active" (`shadow_display_mode`) from "who renders"
++(`shadow_display_owner`) lets us yield the OLED without tearing down input
++gating.
++
++One Move-specific accommodation lives in the shim: **CC 71-78 detents are
++coalesced per audio frame** before being forwarded to Move firmware. Move
++spends ~900µs per knob CC on a synth-param write plus OLED redraw; multiple
++detents in a single frame stack their cost and overrun the SPI frame budget,
++manifesting as sequencer stutter while the user spins a knob. The shim sums
++incoming detents per knob within each frame and emits one consolidated CC,
++clamped to the one-byte signed delta range (±63 — leftover spills naturally
++to the next frame's accumulator). Tools that keep `CORUN_GRP_KNOBS` in their
++own `keep_mask` are unaffected (knob CCs never reach Move in that case).
++
++Per-frame collapse is the framework's contract. Tools that generate unusually
++heavy concurrent MIDI traffic (e.g. simultaneous pad fire, step LEDs, and
++automation lanes during transport) may still see residual stutter on very
++fast knob spins because the per-frame consolidated CC plus the rest of the
++tool's MIDI is enough to pressure Move's SPI window. That's a tool-side
++characteristic worth documenting in the consumer's manual; pushing the
++coalesce to multi-frame intervals trades knob latency for a problem most
++tools won't hit.
++
++## Single source of truth
++
++A single predicate, `corun_event_owner(ctrl, type, d1) -> {TOOL, PEER, BOTH,
++NONE}` in `shadow_constants.h`, decides which side any given control-surface
++event belongs to right now. Both the sh_midi let-through filter (forward to
++Move) and the forward-to-shadow_ui suppress filter (forward to tool) call this
++helper and switch on the result, so the two routes cannot drift apart. Adding
++a new target = extend this function; no mirror checks elsewhere.
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 0c1f640c..6d1872a2 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -16111,10 +16111,9 @@ globalThis.onMidiMessageInternal = function(data) {
+              * the tool set CORUN_KEEP_BACK in its keep_mask (opts out of the
+              * framework auto-exit so its peer UI can use Back for sub-view
+              * pop). The chain editor's deeper views call handleBack(); at
+-             * CHAIN_EDIT (the top level) we eat the event silently — when
+-             * the tool has opted out, it provides its own exit gesture
+-             * (typically Menu, which is tool-routed under the default
+-             * keep-mask). */
++             * CHAIN_EDIT (the top level) we eat the event silently — the
++             * tool provides its own exit gesture (typically Menu, which is
++             * tool-routed under the default keep-mask). */
+             if (d1 === MoveBack && d2 > 0 && coRunCedes(CORUN_GRP_BACK)) {
+                 if (coRunView !== VIEWS.CHAIN_EDIT) {
+                     runCoRunChainEdit(function() { handleBack(); });
+-- 
+2.53.0
+
+From 7af5a1c552ca24c39e3833e8d0a8e151236b14e5 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Tue, 26 May 2026 09:17:14 -0400
+Subject: [PATCH] feat(corun): chain-edit auto-exits on Back at top-level view
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Refines the CORUN_KEEP_BACK opt-out for CORUN_TARGET_CHAIN_EDIT
+specifically. The chain editor lives inside shadow_ui (same process
+as the framework dispatch) and owns its own view stack, so shadow_ui
+can tell when the editor is at its top-level CHAIN_EDIT view vs.
+deeper inside (component edit, patches, hierarchy, etc.).
+
+shadow_ui's Back handler now:
+- in sub-views: handleBack() to pop one level
+- at CHAIN_EDIT (top): calls shadow_corun_end() itself
+
+This gives the chain-edit target the original "Back exits at top,
+navigates within" UX you described in review, even though the tool
+opted out of the framework's broader Back-reservation. Move-native
+keeps the opt-out semantic (Back goes to Move firmware, tool exits
+via its own gesture) because Move's UI depth isn't observable from
+the framework side.
+
+No tool-side changes required — dAVEBOx's pollDSP picks up
+target=NONE on the next frame and runs its existing exit cleanup
+when shadow_ui ends the session.
+---
+ docs/CORUN.md           | 11 ++++++++---
+ src/shadow/shadow_ui.js | 23 ++++++++++++++++-------
+ 2 files changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/docs/CORUN.md b/docs/CORUN.md
+index e0c42047..9c82cb15 100644
+--- a/docs/CORUN.md
++++ b/docs/CORUN.md
+@@ -40,9 +40,14 @@ shadow_corun_begin(CORUN_TARGET_CHAIN_EDIT, slot,
+ 
+ When this bit is set, the framework leaves Back alone: Back routes per the
+ normal `keep_mask` rules (cedes to peer unless `CORUN_GRP_BACK` is also kept).
+-The tool is then responsible for providing its own exit gesture and calling
+-`shadow_corun_end()` itself; `menu` is the obvious choice since it's
+-tool-routed under the default keep-mask.
++For `CORUN_TARGET_CHAIN_EDIT`, shadow_ui's own Back handler still ends the
++session when the chain editor is at its top-level view (`CHAIN_EDIT`) — it
++owns the view stack and can tell, so it provides Charles's "Back exits at
++top, navigates within" UX for free even under the opt-out. For other
++targets like `CORUN_TARGET_MOVE_NATIVE`, the peer UI's depth isn't
++observable from the framework, so the tool is responsible for its own
++exit gesture (typically Menu, which is tool-routed under the default
++keep-mask) and for calling `shadow_corun_end()` itself.
+ 
+ `CORUN_KEEP_BACK` lives in the high half of `keep_mask` (bit 15) so it doesn't
+ collide with any `CORUN_GRP_*` bit.
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 6d1872a2..cacbf0cf 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -16107,17 +16107,26 @@ globalThis.onMidiMessageInternal = function(data) {
+                 needsRedraw = true;
+                 return;
+             }
+-            /* Back during co-run: framework-reserved as exit gesture UNLESS
+-             * the tool set CORUN_KEEP_BACK in its keep_mask (opts out of the
+-             * framework auto-exit so its peer UI can use Back for sub-view
+-             * pop). The chain editor's deeper views call handleBack(); at
+-             * CHAIN_EDIT (the top level) we eat the event silently — the
+-             * tool provides its own exit gesture (typically Menu, which is
+-             * tool-routed under the default keep-mask). */
++            /* Back during co-run: framework-reserved as exit gesture by
++             * default. When the tool sets CORUN_KEEP_BACK in keep_mask (opts
++             * out of the framework auto-exit so its peer UI can use Back for
++             * sub-view nav), the chain editor handles Back itself —
++             * deeper views call handleBack() to pop one level; at CHAIN_EDIT
++             * (the top of the editor's view stack) we end co-run, giving
++             * the chain-edit target the "Back exits at top, navigates within"
++             * UX even though the tool opted out. Other targets (move_native)
++             * still rely on the tool's own exit gesture; only chain-edit gets
++             * the auto-exit-at-top because only shadow_ui can see its own
++             * view depth. */
+             if (d1 === MoveBack && d2 > 0 && coRunCedes(CORUN_GRP_BACK)) {
+                 if (coRunView !== VIEWS.CHAIN_EDIT) {
+                     runCoRunChainEdit(function() { handleBack(); });
+                     needsRedraw = true;
++                } else {
++                    if (typeof shadow_corun_end === "function") shadow_corun_end();
++                    coRunChainEditSlot = -1;
++                    coRunView = VIEWS.OVERTAKE_MODULE;
++                    needsRedraw = true;
+                 }
+                 return;
+             }
+-- 
+2.53.0
+
+From b813a933de4de17698b573af9771c86b2e9036a9 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Tue, 26 May 2026 09:40:21 -0400
+Subject: [PATCH] refactor(corun): keep_mask-driven LED strip for move_native
+ (was hardcoded)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Move-native LED strip in shadow_led_queue.c was hardcoded to a
+specific tool's needs — it stripped pads + every non-master CC Move
+sent during co-run, regardless of what the tool had actually declared
+in its keep_mask. That baked one consumer's keep set into the
+framework.
+
+Generalize: iterate Move's cable-0 CC / note-on / note-off LED writes,
+map each to a CORUN_GRP_* via the existing corun_group_for_event()
+helper, and strip iff the group is in the tool's keep_mask. Surfaces
+the tool cedes pass through naturally — Move's LEDs reach hardware
+for whatever it owns. Sysex LED writes (status 0xF0-0xF7) and
+unclassified events aren't group-mapped today, so they fall through
+unchanged; sysex specifically carries Move's palette colors for the
+knob rings + master (idx 71-79), which the framework intentionally
+leaves alone.
+
+Net effect: LED ownership now mirrors input routing (tool keeps a
+group = tool owns input AND LED; cedes = peer owns both). No tool can
+push a specific LED ownership policy onto the framework without
+declaring the corresponding keep_mask.
+
+docs/CORUN.md gets a short "LED ownership" subsection under the
+Move-firmware coupling discussion.
+---
+ docs/CORUN.md               | 36 +++++++++++++++++++++++++-----------
+ src/host/shadow_led_queue.c | 30 +++++++++++++-----------------
+ 2 files changed, 38 insertions(+), 28 deletions(-)
+
+diff --git a/docs/CORUN.md b/docs/CORUN.md
+index 9c82cb15..84dcdfc3 100644
+--- a/docs/CORUN.md
++++ b/docs/CORUN.md
+@@ -7,15 +7,17 @@ or while the Move firmware's native preset/synth editor takes its knobs.
+ 
+ Two co-run targets ship today:
+ 
+-| Target                    | Peer UI                  | Default cessions                                  |
+-| ------------------------- | ------------------------ | ------------------------------------------------- |
+-| `CORUN_TARGET_CHAIN_EDIT` | Schwung shadow_ui editor | OLED, jog, track buttons (tool keeps the rest)    |
+-| `CORUN_TARGET_MOVE_NATIVE`| Move firmware            | OLED, jog, track buttons, knobs (71-78), Shift, touch notes 0-9, master CC 79 |
+-
+-The default split is encoded as `CORUN_KEEP_DEFAULT = PADS | STEPS | TRANSPORT
+-| MENU` — the tool keeps those control-surface groups and cedes everything
+-else to the peer. Tools can override by passing an explicit `keep_mask` to
+-`shadow_corun_begin()`.
++| Target                    | Peer UI                                 |
++| ------------------------- | --------------------------------------- |
++| `CORUN_TARGET_CHAIN_EDIT` | Schwung shadow_ui's chain-slot editor   |
++| `CORUN_TARGET_MOVE_NATIVE`| Move firmware's native preset / synth editor |
++
++Both targets share the same default split, encoded as `CORUN_KEEP_DEFAULT =
++PADS | STEPS | TRANSPORT | MENU` — the tool keeps those control-surface
++groups and cedes everything else (OLED, jog, track buttons, knobs 71-78,
++master CC 79, Shift, touch notes 0-9) to the peer. Back is framework-reserved
++as the exit gesture by default; see [Exit gesture](#exit-gesture). Tools can
++override by passing an explicit `keep_mask` to `shadow_corun_begin()`.
+ 
+ ## Exit gesture
+ 
+@@ -74,8 +76,8 @@ shadow_corun_state()
+ 
+ Enum constants are registered as JS globals: `CORUN_TARGET_NONE`,
+ `CORUN_TARGET_CHAIN_EDIT`, `CORUN_TARGET_MOVE_NATIVE`, plus
+-`CORUN_GRP_OLED` ... `CORUN_GRP_TOUCH` and `CORUN_KEEP_DEFAULT` (matching
+-`shadow_constants.h`).
++`CORUN_GRP_OLED` ... `CORUN_GRP_TOUCH`, `CORUN_KEEP_DEFAULT`, and
++`CORUN_KEEP_BACK` (matching `shadow_constants.h`).
+ 
+ ### Capability gate
+ 
+@@ -122,6 +124,18 @@ characteristic worth documenting in the consumer's manual; pushing the
+ coalesce to multi-frame intervals trades knob latency for a problem most
+ tools won't hit.
+ 
++### LED ownership
++
++For symmetry with input routing, Move's LED writes are gated by `keep_mask`
++during `CORUN_TARGET_MOVE_NATIVE`: Move's outbound CC / note-on / note-off
++LED messages for any surface group the tool **keeps** (per `keep_mask`) are
++stripped before reaching hardware, so the tool's own LED rendering on those
++surfaces stays uncontested. Surfaces the tool **cedes** pass through —
++Move's LEDs reach the buttons / pads / knob rings directly. Sysex LED writes
++aren't classified by group and pass through unchanged; the framework leaves
++sysex (and the palette entries it carries for knob-ring + master colors,
++idx 71-79) alone.
++
+ ## Single source of truth
+ 
+ A single predicate, `corun_event_owner(ctrl, type, d1) -> {TOOL, PEER, BOTH,
+diff --git a/src/host/shadow_led_queue.c b/src/host/shadow_led_queue.c
+index 75929c10..c062f16b 100644
+--- a/src/host/shadow_led_queue.c
++++ b/src/host/shadow_led_queue.c
+@@ -372,28 +372,24 @@ void shadow_clear_move_leds_if_overtake(void) {
+     if (!cur_overtake) return;
+ 
+     /* Move-native co-run: the tool sets skip_led_clear=1 so Move's CC + sysex
+-     * LED writes pass through (track buttons, knob rings, master). But Move
+-     * also re-asserts the pad grid (note-on/off) and other native
+-     * button/transport CCs, which would clobber the surfaces the tool keeps.
+-     * Strip pads + track buttons + steps/transport CCs; leave sysex untouched
+-     * (knob-ring + master colors are sysex idx 71-79). Keep only the master
+-     * CC latch (79). Track buttons (40-43) are tool-owned in co-run — the
+-     * tool repaints them itself — so strip Move's track-button CC writes too;
+-     * we no longer surface Move's native track colors (they were unreliable
+-     * to cache/land). Runs BEFORE the skip_led_clear early-return so it
+-     * takes priority. */
++     * LED writes pass through (knob rings, master, track buttons, etc.). But
++     * Move also re-asserts the surfaces the tool keeps (per keep_mask), which
++     * would clobber the tool's own LED rendering. Strip Move's CC / note-on /
++     * note-off LED writes for any surface group the tool keeps; events the
++     * tool cedes pass through so Move's LEDs reach hardware. Sysex writes
++     * (status 0xF0-0xF7) and unclassified events aren't currently
++     * group-mapped and pass through unchanged — sysex carries knob-ring +
++     * master colors (palette idx 71-79) and the framework leaves those alone.
++     * Runs BEFORE the skip_led_clear early-return so it takes priority. */
+     if (corun_target(ctrl) == CORUN_TARGET_MOVE_NATIVE) {
++        uint16_t keep = corun_keep_mask_eff(ctrl->corun.keep_mask);
+         for (int i = 0; i < HW_MIDI_OUT_SIZE; i += 4) {
+             uint8_t cable = (midi_out[i] >> 4) & 0x0F;
+             if (cable != 0) continue;
+             uint8_t type = midi_out[i+1] & 0xF0;
+-            if (type == 0x90 || type == 0x80) {
+-                /* Move's pad LEDs (on via note-on, off via note-off) — tool keeps pads. */
+-                midi_out[i] = 0; midi_out[i+1] = 0; midi_out[i+2] = 0; midi_out[i+3] = 0;
+-            } else if (type == 0xB0) {
+-                uint8_t d1 = midi_out[i+2];
+-                if (d1 == 79) continue;  /* keep master; everything else tool-owned */
+-                /* Strip track buttons (40-43) + steps/transport/other native CCs. */
++            uint8_t d1 = midi_out[i+2];
++            uint16_t grp = corun_group_for_event(type, d1);
++            if (grp && (keep & grp)) {
+                 midi_out[i] = 0; midi_out[i+1] = 0; midi_out[i+2] = 0; midi_out[i+3] = 0;
+             }
+         }
+-- 
+2.53.0
+
+From 21c3382fc09fa36447c2a7110d48cb9412f8aacf Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Fri, 29 May 2026 20:18:43 -0400
+Subject: [PATCH] fix(corun): defensively clear corun state on all tool
+ teardown paths
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+shadow_corun_end() was only called from the in-editor Back-at-top
+handler. If a tool exited mid-corun via any other path (Shift+Back,
+suspend-evict, exitToolOvertake, hideToolOvertake), corun.target
+remained set in SHM with no tool loaded to clear it — the shadow UI
+locked into chain editor view with no escape.
+
+Add corunTeardown() helper (unconditional shadow_corun_end() + JS
+state reset) and call it at the top of all four teardown functions:
+exitOvertakeMode, suspendOvertakeMode, exitToolOvertake,
+hideToolOvertake. shadow_corun_end() is a no-op when corun is
+inactive, so the call is safe on every path.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index cacbf0cf..9af50877 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -3081,6 +3081,7 @@ let overtakeExitPending = false;
+ 
+ /* Exit overtake mode back to Move */
+ function exitOvertakeMode() {
++    corunTeardown();
+     /* Flush set state on the way out — defensive, since chain state is not
+      * edited during overtake, but keeps the invariant "all transitions
+      * persist state" honest. */
+@@ -3144,6 +3145,7 @@ function exitOvertakeMode() {
+ 
+ /* Suspend overtake mode — leave background processes running */
+ function suspendOvertakeMode() {
++    corunTeardown();
+     if (overtakeSuspendKeepsJs && overtakeModuleCallbacks && overtakeModuleId) {
+         debugLog("suspendOvertakeMode: suspend_keeps_js — parking " + overtakeModuleId + " in background");
+ 
+@@ -3311,6 +3313,7 @@ function resumeOvertakeModule(moduleId) {
+ 
+ /* Direct exit for interactive tools - skip LED clearing ceremony */
+ function exitToolOvertake() {
++    corunTeardown();
+     debugLog("exitToolOvertake: direct tool exit, nonOvertake=" + toolNonOvertake);
+ 
+     /* Let the module clean up before teardown. */
+@@ -3395,6 +3398,7 @@ function exitToolOvertake() {
+ 
+ /* Hide an interactive tool - exit overtake but keep DSP loaded */
+ function hideToolOvertake() {
++    corunTeardown();
+     debugLog("hideToolOvertake: hiding tool, keeping DSP");
+ 
+     /* Deactivate LED queue */
+@@ -14807,6 +14811,13 @@ globalThis.shadow_save_state_now = function() {
+     return true;
+ };
+ 
++function corunTeardown() {
++    if (typeof shadow_corun_end === "function") shadow_corun_end();
++    coRunChainEditSlot = -1;
++    coRunView = -1;
++    coRunKeepMask = 0;
++}
++
+ /* Co-run helpers — see coRunChainEditSlot / coRunView declarations near top.
+  *
+  * runCoRunChainEdit(fn): temporarily set the outer `view` to coRunView so any
+-- 
+2.53.0
+
+From 78975ee48a61ac0006b9ad7a1406a9e6c11ad12e Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Thu, 4 Jun 2026 18:19:04 -0400
+Subject: [PATCH] feat(corun): open preset-less no-hierarchy modules to a param
+ menu
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In co-run, opening a chain-slot sound generator that has no ui_hierarchy
+fell through to the simple preset browser (loadModuleUi is refused in
+co-run to avoid starving the active tool). With no presets that browser
+is a dead end — "No presets", no way to view or edit params.
+
+Synthesize a minimal one-level hierarchy from the module's chain_params
+and enter the (co-run-dispatched) hierarchy editor instead, so the user
+gets the module's real adjustable params with jog-select / push-edit /
+knob mapping. Editing resolves real min/max/type/options from
+hierEditorChainParams via getParamMetadata(), so the injected level only
+needs each param's key. Gated to co-run + the no-preset case: modules
+with presets keep the working preset browser; non-co-run paths and
+modules with a real ui_hierarchy are untouched.
+
+Verified on device: airplay (chain_params=[gain]) now opens to an
+editable "gain" + swap menu in co-run instead of dead-ending.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 65 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 8ddef642..2c0323f1 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -3956,6 +3956,26 @@ function getComponentChainParams(slot, componentKey) {
+     }
+ }
+ 
++/* Synthesize a minimal one-level ui_hierarchy from a component's chain_params
++ * so a module lacking a real ui_hierarchy still gets the full hierarchy param
++ * editor. Used in co-run (loadModuleUi is refused there, so a preset-less
++ * module would otherwise dead-end on the bare "No presets" browser). The level
++ * only needs each param's `key` — getParamMetadata() merges the real
++ * min/max/type/options from hierEditorChainParams at edit time. Returns null
++ * when there are no usable params (caller then keeps the preset-browser path). */
++function buildSynthHierarchyFromChainParams(chainParams) {
++    if (!Array.isArray(chainParams) || chainParams.length === 0) return null;
++    const params = [];
++    const knobs = [];
++    for (const p of chainParams) {
++        if (!p || !p.key) continue;
++        params.push({ key: p.key, label: p.name || p.label || p.key });
++        if (knobs.length < NUM_KNOBS) knobs.push(p.key);
++    }
++    if (params.length === 0) return null;
++    return { levels: { root: { label: "Parameters", params: params, knobs: knobs } } };
++}
++
+ /* Fetch ui_hierarchy from a component */
+ function getComponentHierarchy(slot, componentKey) {
+     const key = componentKey === "synth" ? "synth:ui_hierarchy" :
+@@ -8502,6 +8522,29 @@ function enterComponentEditFallback(slotIndex, componentKey) {
+         return;
+     }
+ 
++    /* CO-RUN: loadModuleUi is refused (it would overwrite globalThis.tick and
++     * starve the running tool), so a module with no ui_hierarchy would dead-end
++     * on the bare preset browser — and with NO presets there is nothing to show
++     * or edit. Before that, give the module its real param menu by synthesizing
++     * a hierarchy from its chain_params and entering the (co-run-dispatched)
++     * hierarchy editor. Gated to the no-preset case so preset-having modules
++     * keep the working preset browser; non-co-run paths are untouched. */
++    if (coRunChainEditSlot >= 0) {
++        const cPrefix = componentKey === "midiFx" ? "midi_fx1" : componentKey;
++        const cCountStr = getSlotParam(slotIndex, `${cPrefix}:preset_count`);
++        const cPresetCount = cCountStr ? parseInt(cCountStr) : 0;
++        if (cPresetCount <= 0) {
++            const synthHier = buildSynthHierarchyFromChainParams(
++                getComponentChainParams(slotIndex, componentKey));
++            debugLog(`enterComponentEditFallback: co-run no-preset synth=${componentKey} ` +
++                     `params=${synthHier ? synthHier.levels.root.params.length : 0}`);
++            if (synthHier) {
++                enterHierarchyEditorWith(slotIndex, componentKey, synthHier);
++                return;
++            }
++        }
++    }
++
+     /* Fall back to simple preset browser */
+     const prefix = componentKey === "midiFx" ? "midi_fx1" : componentKey;
+ 
+@@ -8532,7 +8575,8 @@ function enterComponentEditFallback(slotIndex, componentKey) {
+  * Hierarchy Editor - Generic parameter editing for plugins
+  * ============================================================ */
+ 
+-/* Enter hierarchy-based parameter editor for a component */
++/* Enter hierarchy-based parameter editor for a component. Fetches the
++ * component's real ui_hierarchy; falls back to the preset browser if absent. */
+ function enterHierarchyEditor(slotIndex, componentKey) {
+     const hierarchy = getComponentHierarchy(slotIndex, componentKey);
+     if (!hierarchy) {
+@@ -8540,6 +8584,25 @@ function enterHierarchyEditor(slotIndex, componentKey) {
+         enterComponentEditFallback(slotIndex, componentKey);
+         return;
+     }
++    enterHierarchyEditorWith(slotIndex, componentKey, hierarchy);
++}
++
++/* Enter the hierarchy editor with an explicit hierarchy object. Lets callers
++ * inject a SYNTHESIZED hierarchy (see buildSynthHierarchyFromChainParams) for a
++ * component that lacks a real ui_hierarchy — used in co-run, where loadModuleUi
++ * is refused so a preset-less module would otherwise dead-end on "No presets".
++ * Editing resolves real min/max/type/options from hierEditorChainParams via
++ * getParamMetadata(), so the injected level only needs each param's `key`.
++ * NOTE for future edits: a synthesized hierarchy has no preset level, so
++ * changeHierPreset() early-returns and the loading-transition re-fetch is
++ * guarded by `if (newHier)` — don't "fix" those guards to re-pull the
++ * hierarchy unconditionally or it would clobber the synthesized one with null. */
++function enterHierarchyEditorWith(slotIndex, componentKey, hierarchy) {
++    if (!hierarchy) {
++        /* No hierarchy - fall back to simple preset browser */
++        enterComponentEditFallback(slotIndex, componentKey);
++        return;
++    }
+ 
+     /* Dismiss any active overlay and clear pending knob state */
+     hideOverlay();
+-- 
+2.53.0
+
+From 4f032a53e3aaf0d3d193e1f473f9810e43fa5be6 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 15:02:16 -0400
+Subject: [PATCH] feat(corun): addressable-view registry + shadow_corun_entries
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index e7fabe6e..ed727dc0 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -316,6 +316,34 @@ const VIEWS = {
+     FX_BUS_PICKER: "fxbuspicker"              // Pick Master FX / Send A / Send B
+ };
+ 
++/* ==== CO-RUN VIEW ADDRESSING (begin) ==== */
++/* A curated registry of addressable Schwung screens a co-running tool may open
++ * as a temporary overlay over its co-run target, then return from. Tool + shadow_ui
++ * share one QuickJS globalThis, so the verbs are plain globals the tool calls
++ * directly. Display-owner / keep_mask SHM writes go through the C helper
++ * shadow_corun_overlay(active, keep_mask), which leaves corun.target untouched.
++ * Entries are curated and added deliberately — NEVER auto-derived from VIEWS. */
++const CORUN_ENTRIES = {
++    slots:           { enter: function() { view = VIEWS.SLOTS; } },
++    chain_editor:    { enter: function(a) { enterChainEdit((a && a.slot) | 0); } },
++    master_fx:       { enter: function() { enterMasterFxSettings(); } },
++    global_settings: { enter: function() { enterGlobalSettings(); } },
++};
++/* Fork-only catalog additions. Guarded on the enter-function so an upstream
++ * build that lacks the FX feature simply doesn't register the id, and tools
++ * gate on shadow_corun_entries(). */
++if (typeof enterFxBusPicker === 'function') {
++    CORUN_ENTRIES.fx_picker = { enter: function() { enterFxBusPicker(); } };
++}
++
++let corunOverlayId = null;       /* active overlay entry id, or null */
++let corunOverlayPrevMask = 0;    /* keep_mask to restore on close */
++
++globalThis.shadow_corun_entries = function() {
++    return Object.keys(CORUN_ENTRIES);
++};
++/* ==== CO-RUN VIEW ADDRESSING (end) ==== */
++
+ /* Special action key for swap module option */
+ const SWAP_MODULE_ACTION = "__swap_module__";
+ 
+-- 
+2.53.0
+
+From 1712248c217dba60d3681073ab354e7644e2afa9 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 15:06:40 -0400
+Subject: [PATCH] feat(corun): shadow_corun_overlay SHM helper (display owner +
+ keep_mask, target untouched)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/src/shadow/shadow_ui.c b/src/shadow/shadow_ui.c
+index 23c27a4b..678097e8 100644
+--- a/src/shadow/shadow_ui.c
++++ b/src/shadow/shadow_ui.c
+@@ -403,6 +403,31 @@ static JSValue js_shadow_corun_end(JSContext *ctx, JSValueConst this_val, int ar
+     return JS_UNDEFINED;
+ }
+ 
++/* shadow_corun_overlay(active, keep_mask) -> void
++ * Present (active=1) or dismiss (active=0) a shadow_ui view as a temporary
++ * overlay over the active co-run target. Sets keep_mask and flips OLED ownership
++ * WITHOUT touching corun.target, so the consumer tool's corun_state() view and
++ * its state machine stay put (no teardown). On dismiss the OLED returns to the
++ * underlay: Move firmware for a move_native underlay, shadow_ui otherwise. */
++static JSValue js_shadow_corun_overlay(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++    (void)this_val;
++    if (!shadow_control || argc < 2) return JS_UNDEFINED;
++    int active = 0, keep = 0;
++    if (JS_ToInt32(ctx, &active, argv[0])) return JS_UNDEFINED;
++    if (JS_ToInt32(ctx, &keep, argv[1])) return JS_UNDEFINED;
++    if (keep < 0 || keep > 0xFFFF) return JS_UNDEFINED;
++    shadow_control->corun.keep_mask = (uint16_t)keep;
++    if (active) {
++        shadow_control->shadow_display_owner = DISPLAY_OWNER_SCHWUNG_UI;
++    } else {
++        shadow_control->shadow_display_owner =
++            (shadow_control->corun.target == CORUN_TARGET_MOVE_NATIVE)
++                ? DISPLAY_OWNER_MOVE_FIRMWARE
++                : DISPLAY_OWNER_SCHWUNG_UI;
++    }
++    return JS_UNDEFINED;
++}
++
+ /* shadow_corun_state() -> { target, id, keep_mask } | null
+  * Returns null when no co-run is active, else the current state. Tools poll
+  * this each frame to detect framework-driven exit (Back press) and to
+@@ -3247,6 +3272,7 @@ static void init_javascript(JSRuntime **prt, JSContext **pctx) {
+     JS_SetPropertyStr(ctx, global_obj, "shadow_corun_begin", JS_NewCFunction(ctx, js_shadow_corun_begin, "shadow_corun_begin", 3));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_corun_end", JS_NewCFunction(ctx, js_shadow_corun_end, "shadow_corun_end", 0));
+     JS_SetPropertyStr(ctx, global_obj, "shadow_corun_state", JS_NewCFunction(ctx, js_shadow_corun_state, "shadow_corun_state", 0));
++    JS_SetPropertyStr(ctx, global_obj, "shadow_corun_overlay", JS_NewCFunction(ctx, js_shadow_corun_overlay, "shadow_corun_overlay", 2));
+     /* Co-run target enum (matches corun_target_t in shadow_constants.h). */
+     JS_SetPropertyStr(ctx, global_obj, "CORUN_TARGET_NONE",        JS_NewInt32(ctx, CORUN_TARGET_NONE));
+     JS_SetPropertyStr(ctx, global_obj, "CORUN_TARGET_CHAIN_EDIT",  JS_NewInt32(ctx, CORUN_TARGET_CHAIN_EDIT));
+-- 
+2.53.0
+
+From 7ea630cac9335d52367aca702a1ed34f3f3af79d Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 15:10:31 -0400
+Subject: [PATCH] feat(corun): shadow_corun_open/close overlay verbs
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index ed727dc0..9719491a 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -342,6 +342,27 @@ let corunOverlayPrevMask = 0;    /* keep_mask to restore on close */
+ globalThis.shadow_corun_entries = function() {
+     return Object.keys(CORUN_ENTRIES);
+ };
++
++globalThis.shadow_corun_open = function(id, keep_mask, args) {
++    const entry = CORUN_ENTRIES[id];
++    if (!entry) return false;
++    const st = (typeof shadow_corun_state === 'function') ? shadow_corun_state() : null;
++    corunOverlayPrevMask = st ? (st.keep_mask | 0) : 0;
++    corunOverlayId = id;
++    /* Flip OLED to shadow_ui + apply the overlay's keep_mask; corun.target stays
++     * put so the consumer tool's state machine is undisturbed. */
++    if (typeof shadow_corun_overlay === 'function') shadow_corun_overlay(1, keep_mask | 0);
++    entry.enter(args);
++    needsRedraw = true;
++    return true;
++};
++
++globalThis.shadow_corun_close = function() {
++    if (corunOverlayId == null) return;
++    corunOverlayId = null;
++    if (typeof shadow_corun_overlay === 'function') shadow_corun_overlay(0, corunOverlayPrevMask | 0);
++    needsRedraw = true;
++};
+ /* ==== CO-RUN VIEW ADDRESSING (end) ==== */
+ 
+ /* Special action key for swap module option */
+-- 
+2.53.0
+
+From 52496d184aff86a9a322bd7ea6953a39f1e052d9 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 15:13:48 -0400
+Subject: [PATCH] feat(corun): route overlay nav in dispatcher + FX_BUS_PICKER
+ Back closes overlay
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 35 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 9719491a..bcacd8ea 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -13650,7 +13650,11 @@ function handleBack() {
+             handleComponentParamsBack();
+             break;
+         case VIEWS.FX_BUS_PICKER:
+-            if (coRunChainEditSlot >= 0) {
++            if (corunOverlayId != null) {
++                /* Overlay over a co-run target → return to the underlay (e.g. the
++                 * Move synth screen) without changing corun.target. */
++                shadow_corun_close();
++            } else if (coRunChainEditSlot >= 0) {
+                 view = VIEWS.CHAIN_EDIT;
+                 coRunView = VIEWS.CHAIN_EDIT;
+             } else {
+@@ -17004,6 +17008,35 @@ globalThis.onMidiMessageInternal = function(data) {
+          * (PATCHES, COMPONENT_*, KNOB_*, etc.) Back navigates up within the
+          * editor; at CHAIN_EDIT (the top level) Back is silent so the tool's
+          * own exit gesture (e.g. Menu) takes over. */
++        /* Co-run view overlay: while an overlay is open over the tool's co-run
++         * target, shadow_ui owns the screen and the nav the tool ceded back to
++         * us (jog turn/click, Back). Route those into the active view. Back is
++         * dispatched through handleBack(), whose per-view top-level cases call
++         * shadow_corun_close() to return to the underlay (see FX_BUS_PICKER). */
++        if (corunOverlayId != null && (status & 0xF0) === 0xB0) {
++            if (d1 === MoveMainKnob) {
++                const delta = decodeDelta(d2);
++                if (delta !== 0) handleJog(delta);
++                needsRedraw = true;
++                return;
++            }
++            if (d1 === MoveMainButton && d2 > 0) {
++                if (hostShiftHeld) handleShiftSelect(); else handleSelect();
++                needsRedraw = true;
++                return;
++            }
++            if (d1 === MoveBack && d2 > 0) {
++                handleBack();
++                needsRedraw = true;
++                return;
++            }
++            /* Note/Session (CC 50) while the overlay is open also closes it. */
++            if (d1 === 50 && d2 > 0) {
++                shadow_corun_close();
++                needsRedraw = true;
++                return;
++            }
++        }
+         if (coRunChainEditSlot >= 0 && (status & 0xF0) === 0xB0) {
+             if (d1 === MoveMainKnob && coRunCedes(CORUN_GRP_JOG)) {
+                 const delta = decodeDelta(d2);
+-- 
+2.53.0
+
+From e9e9a700cac44275e9903d6ce62c27c082ccbf84 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 15:18:36 -0400
+Subject: [PATCH] fix(corun): let Back close overlay before suspend-keeps-js
+ guard
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index bcacd8ea..067b98e4 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -16988,8 +16988,9 @@ globalThis.onMidiMessageInternal = function(data) {
+         /* Back button handling for suspend_keeps_js modules — Wave Editor convention.
+          * Back alone: suspend (module parks in background, ticks continue).
+          * Shift+Back: full exit (unload module).
+-         * Skip while co-run is active: the chain editor claims Back. */
+-        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && coRunChainEditSlot < 0) {
++         * Skip while co-run is active (the chain editor claims Back) or while
++         * a co-run view overlay is open (Back closes the overlay below). */
++        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && coRunChainEditSlot < 0 && corunOverlayId == null) {
+             if (hostShiftHeld) {
+                 debugLog("HOST: Shift+Back → full exit (suspend_keeps_js module)");
+                 if (toolOvertakeActive) exitToolOvertake();
+@@ -17030,7 +17031,7 @@ globalThis.onMidiMessageInternal = function(data) {
+                 needsRedraw = true;
+                 return;
+             }
+-            /* Note/Session (CC 50) while the overlay is open also closes it. */
++            /* Menu (CC 50) while the overlay is open also closes it. */
+             if (d1 === 50 && d2 > 0) {
+                 shadow_corun_close();
+                 needsRedraw = true;
+-- 
+2.53.0
+
+From 5f4ca5b72eeb6a1dd18f452d5504f7c6189cb1bc Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 15:25:01 -0400
+Subject: [PATCH] docs(corun): view-addressing mechanism (registry +
+ open/close/entries)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ docs/CORUN.md | 110 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 110 insertions(+)
+
+diff --git a/docs/CORUN.md b/docs/CORUN.md
+index 84dcdfc3..d8349383 100644
+--- a/docs/CORUN.md
++++ b/docs/CORUN.md
+@@ -88,6 +88,116 @@ Schwung should gate the user-facing entry on the API's presence:
+ const corunAvailable = typeof shadow_corun_begin === "function";
+ ```
+ 
++## View addressing — overlays over a co-run target
++
++The two co-run *targets* above are fixed destinations a session points at for
++its whole lifetime. **View addressing** is a layer on top: while a co-run is
++active, a tool can ask Schwung to show one of its *other* screens — the FX
++picker, Global Settings, the slots list — as a temporary **overlay**, then
++return to the underlying target. The overlay borrows the OLED + the nav inputs
++it needs and hands them back on close; the co-run target itself is never
++changed, so the consumer tool's state machine is undisturbed.
++
++The mechanism is **view-agnostic and upstreamable**; the *catalog* of
++addressable screens varies per build (see [Catalog](#catalog) below).
++
++### The three verbs
++
++Defined on the global object in shadow_ui's JS runtime (same place as
++`shadow_corun_begin` et al.), since shadow_ui and the overtake tool share one
++QuickJS context:
++
++```js
++shadow_corun_entries()
++  // Returns an array of string ids this Schwung build can open as overlays.
++  // Discovery call: a tool reads this to learn the catalog and capability-gate
++  // its entry points, so build divergence (fork adds a screen) is a non-issue.
++
++shadow_corun_open(id, keep_mask, args)
++  // Open the registered screen `id` as an overlay over the current co-run
++  // target. Flips the OLED owner to SCHWUNG_UI and applies `keep_mask` (the nav
++  // groups the overlay needs — typically jog/click/Back/Menu) WITHOUT changing
++  // the co-run target, then runs the screen's enter-function. Returns false for
++  // an unknown id (graceful no-op). `args` is passed to the enter-function.
++
++shadow_corun_close()
++  // Dismiss the overlay: restore the underlay's display owner (e.g. MOVE_FIRMWARE
++  // for a Move-native underlay) and keep_mask. Back at the overlay's top level
++  // calls this.
++```
++
++`open`/`close` are pure JS reusing the existing screen enter-functions; the only
++C is one SHM helper, `shadow_corun_overlay(active, keep_mask)`, because JS can't
++write `shadow_control`'s display-owner / keep_mask fields directly.
++`shadow_corun_open` calls that helper, then invokes the entry's `enter(args)`.
++
++### The registry — `CORUN_ENTRIES`
++
++A curated table in `shadow_ui.js` mapping a stable string id to an existing
++screen enter-function:
++
++```js
++// id -> { enter: fn(args), keepDefault: <mask>, overlay: bool }
++const CORUN_ENTRIES = {
++  slots:           { enter: () => { view = VIEWS.SLOTS; }, ... },
++  chain_editor:    { enter: (a) => enterChainEdit(a.slot), ... },
++  master_fx:       { enter: () => enterMasterFxSettings(), ... },
++  global_settings: { enter: () => enterGlobalSettings(), ... },
++  // fork-only (registered in a fork-guarded block):
++  fx_picker:       { enter: () => enterFxBusPicker(), overlay: true, ... },
++};
++```
++
++Entries are added one reviewed item at a time — the registry is **never**
++auto-derived from the `VIEWS` enum. Most `VIEWS` entries are context-dependent
++sub-views or wizard steps that require preloaded state and are not addressable
++destinations; launchers (`tools` / `overtake_menu` / `store`) are deliberately
++excluded. Each enter-function establishes its own prerequisite state.
++
++### Overlay model
++
++While an overlay is open:
++
++- OLED owner = `SCHWUNG_UI`; shadow_ui draws the view.
++- The declared `keep_mask` keeps the overlay's nav inputs at the tool process,
++  where shadow_ui's `onMidi` gets first crack and routes them into the view
++  (extends the chain-edit intercept with an overlay-aware branch).
++- `corun.target` is **untouched** → the consumer tool still sees its original
++  target via `shadow_corun_state()` and does not run its teardown.
++- Back at the overlay's top level applies `shadow_corun_close()` semantics
++  (restore the underlay). Back gating keeps the framework's exit-on-Back from
++  ending the whole co-run while an overlay is up.
++
++This is what lets the FX picker open over a `MOVE_NATIVE` session and return to
++the same synth screen, and it generalizes to "any registered view, over any
++co-run target."
++
++### Catalog
++
++The mechanism is upstreamable; the registered screens differ by build:
++
++| | Upstream Schwung | dAVEBOx fork |
++|---|---|---|
++| Mechanism (`entries`/`open`/`close`, overlay, registry table) | ✅ ships it | same code |
++| Registered screens | `slots`, `chain_editor`, `master_fx`, `global_settings` | same **+ `fx_picker`** |
++
++Because tools discover the catalog at runtime via `shadow_corun_entries()`, a
++build lacking a screen simply doesn't expose that affordance — no breakage
++across the gap.
++
++### Consumer contract
++
++A tool that uses an overlay is expected to:
++
++- Discover availability with `shadow_corun_entries()` and capability-gate its
++  entry point on the id it wants (e.g. `'fx_picker'`).
++- Pass a `keep_mask` that keeps the overlay's nav group (jog/click, Back, Menu)
++  at the tool while the overlay is open — the first dAVEBOx consumer keeps the
++  jog group for the whole time the FX picker is up.
++- Leave its co-run target alone: opening/closing an overlay does not change
++  `shadow_corun_state()`, so the tool keeps pads/steps/transport throughout, the
++  same as ordinary chain-edit co-run.
++
+ ## Move-firmware coupling
+ 
+ `CORUN_TARGET_MOVE_NATIVE` runs as a pure shim-level split: Move firmware
+-- 
+2.53.0
+
+From 34585fb9e98a5bcccbf68996cc660e6a14c7c701 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 20:13:53 -0400
+Subject: [PATCH] fix(corun): restore underlay view on overlay close
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+shadow_corun_close restored display owner + keep_mask but not view, leaving it
+stuck at the overlay view (e.g. fxbuspicker). The dispatcher only delegates
+input to the tool when view is OVERTAKE_MODULE/MENU, so the tool went deaf
+after close — its exit gesture and picker-reopen both died. Capture the
+underlay view at open and restore it on close.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 067b98e4..1c822d18 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -338,6 +338,11 @@ if (typeof enterFxBusPicker === 'function') {
+ 
+ let corunOverlayId = null;       /* active overlay entry id, or null */
+ let corunOverlayPrevMask = 0;    /* keep_mask to restore on close */
++let corunOverlayPrevView = null; /* underlay view to restore on close (e.g.
++                                  * OVERTAKE_MODULE) — the dispatcher only
++                                  * delegates input to the tool when view is
++                                  * OVERTAKE_MODULE/MENU, so failing to restore
++                                  * it leaves the tool deaf after the overlay. */
+ 
+ globalThis.shadow_corun_entries = function() {
+     return Object.keys(CORUN_ENTRIES);
+@@ -348,6 +353,7 @@ globalThis.shadow_corun_open = function(id, keep_mask, args) {
+     if (!entry) return false;
+     const st = (typeof shadow_corun_state === 'function') ? shadow_corun_state() : null;
+     corunOverlayPrevMask = st ? (st.keep_mask | 0) : 0;
++    corunOverlayPrevView = view;   /* capture BEFORE entry.enter() changes it */
+     corunOverlayId = id;
+     /* Flip OLED to shadow_ui + apply the overlay's keep_mask; corun.target stays
+      * put so the consumer tool's state machine is undisturbed. */
+@@ -360,6 +366,10 @@ globalThis.shadow_corun_open = function(id, keep_mask, args) {
+ globalThis.shadow_corun_close = function() {
+     if (corunOverlayId == null) return;
+     corunOverlayId = null;
++    /* Restore the underlay view so the dispatcher resumes delegating input to
++     * the tool (it only does so for OVERTAKE_MODULE/MENU). Without this the tool
++     * goes deaf after the overlay closes — its exit gesture and reopen both die. */
++    if (corunOverlayPrevView != null) view = corunOverlayPrevView;
+     if (typeof shadow_corun_overlay === 'function') shadow_corun_overlay(0, corunOverlayPrevMask | 0);
+     needsRedraw = true;
+ };
+-- 
+2.53.0
+
+From 96381eb7015c959e608b224febb91655a03381f9 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 21:16:14 -0400
+Subject: [PATCH] refactor(corun): overlay reuses chain-edit dispatch
+ (coRunView), not a parallel router
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The FX-picker overlay over move-native set view=FX_BUS_PICKER directly, which took
+the unified co-run dispatch (gated view===OVERTAKE_MODULE) offline — so the tool
+stopped receiving pads/steps/transport and stopped painting its LEDs. Symptom
+fixes (Back-mask, view-restore) were patching one architectural divergence.
+
+Align the overlay with the proven chain-edit co-run mechanism:
+- coRunUiActive() = coRunChainEditSlot >= 0 || corunOverlayId != null; generalize
+  the draw wrap, knob wrap, suspend-Back guard, input intercept, and loadModuleUi
+  refuse to it.
+- shadow_corun_open keeps view=OVERTAKE_MODULE and runs the entry through
+  runCoRunChainEdit so its view change lands in coRunView (drawn by the co-run
+  path). Track corunOverlayRootView for Back-to-close.
+- coRunWants(grp): during an overlay the tool KEEPS jog/back (so they reach this
+  process); treat those nav groups as shadow_ui's regardless of cede status.
+- Branch Back (close overlay at root, never end co-run), CC50 (close), and track
+  buttons (skip) for the overlay case.
+- Per-frame reconcile clears overlay state when the tool ends co-run (Step 3 /
+  set change), handing the screen back to the tool.
+- Remove the hand-rolled Task-4 overlay router; revert the FX_BUS_PICKER Back
+  patch (overlay close now lives in the dispatch).
+
+Result: Step 3 exits co-run from anywhere + Step-3 LED persists, matching Schwung
+co-run, because the tool stays addressable underneath. Schwung co-run unchanged.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 138 ++++++++++++++++++++++------------------
+ 1 file changed, 76 insertions(+), 62 deletions(-)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 1c822d18..232d0d60 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -228,6 +228,13 @@ let overtakeJogDelta = 0;                             // Accumulated delta for j
+ let coRunChainEditSlot = -1;
+ let coRunView = -1;  // initialized to VIEWS.CHAIN_EDIT on first co-run entry
+ 
++/* True while shadow_ui is drawing a co-run screen over a still-running tool —
++ * either the chain editor (coRunChainEditSlot >= 0) or an addressed-view overlay
++ * over move-native (corunOverlayId != null, declared below). In BOTH, the outer
++ * `view` stays OVERTAKE_MODULE and coRunView holds the drawn screen, so the
++ * dispatcher keeps delegating pads/steps/transport + LEDs to the tool. */
++function coRunUiActive() { return coRunChainEditSlot >= 0 || corunOverlayId != null; }
++
+ /* Co-run control-surface groups — JS mirror of the canonical map in
+  * shadow_constants.h (corun_group_for_event). The tool declares which groups it
+  * KEEPS via shadow_corun_begin; the chain-edit intercept below routes a control
+@@ -245,6 +252,17 @@ function coRunCedes(grp) {
+     return grp !== 0 && (m & grp) === 0;
+ }
+ 
++/* Should shadow_ui's co-run intercept handle this control group?
++ *  - chain-edit: yes when the tool CEDES it (peer is shadow_ui, same process).
++ *  - overlay over move-native: the tool KEEPS its nav (jog/back) precisely so it
++ *    reaches this process instead of being suppressed to Move firmware — so
++ *    during an overlay, treat the nav groups as ours regardless of cede status.
++ * Groups the overlay does NOT keep (knobs/shift/track) are ceded to Move and
++ * never arrive here, so returning true for them is harmless. */
++function coRunWants(grp) {
++    return corunOverlayId != null ? true : coRunCedes(grp);
++}
++
+ /* Param-shim originals. When a chain module's UI is "loaded" (or when
+  * enterHierarchyEditor / setupModuleParamShims fires), the shadow_ui
+  * shims host_module_get_param / host_module_set_param so chain-editor
+@@ -336,13 +354,10 @@ if (typeof enterFxBusPicker === 'function') {
+     CORUN_ENTRIES.fx_picker = { enter: function() { enterFxBusPicker(); } };
+ }
+ 
+-let corunOverlayId = null;       /* active overlay entry id, or null */
+-let corunOverlayPrevMask = 0;    /* keep_mask to restore on close */
+-let corunOverlayPrevView = null; /* underlay view to restore on close (e.g.
+-                                  * OVERTAKE_MODULE) — the dispatcher only
+-                                  * delegates input to the tool when view is
+-                                  * OVERTAKE_MODULE/MENU, so failing to restore
+-                                  * it leaves the tool deaf after the overlay. */
++let corunOverlayId = null;        /* active overlay entry id, or null */
++let corunOverlayPrevMask = 0;     /* keep_mask to restore on close */
++let corunOverlayRootView = -1;    /* the entry's top-level view (e.g. FX_BUS_PICKER);
++                                   * Back at this view closes the overlay. */
+ 
+ globalThis.shadow_corun_entries = function() {
+     return Object.keys(CORUN_ENTRIES);
+@@ -353,12 +368,17 @@ globalThis.shadow_corun_open = function(id, keep_mask, args) {
+     if (!entry) return false;
+     const st = (typeof shadow_corun_state === 'function') ? shadow_corun_state() : null;
+     corunOverlayPrevMask = st ? (st.keep_mask | 0) : 0;
+-    corunOverlayPrevView = view;   /* capture BEFORE entry.enter() changes it */
+     corunOverlayId = id;
+     /* Flip OLED to shadow_ui + apply the overlay's keep_mask; corun.target stays
+      * put so the consumer tool's state machine is undisturbed. */
+     if (typeof shadow_corun_overlay === 'function') shadow_corun_overlay(1, keep_mask | 0);
+-    entry.enter(args);
++    /* Mirror chain-edit co-run: keep the outer view at OVERTAKE_MODULE (so the
++     * dispatcher keeps delegating pads/steps/transport + LEDs to the tool) and
++     * let the entry's view change land in coRunView, which the co-run draw path
++     * renders. runCoRunChainEdit captures view -> coRunView around the enter. */
++    coRunView = VIEWS.OVERTAKE_MODULE;
++    runCoRunChainEdit(function() { entry.enter(args); });
++    corunOverlayRootView = coRunView;
+     needsRedraw = true;
+     return true;
+ };
+@@ -366,10 +386,10 @@ globalThis.shadow_corun_open = function(id, keep_mask, args) {
+ globalThis.shadow_corun_close = function() {
+     if (corunOverlayId == null) return;
+     corunOverlayId = null;
+-    /* Restore the underlay view so the dispatcher resumes delegating input to
+-     * the tool (it only does so for OVERTAKE_MODULE/MENU). Without this the tool
+-     * goes deaf after the overlay closes — its exit gesture and reopen both die. */
+-    if (corunOverlayPrevView != null) view = corunOverlayPrevView;
++    corunOverlayRootView = -1;
++    coRunView = VIEWS.OVERTAKE_MODULE;
++    /* Restore the underlay's OLED owner + keep_mask. view never left
++     * OVERTAKE_MODULE, so the tool stayed addressable throughout the overlay. */
+     if (typeof shadow_corun_overlay === 'function') shadow_corun_overlay(0, corunOverlayPrevMask | 0);
+     needsRedraw = true;
+ };
+@@ -2770,7 +2790,7 @@ function loadModuleUi(slot, componentKey, moduleId) {
+      * (and onMidiMessageInternal), which silences the active tool. The caller
+      * (enterComponentEditFallback) falls back to the simple preset browser
+      * when this returns false — that path doesn't touch globals. */
+-    if (coRunChainEditSlot >= 0) {
++    if (coRunUiActive()) {
+         moduleUiLoadError = true;
+         return false;
+     }
+@@ -13660,11 +13680,7 @@ function handleBack() {
+             handleComponentParamsBack();
+             break;
+         case VIEWS.FX_BUS_PICKER:
+-            if (corunOverlayId != null) {
+-                /* Overlay over a co-run target → return to the underlay (e.g. the
+-                 * Move synth screen) without changing corun.target. */
+-                shadow_corun_close();
+-            } else if (coRunChainEditSlot >= 0) {
++            if (coRunChainEditSlot >= 0) {
+                 view = VIEWS.CHAIN_EDIT;
+                 coRunView = VIEWS.CHAIN_EDIT;
+             } else {
+@@ -16441,7 +16457,7 @@ globalThis.tick = function() {
+      * outer view is OVERTAKE_MODULE; wrap so getKnobContext (cache keyed on
+      * view) resolves against the chain editor's view and the accumulated knob
+      * delta isn't silently dropped under the wrong context. */
+-    if (coRunChainEditSlot >= 0) {
++    if (coRunUiActive()) {
+         runCoRunChainEdit(processPendingHierKnob);
+     } else {
+         processPendingHierKnob();
+@@ -16539,6 +16555,17 @@ globalThis.tick = function() {
+      * shadow_corun_state() returns null and we tear down the editor. */
+     if (typeof shadow_corun_state === "function") {
+         const _st = shadow_corun_state();
++        /* Overlay teardown: if the tool ended co-run (Step 3 / set change / any
++         * exit) while an addressed-view overlay was open, the framework already
++         * restored the display owner + keep_mask via shadow_corun_end(); clear
++         * the JS overlay state here so coRunUiActive() goes false and shadow_ui
++         * hands the screen back to the tool instead of stranding the overlay. */
++        if (corunOverlayId != null && !(_st && _st.target === CORUN_TARGET_MOVE_NATIVE)) {
++            corunOverlayId = null;
++            corunOverlayRootView = -1;
++            coRunView = VIEWS.OVERTAKE_MODULE;
++            needsRedraw = true;
++        }
+         const _slot = (_st && _st.target === CORUN_TARGET_CHAIN_EDIT) ? _st.id : -1;
+         coRunKeepMask = (_st && typeof _st.keep_mask === "number") ? (_st.keep_mask | 0) : 0;
+         if (_slot !== coRunChainEditSlot) {
+@@ -16793,7 +16820,7 @@ globalThis.tick = function() {
+                      * to OLED while coRunChainEditSlot >= 0 — but even if it
+                      * does, drawSlots() (and chain-edit subtree draws) start
+                      * with clear_screen() so the editor's pixels win. */
+-                    if (coRunChainEditSlot >= 0) {
++                    if (coRunUiActive()) {
+                         runCoRunChainEdit(dispatchCoRunDraw);
+                     }
+                 }
+@@ -17000,7 +17027,7 @@ globalThis.onMidiMessageInternal = function(data) {
+          * Shift+Back: full exit (unload module).
+          * Skip while co-run is active (the chain editor claims Back) or while
+          * a co-run view overlay is open (Back closes the overlay below). */
+-        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && coRunChainEditSlot < 0 && corunOverlayId == null) {
++        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && !coRunUiActive()) {
+             if (hostShiftHeld) {
+                 debugLog("HOST: Shift+Back → full exit (suspend_keeps_js module)");
+                 if (toolOvertakeActive) exitToolOvertake();
+@@ -17019,43 +17046,14 @@ globalThis.onMidiMessageInternal = function(data) {
+          * (PATCHES, COMPONENT_*, KNOB_*, etc.) Back navigates up within the
+          * editor; at CHAIN_EDIT (the top level) Back is silent so the tool's
+          * own exit gesture (e.g. Menu) takes over. */
+-        /* Co-run view overlay: while an overlay is open over the tool's co-run
+-         * target, shadow_ui owns the screen and the nav the tool ceded back to
+-         * us (jog turn/click, Back). Route those into the active view. Back is
+-         * dispatched through handleBack(), whose per-view top-level cases call
+-         * shadow_corun_close() to return to the underlay (see FX_BUS_PICKER). */
+-        if (corunOverlayId != null && (status & 0xF0) === 0xB0) {
+-            if (d1 === MoveMainKnob) {
+-                const delta = decodeDelta(d2);
+-                if (delta !== 0) handleJog(delta);
+-                needsRedraw = true;
+-                return;
+-            }
+-            if (d1 === MoveMainButton && d2 > 0) {
+-                if (hostShiftHeld) handleShiftSelect(); else handleSelect();
+-                needsRedraw = true;
+-                return;
+-            }
+-            if (d1 === MoveBack && d2 > 0) {
+-                handleBack();
+-                needsRedraw = true;
+-                return;
+-            }
+-            /* Menu (CC 50) while the overlay is open also closes it. */
+-            if (d1 === 50 && d2 > 0) {
+-                shadow_corun_close();
+-                needsRedraw = true;
+-                return;
+-            }
+-        }
+-        if (coRunChainEditSlot >= 0 && (status & 0xF0) === 0xB0) {
+-            if (d1 === MoveMainKnob && coRunCedes(CORUN_GRP_JOG)) {
++        if (coRunUiActive() && (status & 0xF0) === 0xB0) {
++            if (d1 === MoveMainKnob && coRunWants(CORUN_GRP_JOG)) {
+                 const delta = decodeDelta(d2);
+                 if (delta !== 0) runCoRunChainEdit(function() { handleJog(delta); });
+                 needsRedraw = true;
+                 return;
+             }
+-            if (d1 === MoveMainButton && d2 > 0 && coRunCedes(CORUN_GRP_JOG)) {
++            if (d1 === MoveMainButton && d2 > 0 && coRunWants(CORUN_GRP_JOG)) {
+                 /* Mirror the non-overtake Shift+Click handler (line ~15259):
+                  * Shift+Click in CHAIN_EDIT → handleShiftSelect (enter
+                  * component edit). Plain Click → handleSelect. */
+@@ -17082,16 +17080,24 @@ globalThis.onMidiMessageInternal = function(data) {
+              * still rely on the tool's own exit gesture; only chain-edit gets
+              * the auto-exit-at-top because only shadow_ui can see its own
+              * view depth. */
+-            if (d1 === MoveBack && d2 > 0 && coRunCedes(CORUN_GRP_BACK)) {
+-                if (coRunView !== VIEWS.CHAIN_EDIT) {
++            if (d1 === MoveBack && d2 > 0 && coRunWants(CORUN_GRP_BACK)) {
++                if (corunOverlayId != null) {
++                    /* Overlay over move-native: pop within the addressed view;
++                     * at the overlay's root (e.g. FX_BUS_PICKER) close it to
++                     * return to the synth — never end co-run (Step 3 does that). */
++                    if (coRunView === corunOverlayRootView) {
++                        shadow_corun_close();
++                    } else {
++                        runCoRunChainEdit(function() { handleBack(); });
++                    }
++                } else if (coRunView !== VIEWS.CHAIN_EDIT) {
+                     runCoRunChainEdit(function() { handleBack(); });
+-                    needsRedraw = true;
+                 } else {
+                     if (typeof shadow_corun_end === "function") shadow_corun_end();
+                     coRunChainEditSlot = -1;
+                     coRunView = VIEWS.OVERTAKE_MODULE;
+-                    needsRedraw = true;
+                 }
++                needsRedraw = true;
+                 return;
+             }
+             /* Shift (CC 49): give it ONLY to the chain editor. hostShiftHeld
+@@ -17103,15 +17109,23 @@ globalThis.onMidiMessageInternal = function(data) {
+                 needsRedraw = true;
+                 return;
+             }
+-            /* Menu (CC 50): open FX bus picker during co-run */
++            /* Menu (CC 50): chain-edit opens the FX bus picker; an overlay
++             * closes (returns to the synth). */
+             if (d1 === 50 && d2 > 0) {
+-                coRunView = VIEWS.FX_BUS_PICKER;
+-                runCoRunChainEdit(function() { enterFxBusPicker(); });
++                if (corunOverlayId != null) {
++                    shadow_corun_close();
++                } else {
++                    coRunView = VIEWS.FX_BUS_PICKER;
++                    runCoRunChainEdit(function() { enterFxBusPicker(); });
++                }
+                 needsRedraw = true;
+                 return;
+             }
+-            /* Track buttons: CC 43=Track 1 (slot 0), CC 40=Track 4 (slot 3) */
++            /* Track buttons: CC 43=Track 1 (slot 0), CC 40=Track 4 (slot 3).
++             * Chain-edit only — an overlay has no chain slot; swallow so a stray
++             * track press can't flip it into chain-edit co-run. */
+             if (d1 >= 40 && d1 <= 43 && d2 > 0 && coRunCedes(CORUN_GRP_TRACK_BUTTONS)) {
++                if (corunOverlayId != null) { needsRedraw = true; return; }
+                 const _slot = 43 - d1;
+                 if (_slot >= 0 && _slot < SHADOW_UI_SLOTS && _slot !== coRunChainEditSlot) {
+                     coRunChainEditSlot = _slot;
+-- 
+2.53.0
+
+From 33c5229e4671949c962cd4ce0f785317a86c499a Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 21:19:17 -0400
+Subject: [PATCH] =?UTF-8?q?docs(corun):=20overlay=20reuses=20chain-edit=20?=
+ =?UTF-8?q?dispatch=20(coRunView)=20=E2=80=94=20final=20model?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ docs/CORUN.md | 31 ++++++++++++++++++++++---------
+ 1 file changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/docs/CORUN.md b/docs/CORUN.md
+index d8349383..35c9df8c 100644
+--- a/docs/CORUN.md
++++ b/docs/CORUN.md
+@@ -156,17 +156,30 @@ excluded. Each enter-function establishes its own prerequisite state.
+ 
+ ### Overlay model
+ 
+-While an overlay is open:
+-
+-- OLED owner = `SCHWUNG_UI`; shadow_ui draws the view.
+-- The declared `keep_mask` keeps the overlay's nav inputs at the tool process,
+-  where shadow_ui's `onMidi` gets first crack and routes them into the view
+-  (extends the chain-edit intercept with an overlay-aware branch).
++An overlay **reuses the chain-edit co-run dispatch** — it does not run a parallel
++router. While an overlay is open:
++
++- The outer `view` stays `OVERTAKE_MODULE`; the addressed screen lives in
++  `coRunView` (the entry's view change is captured by `runCoRunChainEdit`).
++  Keeping `view` at `OVERTAKE_MODULE` is what keeps the tool addressable: the
++  unified co-run dispatch (gated `view === OVERTAKE_MODULE`) keeps delegating
++  pads/steps/transport to the tool, so the tool's own gestures (e.g. Step 3 to
++  exit) and its LED painting keep working — for free, exactly as in chain-edit.
++- OLED owner = `SCHWUNG_UI`; the co-run draw path renders `coRunView`.
++- `coRunUiActive() = coRunChainEditSlot >= 0 || corunOverlayId != null` gates the
++  draw/knob/Back-guard/intercept; `coRunWants(grp)` lets the intercept fire for
++  the overlay's **kept** nav groups (jog/back), which `coRunCedes` would reject.
++- The declared `keep_mask` keeps the overlay's nav (jog + Back) at the tool
++  process so shadow_ui's intercept receives them; the consumer must keep both
++  `CORUN_GRP_JOG` and `CORUN_GRP_BACK` (the *routing* group, distinct from the
++  `CORUN_KEEP_BACK` framework-exit opt-out).
+ - `corun.target` is **untouched** → the consumer tool still sees its original
+   target via `shadow_corun_state()` and does not run its teardown.
+-- Back at the overlay's top level applies `shadow_corun_close()` semantics
+-  (restore the underlay). Back gating keeps the framework's exit-on-Back from
+-  ending the whole co-run while an overlay is up.
++- Back at the overlay's root (`corunOverlayRootView`) calls `shadow_corun_close()`
++  (restore the underlay); deeper Back pops within the view. CC 50 also closes.
++- If the tool **ends** co-run while an overlay is open (its own exit gesture, or
++  a set change), the per-frame `shadow_corun_state()` reconcile clears the overlay
++  state so the screen hands back to the tool instead of stranding the view.
+ 
+ This is what lets the FX picker open over a `MOVE_NATIVE` session and return to
+ the same synth screen, and it generalizes to "any registered view, over any
+-- 
+2.53.0
+
+From b6df6effe9447a054a59a0ac57cb7b996d678d55 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 22:13:19 -0400
+Subject: [PATCH] feat(corun): uniform coRunWants() for all UI-element
+ intercept guards
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Generalize the co-run intercept so which control groups an overlay/editor owns is
+driven solely by the tool's keep_mask, with no per-element special-casing.
+coRunWants(grp) now = (overlay ? KEEPS : CEDES) — the keep-based predicate is the
+overlay analogue of chain-edit's cede-based one. Apply it to every guard (jog,
+back, knobs, shift, track, knob-touch), and generalize the knob-touch note gate
+to coRunUiActive(). A tool enables FX-knob editing in an overlay just by keeping
+CORUN_GRP_KNOBS (+ TOUCH for the param pop-up). Chain-edit unchanged (corunOverlayId
+null → coRunWants == coRunCedes).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 30 +++++++++++++++++-------------
+ 1 file changed, 17 insertions(+), 13 deletions(-)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 232d0d60..f8a94b85 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -252,15 +252,19 @@ function coRunCedes(grp) {
+     return grp !== 0 && (m & grp) === 0;
+ }
+ 
+-/* Should shadow_ui's co-run intercept handle this control group?
+- *  - chain-edit: yes when the tool CEDES it (peer is shadow_ui, same process).
+- *  - overlay over move-native: the tool KEEPS its nav (jog/back) precisely so it
+- *    reaches this process instead of being suppressed to Move firmware — so
+- *    during an overlay, treat the nav groups as ours regardless of cede status.
+- * Groups the overlay does NOT keep (knobs/shift/track) are ceded to Move and
+- * never arrive here, so returning true for them is harmless. */
++/* Should shadow_ui's co-run intercept handle this control group? ONE uniform
++ * rule for every UI element — which elements an overlay/editor owns is driven
++ * purely by the tool's keep_mask, with no per-element special-casing:
++ *  - chain-edit: handle it when the tool CEDES it (peer is shadow_ui, same
++ *    process, so ceded events arrive here).
++ *  - overlay over move-native: handle it when the tool KEEPS it — the tool keeps
++ *    exactly the UI elements it wants the overlay to drive (kept events reach
++ *    this process; ceded ones go to Move firmware instead). So "keeps" is the
++ *    overlay's analogue of chain-edit's "cedes".
++ * A tool therefore enables, e.g., FX-knob editing in an overlay simply by
++ * keeping CORUN_GRP_KNOBS — no FX-specific code here. */
+ function coRunWants(grp) {
+-    return corunOverlayId != null ? true : coRunCedes(grp);
++    return corunOverlayId != null ? !coRunCedes(grp) : coRunCedes(grp);
+ }
+ 
+ /* Param-shim originals. When a chain module's UI is "loaded" (or when
+@@ -17105,7 +17109,7 @@ globalThis.onMidiMessageInternal = function(data) {
+              * the editor's isShiftHeld()-based code paths see the right state.
+              * Eating it here prevents the tool from reacting (e.g. its own
+              * Shift+button shortcuts while you're navigating the editor). */
+-            if (d1 === 49 && coRunCedes(CORUN_GRP_SHIFT)) {
++            if (d1 === 49 && coRunWants(CORUN_GRP_SHIFT)) {
+                 needsRedraw = true;
+                 return;
+             }
+@@ -17124,7 +17128,7 @@ globalThis.onMidiMessageInternal = function(data) {
+             /* Track buttons: CC 43=Track 1 (slot 0), CC 40=Track 4 (slot 3).
+              * Chain-edit only — an overlay has no chain slot; swallow so a stray
+              * track press can't flip it into chain-edit co-run. */
+-            if (d1 >= 40 && d1 <= 43 && d2 > 0 && coRunCedes(CORUN_GRP_TRACK_BUTTONS)) {
++            if (d1 >= 40 && d1 <= 43 && d2 > 0 && coRunWants(CORUN_GRP_TRACK_BUTTONS)) {
+                 if (corunOverlayId != null) { needsRedraw = true; return; }
+                 const _slot = 43 - d1;
+                 if (_slot >= 0 && _slot < SHADOW_UI_SLOTS && _slot !== coRunChainEditSlot) {
+@@ -17147,7 +17151,7 @@ globalThis.onMidiMessageInternal = function(data) {
+              * before the tool knob-accumulation below, so the tool no longer
+              * receives knob turns while co-run is active. Knob TOUCH notes still
+              * forward to the tool — intentional turn-only split. */
+-            if (d1 >= KNOB_CC_START && d1 <= KNOB_CC_END && coRunCedes(CORUN_GRP_KNOBS)) {
++            if (d1 >= KNOB_CC_START && d1 <= KNOB_CC_END && coRunWants(CORUN_GRP_KNOBS)) {
+                 const _kIdx = d1 - KNOB_CC_START;
+                 const _kDelta = decodeDelta(d2);
+                 if (_kDelta !== 0) {
+@@ -17185,8 +17189,8 @@ globalThis.onMidiMessageInternal = function(data) {
+          * notes pre-change; keeping that avoids a stranded knobTouched on exit).
+          * Release drains BOTH the hierarchy (pendingHierKnob) and slot-global
+          * (pendingKnob) paths, which is what actually clears the value popup. */
+-        if (coRunChainEditSlot >= 0 && (status & 0xF0) === MidiNoteOn &&
+-                d1 >= MoveKnob1Touch && d1 <= MoveKnob8Touch && coRunCedes(CORUN_GRP_TOUCH)) {
++        if (coRunUiActive() && (status & 0xF0) === MidiNoteOn &&
++                d1 >= MoveKnob1Touch && d1 <= MoveKnob8Touch && coRunWants(CORUN_GRP_TOUCH)) {
+             const _tk = d1 - MoveKnob1Touch;
+             if (d2 > 0) {
+                 runCoRunChainEdit(function() {
+-- 
+2.53.0
+

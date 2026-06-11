@@ -1,0 +1,147 @@
+From b813a933de4de17698b573af9771c86b2e9036a9 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Tue, 26 May 2026 09:40:21 -0400
+Subject: [PATCH] refactor(corun): keep_mask-driven LED strip for move_native
+ (was hardcoded)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Move-native LED strip in shadow_led_queue.c was hardcoded to a
+specific tool's needs — it stripped pads + every non-master CC Move
+sent during co-run, regardless of what the tool had actually declared
+in its keep_mask. That baked one consumer's keep set into the
+framework.
+
+Generalize: iterate Move's cable-0 CC / note-on / note-off LED writes,
+map each to a CORUN_GRP_* via the existing corun_group_for_event()
+helper, and strip iff the group is in the tool's keep_mask. Surfaces
+the tool cedes pass through naturally — Move's LEDs reach hardware
+for whatever it owns. Sysex LED writes (status 0xF0-0xF7) and
+unclassified events aren't group-mapped today, so they fall through
+unchanged; sysex specifically carries Move's palette colors for the
+knob rings + master (idx 71-79), which the framework intentionally
+leaves alone.
+
+Net effect: LED ownership now mirrors input routing (tool keeps a
+group = tool owns input AND LED; cedes = peer owns both). No tool can
+push a specific LED ownership policy onto the framework without
+declaring the corresponding keep_mask.
+
+docs/CORUN.md gets a short "LED ownership" subsection under the
+Move-firmware coupling discussion.
+---
+ docs/CORUN.md               | 36 +++++++++++++++++++++++++-----------
+ src/host/shadow_led_queue.c | 30 +++++++++++++-----------------
+ 2 files changed, 38 insertions(+), 28 deletions(-)
+
+diff --git a/docs/CORUN.md b/docs/CORUN.md
+index 9c82cb15..84dcdfc3 100644
+--- a/docs/CORUN.md
++++ b/docs/CORUN.md
+@@ -7,15 +7,17 @@ or while the Move firmware's native preset/synth editor takes its knobs.
+ 
+ Two co-run targets ship today:
+ 
+-| Target                    | Peer UI                  | Default cessions                                  |
+-| ------------------------- | ------------------------ | ------------------------------------------------- |
+-| `CORUN_TARGET_CHAIN_EDIT` | Schwung shadow_ui editor | OLED, jog, track buttons (tool keeps the rest)    |
+-| `CORUN_TARGET_MOVE_NATIVE`| Move firmware            | OLED, jog, track buttons, knobs (71-78), Shift, touch notes 0-9, master CC 79 |
+-
+-The default split is encoded as `CORUN_KEEP_DEFAULT = PADS | STEPS | TRANSPORT
+-| MENU` — the tool keeps those control-surface groups and cedes everything
+-else to the peer. Tools can override by passing an explicit `keep_mask` to
+-`shadow_corun_begin()`.
++| Target                    | Peer UI                                 |
++| ------------------------- | --------------------------------------- |
++| `CORUN_TARGET_CHAIN_EDIT` | Schwung shadow_ui's chain-slot editor   |
++| `CORUN_TARGET_MOVE_NATIVE`| Move firmware's native preset / synth editor |
++
++Both targets share the same default split, encoded as `CORUN_KEEP_DEFAULT =
++PADS | STEPS | TRANSPORT | MENU` — the tool keeps those control-surface
++groups and cedes everything else (OLED, jog, track buttons, knobs 71-78,
++master CC 79, Shift, touch notes 0-9) to the peer. Back is framework-reserved
++as the exit gesture by default; see [Exit gesture](#exit-gesture). Tools can
++override by passing an explicit `keep_mask` to `shadow_corun_begin()`.
+ 
+ ## Exit gesture
+ 
+@@ -74,8 +76,8 @@ shadow_corun_state()
+ 
+ Enum constants are registered as JS globals: `CORUN_TARGET_NONE`,
+ `CORUN_TARGET_CHAIN_EDIT`, `CORUN_TARGET_MOVE_NATIVE`, plus
+-`CORUN_GRP_OLED` ... `CORUN_GRP_TOUCH` and `CORUN_KEEP_DEFAULT` (matching
+-`shadow_constants.h`).
++`CORUN_GRP_OLED` ... `CORUN_GRP_TOUCH`, `CORUN_KEEP_DEFAULT`, and
++`CORUN_KEEP_BACK` (matching `shadow_constants.h`).
+ 
+ ### Capability gate
+ 
+@@ -122,6 +124,18 @@ characteristic worth documenting in the consumer's manual; pushing the
+ coalesce to multi-frame intervals trades knob latency for a problem most
+ tools won't hit.
+ 
++### LED ownership
++
++For symmetry with input routing, Move's LED writes are gated by `keep_mask`
++during `CORUN_TARGET_MOVE_NATIVE`: Move's outbound CC / note-on / note-off
++LED messages for any surface group the tool **keeps** (per `keep_mask`) are
++stripped before reaching hardware, so the tool's own LED rendering on those
++surfaces stays uncontested. Surfaces the tool **cedes** pass through —
++Move's LEDs reach the buttons / pads / knob rings directly. Sysex LED writes
++aren't classified by group and pass through unchanged; the framework leaves
++sysex (and the palette entries it carries for knob-ring + master colors,
++idx 71-79) alone.
++
+ ## Single source of truth
+ 
+ A single predicate, `corun_event_owner(ctrl, type, d1) -> {TOOL, PEER, BOTH,
+diff --git a/src/host/shadow_led_queue.c b/src/host/shadow_led_queue.c
+index 75929c10..c062f16b 100644
+--- a/src/host/shadow_led_queue.c
++++ b/src/host/shadow_led_queue.c
+@@ -372,28 +372,24 @@ void shadow_clear_move_leds_if_overtake(void) {
+     if (!cur_overtake) return;
+ 
+     /* Move-native co-run: the tool sets skip_led_clear=1 so Move's CC + sysex
+-     * LED writes pass through (track buttons, knob rings, master). But Move
+-     * also re-asserts the pad grid (note-on/off) and other native
+-     * button/transport CCs, which would clobber the surfaces the tool keeps.
+-     * Strip pads + track buttons + steps/transport CCs; leave sysex untouched
+-     * (knob-ring + master colors are sysex idx 71-79). Keep only the master
+-     * CC latch (79). Track buttons (40-43) are tool-owned in co-run — the
+-     * tool repaints them itself — so strip Move's track-button CC writes too;
+-     * we no longer surface Move's native track colors (they were unreliable
+-     * to cache/land). Runs BEFORE the skip_led_clear early-return so it
+-     * takes priority. */
++     * LED writes pass through (knob rings, master, track buttons, etc.). But
++     * Move also re-asserts the surfaces the tool keeps (per keep_mask), which
++     * would clobber the tool's own LED rendering. Strip Move's CC / note-on /
++     * note-off LED writes for any surface group the tool keeps; events the
++     * tool cedes pass through so Move's LEDs reach hardware. Sysex writes
++     * (status 0xF0-0xF7) and unclassified events aren't currently
++     * group-mapped and pass through unchanged — sysex carries knob-ring +
++     * master colors (palette idx 71-79) and the framework leaves those alone.
++     * Runs BEFORE the skip_led_clear early-return so it takes priority. */
+     if (corun_target(ctrl) == CORUN_TARGET_MOVE_NATIVE) {
++        uint16_t keep = corun_keep_mask_eff(ctrl->corun.keep_mask);
+         for (int i = 0; i < HW_MIDI_OUT_SIZE; i += 4) {
+             uint8_t cable = (midi_out[i] >> 4) & 0x0F;
+             if (cable != 0) continue;
+             uint8_t type = midi_out[i+1] & 0xF0;
+-            if (type == 0x90 || type == 0x80) {
+-                /* Move's pad LEDs (on via note-on, off via note-off) — tool keeps pads. */
+-                midi_out[i] = 0; midi_out[i+1] = 0; midi_out[i+2] = 0; midi_out[i+3] = 0;
+-            } else if (type == 0xB0) {
+-                uint8_t d1 = midi_out[i+2];
+-                if (d1 == 79) continue;  /* keep master; everything else tool-owned */
+-                /* Strip track buttons (40-43) + steps/transport/other native CCs. */
++            uint8_t d1 = midi_out[i+2];
++            uint16_t grp = corun_group_for_event(type, d1);
++            if (grp && (keep & grp)) {
+                 midi_out[i] = 0; midi_out[i+1] = 0; midi_out[i+2] = 0; midi_out[i+3] = 0;
+             }
+         }
+-- 
+2.53.0
+

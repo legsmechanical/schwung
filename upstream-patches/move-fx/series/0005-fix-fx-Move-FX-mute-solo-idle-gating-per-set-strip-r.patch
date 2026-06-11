@@ -1,0 +1,194 @@
+From baff3258736b0592f5d8fdf3dfd3777a7e21b1c0 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 11:27:28 -0400
+Subject: [PATCH] fix(fx): Move FX mute/solo, idle gating, per-set strip reset
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review fixes for the Move-track strips feature:
+
+- Move FX strip now obeys the channel's mute/solo via a new
+  shadow_slot_active_gain() helper (was mixing at raw strip volume, so
+  Mute+Track / solo had no effect on a peeled Move track).
+- Wire the previously-unused shadow_move_fx_has_fx() in: when no FX is
+  loaded, skip the memcpy + FX loop and mix straight from la_cache.
+- Relocate the Move FX block ahead of the synth block and relax the synth
+  idle gate to (!have_move_track || !route_to_synth) — an idle synth with
+  Move>Slot off no longer runs its FX chain on silence, and the idle-continue
+  can't skip the (now-earlier) Move FX block. Mixing is additive so order is
+  unchanged.
+- restoreMoveFxFromFiles applies all strip levels every restore, defaulting
+  to unity/no-send when the meta file is absent, so a new set no longer
+  inherits the prior set's Move FX levels (shim strips are global, never reset).
+
+(Review finding "drawMasterFxModuleSelect hardcodes master components" was a
+false positive — it reads ctx.MASTER_FX_CHAIN_COMPONENTS, a getter returning
+activeFxBus.components; the shadow_ui.js:9502 sibling is gated to the master bus.)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/host/shadow_chain_mgmt.h | 10 +++++
+ src/schwung_shim.c           | 72 +++++++++++++++++++++---------------
+ src/shadow/shadow_ui.js      | 26 ++++++++-----
+ 3 files changed, 68 insertions(+), 40 deletions(-)
+
+diff --git a/src/host/shadow_chain_mgmt.h b/src/host/shadow_chain_mgmt.h
+index ccef8390..4d930684 100644
+--- a/src/host/shadow_chain_mgmt.h
++++ b/src/host/shadow_chain_mgmt.h
+@@ -167,6 +167,16 @@ static inline float shadow_effective_volume(int slot) {
+     return shadow_chain_slots[slot].volume;
+ }
+ 
++/* Mute/solo gate (0.0 or 1.0) independent of slot volume. The Move FX strip
++ * carries its own volume but should still obey the channel's mute/solo like
++ * every other audio path. Solo wins over mute, matching shadow_effective_volume. */
++static inline float shadow_slot_active_gain(int slot) {
++    if (shadow_solo_count > 0) {
++        return shadow_chain_slots[slot].soloed ? 1.0f : 0.0f;
++    }
++    return shadow_chain_slots[slot].muted ? 0.0f : 1.0f;
++}
++
+ /* Advance the fade envelope by one sample. Call once per stereo frame in mix loop. */
+ static inline void shadow_fade_advance(int slot) {
+     slot_fade_t *f = &shadow_chain_slots[slot].fade;
+diff --git a/src/schwung_shim.c b/src/schwung_shim.c
+index db864c97..5f6aac72 100644
+--- a/src/schwung_shim.c
++++ b/src/schwung_shim.c
+@@ -2118,10 +2118,50 @@ static void shadow_inprocess_mix_from_buffer(void) {
+                                shadow_chain_slots[s].instance &&
+                                shadow_slot_deferred_valid[s]);
+ 
++            /* Move FX slot: when Move>Slot is off, the channel's Move track is
++             * routed through its own ≤MOVE_FX_BLOCKS insert FX chain (independent
++             * of the synth on this channel), then mixed to the master at the
++             * strip's volume and tapped into the global Send A/B buses. Runs
++             * regardless of whether a synth is loaded on the slot, and BEFORE the
++             * synth block so the synth's idle-continue below can't skip it.
++             * Mixing is additive, so order doesn't change the sum. */
++            if (!route_to_synth && have_move_track && s < MOVE_FX_SLOTS) {
++                /* Skip the copy + FX loop entirely when no FX is loaded — the
++                 * track then mixes straight from la_cache (read-only). */
++                const int16_t *msrc = move_track;
++                int16_t mbuf[FRAMES_PER_BLOCK * 2];
++                if (shadow_move_fx_has_fx(s)) {
++                    memcpy(mbuf, move_track, sizeof(mbuf));
++                    for (int b = 0; b < MOVE_FX_BLOCKS; b++) {
++                        master_fx_slot_t *mf = &shadow_move_fx_slots[s][b];
++                        if (!(mf->instance && mf->api && mf->api->process_block)) continue;
++                        if (mf->bypassed) continue;
++                        mf->api->process_block(mf->instance, mbuf, FRAMES_PER_BLOCK);
++                    }
++                    msrc = mbuf;
++                }
++                /* Strip volume × the channel's mute/solo gate (not the synth
++                 * slot volume — the Move FX strip has its own level). */
++                float mvol = shadow_move_fx_strip[s].volume * shadow_slot_active_gain(s);
++                for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
++                    int32_t scaled = (int32_t)lroundf((float)msrc[i] * mvol);
++                    int32_t mixed = (int32_t)mailbox_audio[i] + scaled;
++                    if (mixed > 32767) mixed = 32767;
++                    if (mixed < -32768) mixed = -32768;
++                    mailbox_audio[i] = (int16_t)mixed;
++                    me_full[i]  += scaled;
++                    me_unity[i] += scaled;
++                }
++                accumulate_sends_ex(msrc, mvol, shadow_move_fx_strip[s].send_a,
++                                    shadow_move_fx_strip[s].send_b, send_accum);
++            }
++
+             if (slot_active) {
+                 /* Phase 2 idle gate: skip FX when synth AND FX output are silent
+-                 * AND no Link Audio track data is flowing for this slot */
+-                if (shadow_slot_fx_idle[s] && shadow_slot_idle[s] && !have_move_track) continue;
++                 * AND either no Link Audio track is flowing OR it's been peeled to
++                 * the Move FX slot (handled above), so the synth has nothing to do. */
++                if (shadow_slot_fx_idle[s] && shadow_slot_idle[s] &&
++                    (!have_move_track || !route_to_synth)) continue;
+ 
+                 /* Latency comp: delay the local synth output to match the
+                  * Link Audio path before combining. The nudge in
+@@ -2317,34 +2357,6 @@ static void shadow_inprocess_mix_from_buffer(void) {
+                     ps->write_pos = wp;
+                 }
+             }
+-
+-            /* Move FX slot: when Move>Slot is off, the channel's Move track is
+-             * routed through its own ≤MOVE_FX_BLOCKS insert FX chain (independent
+-             * of the synth on this channel), then mixed to the master at the
+-             * strip's volume and tapped into the global Send A/B buses. Runs
+-             * regardless of whether a synth is loaded on the slot. */
+-            if (!route_to_synth && have_move_track && s < MOVE_FX_SLOTS) {
+-                int16_t mbuf[FRAMES_PER_BLOCK * 2];
+-                memcpy(mbuf, move_track, sizeof(mbuf));
+-                for (int b = 0; b < MOVE_FX_BLOCKS; b++) {
+-                    master_fx_slot_t *mf = &shadow_move_fx_slots[s][b];
+-                    if (!(mf->instance && mf->api && mf->api->process_block)) continue;
+-                    if (mf->bypassed) continue;
+-                    mf->api->process_block(mf->instance, mbuf, FRAMES_PER_BLOCK);
+-                }
+-                float mvol = shadow_move_fx_strip[s].volume;
+-                for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+-                    int32_t scaled = (int32_t)lroundf((float)mbuf[i] * mvol);
+-                    int32_t mixed = (int32_t)mailbox_audio[i] + scaled;
+-                    if (mixed > 32767) mixed = 32767;
+-                    if (mixed < -32768) mixed = -32768;
+-                    mailbox_audio[i] = (int16_t)mixed;
+-                    me_full[i]  += scaled;
+-                    me_unity[i] += scaled;
+-                }
+-                accumulate_sends_ex(mbuf, mvol, shadow_move_fx_strip[s].send_a,
+-                                    shadow_move_fx_strip[s].send_b, send_accum);
+-            }
+         }
+ 
+     }
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 863c1a9a..e7fabe6e 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -7030,22 +7030,28 @@ function restoreMoveFxFromFiles() {
+                 if (data.bypassed) shadow_set_param(0, key + ":bypassed", "1");
+             }
+         }
+-        /* Restore per-slot strip levels (missing → leave shim defaults). */
++        /* Restore per-slot strip levels. Apply ALL slots every time, defaulting
++         * to unity / no-send when the meta file or a slot entry is absent. The
++         * shim's shadow_move_fx_strip[] is global and never reset on set change,
++         * so a new/older set with no meta would otherwise inherit the previous
++         * set's Move FX levels — explicitly writing defaults here resets them. */
++        let moveStrips = null;
+         try {
+             const raw = host_read_file(activeSlotStateDir + "/move_fx_meta.json");
+             if (raw) {
+                 const meta = JSON.parse(raw);
+-                if (meta && Array.isArray(meta.strips)) {
+-                    for (let sl = 0; sl < meta.strips.length && sl < MOVE_FX_SLOTS_JS; sl++) {
+-                        const st = meta.strips[sl];
+-                        if (!st) continue;
+-                        if (typeof st.volume === "number") shadow_set_param(0, "move_fx:" + (sl + 1) + ":volume", st.volume.toFixed(3));
+-                        if (typeof st.send_a === "number") shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_a", st.send_a.toFixed(3));
+-                        if (typeof st.send_b === "number") shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_b", st.send_b.toFixed(3));
+-                    }
+-                }
++                if (meta && Array.isArray(meta.strips)) moveStrips = meta.strips;
+             }
+         } catch (e) {}
++        for (let sl = 0; sl < MOVE_FX_SLOTS_JS; sl++) {
++            const st = (moveStrips && moveStrips[sl]) ? moveStrips[sl] : null;
++            const vol = (st && typeof st.volume === "number") ? st.volume : 1.0;
++            const sa  = (st && typeof st.send_a === "number") ? st.send_a : 0.0;
++            const sb  = (st && typeof st.send_b === "number") ? st.send_b : 0.0;
++            shadow_set_param(0, "move_fx:" + (sl + 1) + ":volume", vol.toFixed(3));
++            shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_a", sa.toFixed(3));
++            shadow_set_param(0, "move_fx:" + (sl + 1) + ":send_b", sb.toFixed(3));
++        }
+     } catch (e) {
+         debugLog("restoreMoveFxFromFiles error: " + e);
+     }
+-- 
+2.53.0
+

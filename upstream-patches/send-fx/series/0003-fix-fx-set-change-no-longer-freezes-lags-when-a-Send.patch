@@ -1,7 +1,7 @@
-From e3aa8dfcae2f7d85a90d08ec7f304f15158fc151 Mon Sep 17 00:00:00 2001
+From 17648598329e6b553dea800290d4c6e372ec4c4e Mon Sep 17 00:00:00 2001
 From: legsmechanical <joshgaine@gmail.com>
 Date: Thu, 4 Jun 2026 00:12:06 -0400
-Subject: [PATCH 3/8] fix(fx): set-change no longer freezes/lags when a Send FX
+Subject: [PATCH] fix(fx): set-change no longer freezes/lags when a Send FX
  editor was open
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -31,10 +31,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  1 file changed, 17 insertions(+), 1 deletion(-)
 
 diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
-index 152c66f7..49ef7c73 100644
+index c972d7a1..e9f74698 100644
 --- a/src/shadow/shadow_ui.js
 +++ b/src/shadow/shadow_ui.js
-@@ -15553,7 +15553,23 @@ globalThis.tick = function() {
+@@ -15580,7 +15580,23 @@ globalThis.tick = function() {
               * overwrite the freshly-written slot files */
              autosaveSuppressUntil = 150; /* ~5 seconds at 30fps */
  

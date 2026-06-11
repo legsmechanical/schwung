@@ -1,7 +1,7 @@
-From 4880b6f28b9878ee0d9a353419ad4347855b2331 Mon Sep 17 00:00:00 2001
+From 8022b35f0afc7eeb12bc0a193db0ae384dc207a6 Mon Sep 17 00:00:00 2001
 From: legsmechanical <joshgaine@gmail.com>
 Date: Thu, 4 Jun 2026 10:01:46 -0400
-Subject: [PATCH 5/8] feat(fx): send FX per-set auto-persist + editor fixes
+Subject: [PATCH] feat(fx): send FX per-set auto-persist + editor fixes
 
 UI side of send FX Phase 2:
 - Per-set auto-persist: saveSendFxChainConfig/restoreSendFxFromFiles write and
@@ -22,10 +22,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  1 file changed, 186 insertions(+), 13 deletions(-)
 
 diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
-index 49ef7c73..5ce6b6ce 100644
+index e9f74698..c7ffc81f 100644
 --- a/src/shadow/shadow_ui.js
 +++ b/src/shadow/shadow_ui.js
-@@ -6183,10 +6183,9 @@ function applyMasterFxModuleSelection() {
+@@ -6185,10 +6185,9 @@ function applyMasterFxModuleSelection() {
  
  /* Save master FX chain configuration */
  function saveMasterFxChainConfig() {
@@ -39,7 +39,7 @@ index 49ef7c73..5ce6b6ce 100644
      /* The shim persists the state, but we also save to shadow config */
      try {
          const configPath = "/data/UserData/schwung/shadow_config.json";
-@@ -6719,6 +6718,140 @@ function loadMasterFxChainFromConfig() {
+@@ -6721,6 +6720,140 @@ function loadMasterFxChainFromConfig() {
      }
  }
  
@@ -180,7 +180,7 @@ index 49ef7c73..5ce6b6ce 100644
  /* Enter chain editing view for a slot */
  function enterChainEdit(slotIndex) {
      selectedSlot = slotIndex;
-@@ -8550,15 +8683,18 @@ function enterSendFxHierarchyEditor(bus, fxSlot) {
+@@ -8552,15 +8685,18 @@ function enterSendFxHierarchyEditor(bus, fxSlot) {
      hierEditorSelectedIdx = 0;
      hierEditorEditMode = false;
      resetHierarchyEditState();
@@ -206,7 +206,7 @@ index 49ef7c73..5ce6b6ce 100644
  
      setupModuleParamShims(0, compKey);
      loadHierarchyLevel();
-@@ -12214,7 +12350,16 @@ function handleSelect() {
+@@ -12241,7 +12377,16 @@ function handleSelect() {
                              }
                          } else {
                              const busIdx = (activeFxBus.id === "sendB") ? 1 : 0;
@@ -224,7 +224,7 @@ index 49ef7c73..5ce6b6ce 100644
                          }
                      } else {
                          /* No module loaded - enter module selection */
-@@ -13095,7 +13240,11 @@ function handleBack() {
+@@ -13122,7 +13267,11 @@ function handleBack() {
                  view = VIEWS.CHAIN_EDIT;
                  coRunView = VIEWS.CHAIN_EDIT;
              } else {
@@ -237,7 +237,7 @@ index 49ef7c73..5ce6b6ce 100644
              }
              break;
          case VIEWS.MASTER_FX:
-@@ -14957,6 +15106,8 @@ globalThis.init = function() {
+@@ -14984,6 +15133,8 @@ globalThis.init = function() {
      }
      /* Re-apply Master FX sync after activeSlotStateDir resolves to the active set. */
      loadMasterFxChainFromConfig();
@@ -246,7 +246,7 @@ index 49ef7c73..5ce6b6ce 100644
  
      /* Sync dirty cache and slot names from autosave files (shim loaded them on startup) */
      for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
-@@ -15071,6 +15222,7 @@ globalThis.init = function() {
+@@ -15098,6 +15249,7 @@ globalThis.init = function() {
  globalThis.shadow_save_state_now = function() {
      autosaveAllSlots();
      saveMasterFxChainConfig();
@@ -254,7 +254,7 @@ index 49ef7c73..5ce6b6ce 100644
      /* Also persist volumes/channels/mute/solo — otherwise the set's
       * shadow_chain_config.json drifts from slot_N.json across reboots,
       * e.g. toggling MPE (recv=All) before shutdown would revert on boot. */
-@@ -15467,6 +15619,16 @@ globalThis.tick = function() {
+@@ -15494,6 +15646,16 @@ globalThis.tick = function() {
                          const mfx = host_read_file(copySourceDir + "/master_fx_" + i + ".json");
                          if (mfx) host_write_file(newDir + "/master_fx_" + i + ".json", mfx);
                      }
@@ -271,7 +271,7 @@ index 49ef7c73..5ce6b6ce 100644
                      /* Also copy chain config */
                      const chainCfg = host_read_file(copySourceDir + "/shadow_chain_config.json");
                      if (chainCfg) host_write_file(newDir + "/shadow_chain_config.json", chainCfg);
-@@ -15477,6 +15639,12 @@ globalThis.tick = function() {
+@@ -15504,6 +15666,12 @@ globalThis.tick = function() {
                          host_write_file(newDir + "/slot_" + i + ".json", "{}\n");
                          host_write_file(newDir + "/master_fx_" + i + ".json", "{}\n");
                      }
@@ -284,7 +284,7 @@ index 49ef7c73..5ce6b6ce 100644
                      /* Seed a default chain config so receive channels reset to
                       * per-track defaults (Ch 1-4). Without this, the upcoming
                       * loadChainConfigFromDir silently bails and the shim's
-@@ -15615,6 +15783,11 @@ globalThis.tick = function() {
+@@ -15642,6 +15810,11 @@ globalThis.tick = function() {
                  }
                  debugLog("SET_CHANGED: MFX " + mfxi + " -> " + (mfxModuleId || "(none)"));
              }

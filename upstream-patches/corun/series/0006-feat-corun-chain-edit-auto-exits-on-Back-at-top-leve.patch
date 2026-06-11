@@ -1,0 +1,96 @@
+From 7af5a1c552ca24c39e3833e8d0a8e151236b14e5 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Tue, 26 May 2026 09:17:14 -0400
+Subject: [PATCH] feat(corun): chain-edit auto-exits on Back at top-level view
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Refines the CORUN_KEEP_BACK opt-out for CORUN_TARGET_CHAIN_EDIT
+specifically. The chain editor lives inside shadow_ui (same process
+as the framework dispatch) and owns its own view stack, so shadow_ui
+can tell when the editor is at its top-level CHAIN_EDIT view vs.
+deeper inside (component edit, patches, hierarchy, etc.).
+
+shadow_ui's Back handler now:
+- in sub-views: handleBack() to pop one level
+- at CHAIN_EDIT (top): calls shadow_corun_end() itself
+
+This gives the chain-edit target the original "Back exits at top,
+navigates within" UX you described in review, even though the tool
+opted out of the framework's broader Back-reservation. Move-native
+keeps the opt-out semantic (Back goes to Move firmware, tool exits
+via its own gesture) because Move's UI depth isn't observable from
+the framework side.
+
+No tool-side changes required — dAVEBOx's pollDSP picks up
+target=NONE on the next frame and runs its existing exit cleanup
+when shadow_ui ends the session.
+---
+ docs/CORUN.md           | 11 ++++++++---
+ src/shadow/shadow_ui.js | 23 ++++++++++++++++-------
+ 2 files changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/docs/CORUN.md b/docs/CORUN.md
+index e0c42047..9c82cb15 100644
+--- a/docs/CORUN.md
++++ b/docs/CORUN.md
+@@ -40,9 +40,14 @@ shadow_corun_begin(CORUN_TARGET_CHAIN_EDIT, slot,
+ 
+ When this bit is set, the framework leaves Back alone: Back routes per the
+ normal `keep_mask` rules (cedes to peer unless `CORUN_GRP_BACK` is also kept).
+-The tool is then responsible for providing its own exit gesture and calling
+-`shadow_corun_end()` itself; `menu` is the obvious choice since it's
+-tool-routed under the default keep-mask.
++For `CORUN_TARGET_CHAIN_EDIT`, shadow_ui's own Back handler still ends the
++session when the chain editor is at its top-level view (`CHAIN_EDIT`) — it
++owns the view stack and can tell, so it provides Charles's "Back exits at
++top, navigates within" UX for free even under the opt-out. For other
++targets like `CORUN_TARGET_MOVE_NATIVE`, the peer UI's depth isn't
++observable from the framework, so the tool is responsible for its own
++exit gesture (typically Menu, which is tool-routed under the default
++keep-mask) and for calling `shadow_corun_end()` itself.
+ 
+ `CORUN_KEEP_BACK` lives in the high half of `keep_mask` (bit 15) so it doesn't
+ collide with any `CORUN_GRP_*` bit.
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 6d1872a2..cacbf0cf 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -16107,17 +16107,26 @@ globalThis.onMidiMessageInternal = function(data) {
+                 needsRedraw = true;
+                 return;
+             }
+-            /* Back during co-run: framework-reserved as exit gesture UNLESS
+-             * the tool set CORUN_KEEP_BACK in its keep_mask (opts out of the
+-             * framework auto-exit so its peer UI can use Back for sub-view
+-             * pop). The chain editor's deeper views call handleBack(); at
+-             * CHAIN_EDIT (the top level) we eat the event silently — the
+-             * tool provides its own exit gesture (typically Menu, which is
+-             * tool-routed under the default keep-mask). */
++            /* Back during co-run: framework-reserved as exit gesture by
++             * default. When the tool sets CORUN_KEEP_BACK in keep_mask (opts
++             * out of the framework auto-exit so its peer UI can use Back for
++             * sub-view nav), the chain editor handles Back itself —
++             * deeper views call handleBack() to pop one level; at CHAIN_EDIT
++             * (the top of the editor's view stack) we end co-run, giving
++             * the chain-edit target the "Back exits at top, navigates within"
++             * UX even though the tool opted out. Other targets (move_native)
++             * still rely on the tool's own exit gesture; only chain-edit gets
++             * the auto-exit-at-top because only shadow_ui can see its own
++             * view depth. */
+             if (d1 === MoveBack && d2 > 0 && coRunCedes(CORUN_GRP_BACK)) {
+                 if (coRunView !== VIEWS.CHAIN_EDIT) {
+                     runCoRunChainEdit(function() { handleBack(); });
+                     needsRedraw = true;
++                } else {
++                    if (typeof shadow_corun_end === "function") shadow_corun_end();
++                    coRunChainEditSlot = -1;
++                    coRunView = VIEWS.OVERTAKE_MODULE;
++                    needsRedraw = true;
+                 }
+                 return;
+             }
+-- 
+2.53.0
+

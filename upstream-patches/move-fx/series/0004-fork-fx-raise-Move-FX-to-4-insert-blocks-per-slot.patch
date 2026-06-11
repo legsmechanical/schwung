@@ -1,0 +1,49 @@
+From ab5ec6da334e6caf417e6c75e63c6507fe69db43 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Tue, 9 Jun 2026 23:41:17 -0400
+Subject: [PATCH] fork(fx): raise Move FX to 4 insert blocks per slot
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Daily-driver fork build only — bumps MOVE_FX_BLOCKS (C) and MOVE_FX_BLOCKS_JS
+(shadow_ui.js) from 2 to 4. Kept as a separate commit so the cherry-picked
+feature (08172e31) stays identical to the upstream 2-block version for future
+syncs. The generic fxN parser, loaders, persistence, and UI already scale to
+the count, so this is the only change needed.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/host/shadow_chain_mgmt.h | 2 +-
+ src/shadow/shadow_ui.js      | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/host/shadow_chain_mgmt.h b/src/host/shadow_chain_mgmt.h
+index 65b07832..ccef8390 100644
+--- a/src/host/shadow_chain_mgmt.h
++++ b/src/host/shadow_chain_mgmt.h
+@@ -22,7 +22,7 @@
+ #define SEND_BUS_COUNT 2
+ #define SEND_FX_SLOTS  4
+ #define MOVE_FX_SLOTS  4   /* one Move FX mini-bus per Move track / channel */
+-#define MOVE_FX_BLOCKS 2   /* up to 2 insert FX per Move FX slot */
++#define MOVE_FX_BLOCKS 4   /* up to 4 insert FX per Move FX slot (fork daily-driver build) */
+ #define SHADOW_CHAIN_MODULE_DIR "/data/UserData/schwung/modules/chain"
+ #define SHADOW_CHAIN_DSP_PATH "/data/UserData/schwung/modules/chain/dsp.so"
+ 
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index efbe861b..863c1a9a 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -855,7 +855,7 @@ let currentMasterFxPath = ""; // Full path to currently loaded DSP
+  * the fork raises both together (e.g. to 4). Defined here (above FX_BUS) because
+  * the Move FX bus descriptors are built from them just below. */
+ const MOVE_FX_SLOTS_JS = 4;
+-const MOVE_FX_BLOCKS_JS = 2;
++const MOVE_FX_BLOCKS_JS = 4;
+ 
+ /* Master FX chain components (4 FX slots + settings) */
+ const MASTER_FX_CHAIN_COMPONENTS = [
+-- 
+2.53.0
+

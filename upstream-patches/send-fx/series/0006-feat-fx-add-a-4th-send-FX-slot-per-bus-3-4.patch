@@ -1,7 +1,7 @@
-From cd8ff4ea815a1b24af57bffcbd7ffac8b17f182a Mon Sep 17 00:00:00 2001
+From 70715d3af231771906e4039cbad3943aed834a34 Mon Sep 17 00:00:00 2001
 From: legsmechanical <joshgaine@gmail.com>
 Date: Thu, 4 Jun 2026 10:11:39 -0400
-Subject: [PATCH 6/8] feat(fx): add a 4th send FX slot per bus (3 -> 4)
+Subject: [PATCH] feat(fx): add a 4th send FX slot per bus (3 -> 4)
 
 Brings sends to parity with Master FX (4 slots). The design was already
 parameterized, so this is mechanical:
@@ -23,7 +23,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  4 files changed, 15 insertions(+), 9 deletions(-)
 
 diff --git a/src/host/shadow_chain_mgmt.c b/src/host/shadow_chain_mgmt.c
-index 98271225..7452b40d 100644
+index abc32417..9fbeb0f4 100644
 --- a/src/host/shadow_chain_mgmt.c
 +++ b/src/host/shadow_chain_mgmt.c
 @@ -1884,6 +1884,7 @@ void shadow_direct_set_param(uint8_t slot, const char *key, const char *value) {
@@ -34,7 +34,7 @@ index 98271225..7452b40d 100644
          if (sfx_slot < 0) return;
  
          master_fx_slot_t *sfx = &shadow_send_fx_slots[bus][sfx_slot];
-@@ -2865,6 +2866,7 @@ void shadow_inprocess_handle_param_request(void) {
+@@ -2866,6 +2867,7 @@ void shadow_inprocess_handle_param_request(void) {
          if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
          else if (strncmp(rest, "fx2:", 4) == 0) { sfx_slot = 1; rest += 4; }
          else if (strncmp(rest, "fx3:", 4) == 0) { sfx_slot = 2; rest += 4; }
@@ -87,7 +87,7 @@ index 11425917..992d2ff9 100644
  
  static int save_send_preset(int bus, const char *json_str) {
 diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
-index 5ce6b6ce..89cd3f24 100644
+index c7ffc81f..be1c5415 100644
 --- a/src/shadow/shadow_ui.js
 +++ b/src/shadow/shadow_ui.js
 @@ -873,13 +873,15 @@ const SEND_FX_COMPONENTS_A = [
@@ -126,7 +126,7 @@ index 5ce6b6ce..89cd3f24 100644
          volumeKey: "send_fx:b:return_level", components: SEND_FX_COMPONENTS_B,
          presetPickerTitle: "Send FX B Presets",
          presetJsonRoot: "send_fx",
-@@ -6731,7 +6733,7 @@ function loadMasterFxChainFromConfig() {
+@@ -6733,7 +6735,7 @@ function loadMasterFxChainFromConfig() {
   * to call regardless of which FX editor is open. JS-only — the Phase-1
   * send GET/SET handlers already forward :state/:chain_params/params. */
  const SEND_FX_BUSES = ["a", "b"];

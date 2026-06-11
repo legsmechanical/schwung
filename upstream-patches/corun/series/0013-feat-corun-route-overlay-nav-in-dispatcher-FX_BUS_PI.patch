@@ -1,0 +1,67 @@
+From 52496d184aff86a9a322bd7ea6953a39f1e052d9 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 15:13:48 -0400
+Subject: [PATCH] feat(corun): route overlay nav in dispatcher + FX_BUS_PICKER
+ Back closes overlay
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 35 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 9719491a..bcacd8ea 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -13650,7 +13650,11 @@ function handleBack() {
+             handleComponentParamsBack();
+             break;
+         case VIEWS.FX_BUS_PICKER:
+-            if (coRunChainEditSlot >= 0) {
++            if (corunOverlayId != null) {
++                /* Overlay over a co-run target → return to the underlay (e.g. the
++                 * Move synth screen) without changing corun.target. */
++                shadow_corun_close();
++            } else if (coRunChainEditSlot >= 0) {
+                 view = VIEWS.CHAIN_EDIT;
+                 coRunView = VIEWS.CHAIN_EDIT;
+             } else {
+@@ -17004,6 +17008,35 @@ globalThis.onMidiMessageInternal = function(data) {
+          * (PATCHES, COMPONENT_*, KNOB_*, etc.) Back navigates up within the
+          * editor; at CHAIN_EDIT (the top level) Back is silent so the tool's
+          * own exit gesture (e.g. Menu) takes over. */
++        /* Co-run view overlay: while an overlay is open over the tool's co-run
++         * target, shadow_ui owns the screen and the nav the tool ceded back to
++         * us (jog turn/click, Back). Route those into the active view. Back is
++         * dispatched through handleBack(), whose per-view top-level cases call
++         * shadow_corun_close() to return to the underlay (see FX_BUS_PICKER). */
++        if (corunOverlayId != null && (status & 0xF0) === 0xB0) {
++            if (d1 === MoveMainKnob) {
++                const delta = decodeDelta(d2);
++                if (delta !== 0) handleJog(delta);
++                needsRedraw = true;
++                return;
++            }
++            if (d1 === MoveMainButton && d2 > 0) {
++                if (hostShiftHeld) handleShiftSelect(); else handleSelect();
++                needsRedraw = true;
++                return;
++            }
++            if (d1 === MoveBack && d2 > 0) {
++                handleBack();
++                needsRedraw = true;
++                return;
++            }
++            /* Note/Session (CC 50) while the overlay is open also closes it. */
++            if (d1 === 50 && d2 > 0) {
++                shadow_corun_close();
++                needsRedraw = true;
++                return;
++            }
++        }
+         if (coRunChainEditSlot >= 0 && (status & 0xF0) === 0xB0) {
+             if (d1 === MoveMainKnob && coRunCedes(CORUN_GRP_JOG)) {
+                 const delta = decodeDelta(d2);
+-- 
+2.53.0
+

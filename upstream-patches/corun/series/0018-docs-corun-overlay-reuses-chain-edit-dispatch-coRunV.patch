@@ -1,0 +1,61 @@
+From 33c5229e4671949c962cd4ce0f785317a86c499a Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 21:19:17 -0400
+Subject: [PATCH] =?UTF-8?q?docs(corun):=20overlay=20reuses=20chain-edit=20?=
+ =?UTF-8?q?dispatch=20(coRunView)=20=E2=80=94=20final=20model?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ docs/CORUN.md | 31 ++++++++++++++++++++++---------
+ 1 file changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/docs/CORUN.md b/docs/CORUN.md
+index d8349383..35c9df8c 100644
+--- a/docs/CORUN.md
++++ b/docs/CORUN.md
+@@ -156,17 +156,30 @@ excluded. Each enter-function establishes its own prerequisite state.
+ 
+ ### Overlay model
+ 
+-While an overlay is open:
+-
+-- OLED owner = `SCHWUNG_UI`; shadow_ui draws the view.
+-- The declared `keep_mask` keeps the overlay's nav inputs at the tool process,
+-  where shadow_ui's `onMidi` gets first crack and routes them into the view
+-  (extends the chain-edit intercept with an overlay-aware branch).
++An overlay **reuses the chain-edit co-run dispatch** — it does not run a parallel
++router. While an overlay is open:
++
++- The outer `view` stays `OVERTAKE_MODULE`; the addressed screen lives in
++  `coRunView` (the entry's view change is captured by `runCoRunChainEdit`).
++  Keeping `view` at `OVERTAKE_MODULE` is what keeps the tool addressable: the
++  unified co-run dispatch (gated `view === OVERTAKE_MODULE`) keeps delegating
++  pads/steps/transport to the tool, so the tool's own gestures (e.g. Step 3 to
++  exit) and its LED painting keep working — for free, exactly as in chain-edit.
++- OLED owner = `SCHWUNG_UI`; the co-run draw path renders `coRunView`.
++- `coRunUiActive() = coRunChainEditSlot >= 0 || corunOverlayId != null` gates the
++  draw/knob/Back-guard/intercept; `coRunWants(grp)` lets the intercept fire for
++  the overlay's **kept** nav groups (jog/back), which `coRunCedes` would reject.
++- The declared `keep_mask` keeps the overlay's nav (jog + Back) at the tool
++  process so shadow_ui's intercept receives them; the consumer must keep both
++  `CORUN_GRP_JOG` and `CORUN_GRP_BACK` (the *routing* group, distinct from the
++  `CORUN_KEEP_BACK` framework-exit opt-out).
+ - `corun.target` is **untouched** → the consumer tool still sees its original
+   target via `shadow_corun_state()` and does not run its teardown.
+-- Back at the overlay's top level applies `shadow_corun_close()` semantics
+-  (restore the underlay). Back gating keeps the framework's exit-on-Back from
+-  ending the whole co-run while an overlay is up.
++- Back at the overlay's root (`corunOverlayRootView`) calls `shadow_corun_close()`
++  (restore the underlay); deeper Back pops within the view. CC 50 also closes.
++- If the tool **ends** co-run while an overlay is open (its own exit gesture, or
++  a set change), the per-frame `shadow_corun_state()` reconcile clears the overlay
++  state so the screen hands back to the tool instead of stranding the view.
+ 
+ This is what lets the FX picker open over a `MOVE_NATIVE` session and return to
+ the same synth screen, and it generalizes to "any registered view, over any
+-- 
+2.53.0
+

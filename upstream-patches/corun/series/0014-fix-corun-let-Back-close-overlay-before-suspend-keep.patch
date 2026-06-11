@@ -1,0 +1,39 @@
+From e9e9a700cac44275e9903d6ce62c27c082ccbf84 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 15:18:36 -0400
+Subject: [PATCH] fix(corun): let Back close overlay before suspend-keeps-js
+ guard
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index bcacd8ea..067b98e4 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -16988,8 +16988,9 @@ globalThis.onMidiMessageInternal = function(data) {
+         /* Back button handling for suspend_keeps_js modules — Wave Editor convention.
+          * Back alone: suspend (module parks in background, ticks continue).
+          * Shift+Back: full exit (unload module).
+-         * Skip while co-run is active: the chain editor claims Back. */
+-        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && coRunChainEditSlot < 0) {
++         * Skip while co-run is active (the chain editor claims Back) or while
++         * a co-run view overlay is open (Back closes the overlay below). */
++        if ((status & 0xF0) === 0xB0 && d1 === MoveBack && d2 > 0 && overtakeSuspendKeepsJs && coRunChainEditSlot < 0 && corunOverlayId == null) {
+             if (hostShiftHeld) {
+                 debugLog("HOST: Shift+Back → full exit (suspend_keeps_js module)");
+                 if (toolOvertakeActive) exitToolOvertake();
+@@ -17030,7 +17031,7 @@ globalThis.onMidiMessageInternal = function(data) {
+                 needsRedraw = true;
+                 return;
+             }
+-            /* Note/Session (CC 50) while the overlay is open also closes it. */
++            /* Menu (CC 50) while the overlay is open also closes it. */
+             if (d1 === 50 && d2 > 0) {
+                 shadow_corun_close();
+                 needsRedraw = true;
+-- 
+2.53.0
+

@@ -1,0 +1,57 @@
+From 34585fb9e98a5bcccbf68996cc660e6a14c7c701 Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Wed, 10 Jun 2026 20:13:53 -0400
+Subject: [PATCH] fix(corun): restore underlay view on overlay close
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+shadow_corun_close restored display owner + keep_mask but not view, leaving it
+stuck at the overlay view (e.g. fxbuspicker). The dispatcher only delegates
+input to the tool when view is OVERTAKE_MODULE/MENU, so the tool went deaf
+after close — its exit gesture and picker-reopen both died. Capture the
+underlay view at open and restore it on close.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index 067b98e4..1c822d18 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -338,6 +338,11 @@ if (typeof enterFxBusPicker === 'function') {
+ 
+ let corunOverlayId = null;       /* active overlay entry id, or null */
+ let corunOverlayPrevMask = 0;    /* keep_mask to restore on close */
++let corunOverlayPrevView = null; /* underlay view to restore on close (e.g.
++                                  * OVERTAKE_MODULE) — the dispatcher only
++                                  * delegates input to the tool when view is
++                                  * OVERTAKE_MODULE/MENU, so failing to restore
++                                  * it leaves the tool deaf after the overlay. */
+ 
+ globalThis.shadow_corun_entries = function() {
+     return Object.keys(CORUN_ENTRIES);
+@@ -348,6 +353,7 @@ globalThis.shadow_corun_open = function(id, keep_mask, args) {
+     if (!entry) return false;
+     const st = (typeof shadow_corun_state === 'function') ? shadow_corun_state() : null;
+     corunOverlayPrevMask = st ? (st.keep_mask | 0) : 0;
++    corunOverlayPrevView = view;   /* capture BEFORE entry.enter() changes it */
+     corunOverlayId = id;
+     /* Flip OLED to shadow_ui + apply the overlay's keep_mask; corun.target stays
+      * put so the consumer tool's state machine is undisturbed. */
+@@ -360,6 +366,10 @@ globalThis.shadow_corun_open = function(id, keep_mask, args) {
+ globalThis.shadow_corun_close = function() {
+     if (corunOverlayId == null) return;
+     corunOverlayId = null;
++    /* Restore the underlay view so the dispatcher resumes delegating input to
++     * the tool (it only does so for OVERTAKE_MODULE/MENU). Without this the tool
++     * goes deaf after the overlay closes — its exit gesture and reopen both die. */
++    if (corunOverlayPrevView != null) view = corunOverlayPrevView;
+     if (typeof shadow_corun_overlay === 'function') shadow_corun_overlay(0, corunOverlayPrevMask | 0);
+     needsRedraw = true;
+ };
+-- 
+2.53.0
+

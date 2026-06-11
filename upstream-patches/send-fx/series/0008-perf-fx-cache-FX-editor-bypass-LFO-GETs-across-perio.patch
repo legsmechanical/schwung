@@ -1,8 +1,8 @@
-From 88b74e61a04a46ecc3514649bfde8d23a7967412 Mon Sep 17 00:00:00 2001
+From c851b795845b8ce6c4adf4e0c60f99fd314efea2 Mon Sep 17 00:00:00 2001
 From: legsmechanical <joshgaine@gmail.com>
 Date: Thu, 4 Jun 2026 11:10:06 -0400
-Subject: [PATCH 8/8] perf(fx): cache FX editor bypass + LFO GETs across
- periodic redraws
+Subject: [PATCH] perf(fx): cache FX editor bypass + LFO GETs across periodic
+ redraws
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

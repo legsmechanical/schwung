@@ -1,0 +1,79 @@
+From 21c3382fc09fa36447c2a7110d48cb9412f8aacf Mon Sep 17 00:00:00 2001
+From: legsmechanical <joshgaine@gmail.com>
+Date: Fri, 29 May 2026 20:18:43 -0400
+Subject: [PATCH] fix(corun): defensively clear corun state on all tool
+ teardown paths
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+shadow_corun_end() was only called from the in-editor Back-at-top
+handler. If a tool exited mid-corun via any other path (Shift+Back,
+suspend-evict, exitToolOvertake, hideToolOvertake), corun.target
+remained set in SHM with no tool loaded to clear it — the shadow UI
+locked into chain editor view with no escape.
+
+Add corunTeardown() helper (unconditional shadow_corun_end() + JS
+state reset) and call it at the top of all four teardown functions:
+exitOvertakeMode, suspendOvertakeMode, exitToolOvertake,
+hideToolOvertake. shadow_corun_end() is a no-op when corun is
+inactive, so the call is safe on every path.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/shadow/shadow_ui.js | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
+index cacbf0cf..9af50877 100644
+--- a/src/shadow/shadow_ui.js
++++ b/src/shadow/shadow_ui.js
+@@ -3081,6 +3081,7 @@ let overtakeExitPending = false;
+ 
+ /* Exit overtake mode back to Move */
+ function exitOvertakeMode() {
++    corunTeardown();
+     /* Flush set state on the way out — defensive, since chain state is not
+      * edited during overtake, but keeps the invariant "all transitions
+      * persist state" honest. */
+@@ -3144,6 +3145,7 @@ function exitOvertakeMode() {
+ 
+ /* Suspend overtake mode — leave background processes running */
+ function suspendOvertakeMode() {
++    corunTeardown();
+     if (overtakeSuspendKeepsJs && overtakeModuleCallbacks && overtakeModuleId) {
+         debugLog("suspendOvertakeMode: suspend_keeps_js — parking " + overtakeModuleId + " in background");
+ 
+@@ -3311,6 +3313,7 @@ function resumeOvertakeModule(moduleId) {
+ 
+ /* Direct exit for interactive tools - skip LED clearing ceremony */
+ function exitToolOvertake() {
++    corunTeardown();
+     debugLog("exitToolOvertake: direct tool exit, nonOvertake=" + toolNonOvertake);
+ 
+     /* Let the module clean up before teardown. */
+@@ -3395,6 +3398,7 @@ function exitToolOvertake() {
+ 
+ /* Hide an interactive tool - exit overtake but keep DSP loaded */
+ function hideToolOvertake() {
++    corunTeardown();
+     debugLog("hideToolOvertake: hiding tool, keeping DSP");
+ 
+     /* Deactivate LED queue */
+@@ -14807,6 +14811,13 @@ globalThis.shadow_save_state_now = function() {
+     return true;
+ };
+ 
++function corunTeardown() {
++    if (typeof shadow_corun_end === "function") shadow_corun_end();
++    coRunChainEditSlot = -1;
++    coRunView = -1;
++    coRunKeepMask = 0;
++}
++
+ /* Co-run helpers — see coRunChainEditSlot / coRunView declarations near top.
+  *
+  * runCoRunChainEdit(fn): temporarily set the outer `view` to coRunView so any
+-- 
+2.53.0
+

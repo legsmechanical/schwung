@@ -1,7 +1,7 @@
-From 20e38fcac89dc24f3d4a182d1fb3b559d2e0ffa7 Mon Sep 17 00:00:00 2001
+From d21074190a40ae22d419bea7e5102a2d89a08b96 Mon Sep 17 00:00:00 2001
 From: legsmechanical <joshgaine@gmail.com>
 Date: Wed, 3 Jun 2026 15:18:34 -0400
-Subject: [PATCH 2/8] feat(fx): generic FX bus editor serving Master + Send A/B
+Subject: [PATCH] feat(fx): generic FX bus editor serving Master + Send A/B
 
 Genericize the Master FX UI into one bus-descriptor-driven editor
 (FX_BUS: master/sendA/sendB) and route Send A/B through it instead of
@@ -30,7 +30,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  delete mode 100644 src/shadow/shadow_ui_send_fx.mjs
 
 diff --git a/src/shadow/shadow_ui.js b/src/shadow/shadow_ui.js
-index 6e9bd6e5..152c66f7 100644
+index f93384a9..c972d7a1 100644
 --- a/src/shadow/shadow_ui.js
 +++ b/src/shadow/shadow_ui.js
 @@ -170,12 +170,6 @@ import {
@@ -133,7 +133,7 @@ index 6e9bd6e5..152c66f7 100644
  /* Master FX chain editing state */
  let masterFxConfig = {
      fx1: { module: "" },
-@@ -3909,9 +3974,8 @@ function getComponentHierarchy(slot, componentKey) {
+@@ -3911,9 +3976,8 @@ function getComponentHierarchy(slot, componentKey) {
  
  /* Fetch chain_params metadata from a Master FX slot */
  function getMasterFxChainParams(fxSlot) {
@@ -145,7 +145,7 @@ index 6e9bd6e5..152c66f7 100644
      const json = shadow_get_param(0, key);
      if (!json) return [];
      try {
-@@ -3923,9 +3987,8 @@ function getMasterFxChainParams(fxSlot) {
+@@ -3925,9 +3989,8 @@ function getMasterFxChainParams(fxSlot) {
  
  /* Fetch ui_hierarchy from a Master FX slot */
  function getMasterFxHierarchy(fxSlot) {
@@ -157,7 +157,7 @@ index 6e9bd6e5..152c66f7 100644
      const json = shadow_get_param(0, key);
      if (!json) return null;
      try {
-@@ -4728,12 +4791,12 @@ function announceSavePreview(name, selectedIndex, full = true) {
+@@ -4730,12 +4793,12 @@ function announceSavePreview(name, selectedIndex, full = true) {
  
  function loadMasterPresetList() {
      masterPresets = [];
@@ -172,7 +172,7 @@ index 6e9bd6e5..152c66f7 100644
          /* Hex dump first 20 chars to debug garbage issue */
          let hex = "";
          for (let j = 0; j < Math.min(20, name.length); j++) {
-@@ -4751,7 +4814,7 @@ function enterMasterPresetPicker() {
+@@ -4753,7 +4816,7 @@ function enterMasterPresetPicker() {
      needsRedraw = true;
  
      /* Announce menu title + initial selection */
@@ -181,7 +181,7 @@ index 6e9bd6e5..152c66f7 100644
  }
  
  function exitMasterPresetPicker() {
-@@ -4772,7 +4835,7 @@ function findMasterPresetByName(name) {
+@@ -4774,7 +4837,7 @@ function findMasterPresetByName(name) {
  
  function generateMasterPresetName() {
      const parts = [];
@@ -190,7 +190,7 @@ index 6e9bd6e5..152c66f7 100644
          const key = `fx${i + 1}`;
          const moduleId = masterFxConfig[key]?.module;
          if (moduleId) {
-@@ -4780,12 +4843,12 @@ function generateMasterPresetName() {
+@@ -4782,12 +4845,12 @@ function generateMasterPresetName() {
              parts.push(abbrev);
          }
      }
@@ -206,7 +206,7 @@ index 6e9bd6e5..152c66f7 100644
          setMasterFxSlotModule(i, "");
          masterFxConfig[`fx${i + 1}`].module = "";
      }
-@@ -4796,15 +4859,15 @@ function clearMasterFx() {
+@@ -4798,15 +4861,15 @@ function clearMasterFx() {
  
  function loadMasterPreset(index, presetName) {
      /* Get preset JSON from DSP */
@@ -225,7 +225,7 @@ index 6e9bd6e5..152c66f7 100644
              const key = `fx${i + 1}`;
              const fxConfig = fx[key];
              if (fxConfig && fxConfig.type) {
-@@ -4817,12 +4880,12 @@ function loadMasterPreset(index, presetName) {
+@@ -4819,12 +4882,12 @@ function loadMasterPreset(index, presetName) {
                      /* Restore plugin_id first (CLAP sub-plugin selection) */
                      if (fxConfig.params && typeof shadow_set_param === "function") {
                          if (fxConfig.params.plugin_id) {
@@ -240,7 +240,7 @@ index 6e9bd6e5..152c66f7 100644
                              }
                          }
                      }
-@@ -4837,17 +4900,19 @@ function loadMasterPreset(index, presetName) {
+@@ -4839,17 +4902,19 @@ function loadMasterPreset(index, presetName) {
              }
          }
  
@@ -271,7 +271,7 @@ index 6e9bd6e5..152c66f7 100644
                  }
              }
          }
-@@ -4865,15 +4930,15 @@ function loadMasterPreset(index, presetName) {
+@@ -4867,15 +4932,15 @@ function loadMasterPreset(index, presetName) {
  
  /* Build JSON for saving master preset */
  function buildMasterPresetJson(name) {
@@ -295,7 +295,7 @@ index 6e9bd6e5..152c66f7 100644
          const key = `fx${i + 1}`;
          const moduleId = masterFxConfig[key]?.module;
          if (moduleId) {
-@@ -4885,7 +4950,7 @@ function buildMasterPresetJson(name) {
+@@ -4887,7 +4952,7 @@ function buildMasterPresetJson(name) {
              /* Capture plugin_id (for CLAP sub-plugin selection) */
              if (typeof shadow_get_param === "function") {
                  try {
@@ -304,7 +304,7 @@ index 6e9bd6e5..152c66f7 100644
                      if (pluginId) {
                          slotPreset.params["plugin_id"] = pluginId;
                      }
-@@ -4896,7 +4961,7 @@ function buildMasterPresetJson(name) {
+@@ -4898,7 +4963,7 @@ function buildMasterPresetJson(name) {
                      const chainParams = getMasterFxChainParams(i);
                      if (chainParams && chainParams.length > 0) {
                          for (const p of chainParams) {
@@ -313,7 +313,7 @@ index 6e9bd6e5..152c66f7 100644
                              if (val !== null && val !== undefined && val !== "") {
                                  slotPreset.params[p.key] = val;
                              }
-@@ -4909,14 +4974,16 @@ function buildMasterPresetJson(name) {
+@@ -4911,14 +4976,16 @@ function buildMasterPresetJson(name) {
          }
      }
  
@@ -338,7 +338,7 @@ index 6e9bd6e5..152c66f7 100644
      }
  
      return JSON.stringify(preset);
-@@ -4928,10 +4995,10 @@ function doSaveMasterPreset(name) {
+@@ -4930,10 +4997,10 @@ function doSaveMasterPreset(name) {
  
      if (masterOverwriteTargetIndex >= 0) {
          /* Overwriting existing preset */
@@ -351,7 +351,7 @@ index 6e9bd6e5..152c66f7 100644
      }
  
      currentMasterPresetName = name;
-@@ -5157,7 +5224,7 @@ function handleMasterFxSettingsAction(key) {
+@@ -5159,7 +5226,7 @@ function handleMasterFxSettingsAction(key) {
  function doDeleteMasterPreset() {
      const index = findMasterPresetByName(currentMasterPresetName);
      if (index >= 0) {
@@ -360,7 +360,7 @@ index 6e9bd6e5..152c66f7 100644
      }
  
      /* Clear current preset and return to picker */
-@@ -6023,15 +6090,15 @@ function handleGlobalSettingsAction(key) {
+@@ -6025,15 +6092,15 @@ function handleGlobalSettingsAction(key) {
  
  /* Load master FX chain configuration from DSP */
  function loadMasterFxChainConfig() {
@@ -383,7 +383,7 @@ index 6e9bd6e5..152c66f7 100644
          const key = `fx${i}`;
          const moduleId = getMasterFxSlotModule(i - 1);
          masterFxConfig[key].module = moduleId || "";
-@@ -6042,30 +6109,30 @@ function loadMasterFxChainConfig() {
+@@ -6044,30 +6111,30 @@ function loadMasterFxChainConfig() {
  function getMasterFxParam(slotIndex, key) {
      if (typeof shadow_get_param !== "function") return "";
      try {
@@ -419,7 +419,7 @@ index 6e9bd6e5..152c66f7 100644
      } catch (e) {
          return false;
      }
-@@ -6073,7 +6140,7 @@ function setMasterFxSlotModule(slotIndex, dspPath) {
+@@ -6075,7 +6142,7 @@ function setMasterFxSlotModule(slotIndex, dspPath) {
  
  /* Enter module selection for a Master FX slot */
  function enterMasterFxModuleSelect(componentIndex) {
@@ -428,7 +428,7 @@ index 6e9bd6e5..152c66f7 100644
      if (!comp || comp.key === "settings") return;
  
      /* Set selection index to current module if any */
-@@ -6091,7 +6158,7 @@ function enterMasterFxModuleSelect(componentIndex) {
+@@ -6093,7 +6160,7 @@ function enterMasterFxModuleSelect(componentIndex) {
  
  /* Apply module selection for Master FX slot */
  function applyMasterFxModuleSelection() {
@@ -437,7 +437,7 @@ index 6e9bd6e5..152c66f7 100644
      if (!comp || comp.key === "settings") return;
  
      const selected = MASTER_FX_OPTIONS[selectedMasterFxModuleIndex];
-@@ -6116,6 +6183,10 @@ function applyMasterFxModuleSelection() {
+@@ -6118,6 +6185,10 @@ function applyMasterFxModuleSelection() {
  
  /* Save master FX chain configuration */
  function saveMasterFxChainConfig() {
@@ -448,7 +448,7 @@ index 6e9bd6e5..152c66f7 100644
      /* The shim persists the state, but we also save to shadow config */
      try {
          const configPath = "/data/UserData/schwung/shadow_config.json";
-@@ -8492,7 +8563,8 @@ function enterSendFxHierarchyEditor(bus, fxSlot) {
+@@ -8494,7 +8565,8 @@ function enterSendFxHierarchyEditor(bus, fxSlot) {
      setupModuleParamShims(0, compKey);
      loadHierarchyLevel();
  
@@ -458,7 +458,7 @@ index 6e9bd6e5..152c66f7 100644
      setView(VIEWS.HIERARCHY_EDITOR);
      needsRedraw = true;
  
-@@ -9213,8 +9285,11 @@ function buildKnobContextForKnob(knobIndex) {
+@@ -9215,8 +9287,11 @@ function buildKnobContextForKnob(knobIndex) {
          }
      }
  
@@ -472,7 +472,7 @@ index 6e9bd6e5..152c66f7 100644
          const comp = MASTER_FX_CHAIN_COMPONENTS[selectedMasterFxComponent];
          if (comp && comp.key !== "settings") {
              const chainParams = getMasterFxChainParams(selectedMasterFxComponent);
-@@ -11209,7 +11284,7 @@ function changeComponentPreset(delta) {
+@@ -11211,7 +11286,7 @@ function changeComponentPreset(delta) {
  /* Get Master FX setting current value for display */
  function getMasterFxSettingValue(setting) {
      if (setting.key === "master_volume") {
@@ -481,7 +481,7 @@ index 6e9bd6e5..152c66f7 100644
          if (!val) return "100%";
          const num = parseFloat(val);
          return isNaN(num) ? val : `${Math.round(num * 100)}%`;
-@@ -11318,10 +11393,10 @@ function adjustMasterFxSetting(setting, delta) {
+@@ -11324,10 +11399,10 @@ function adjustMasterFxSetting(setting, delta) {
      if (setting.type === "action") return;
  
      if (setting.key === "master_volume") {
@@ -494,7 +494,7 @@ index 6e9bd6e5..152c66f7 100644
          return;
      }
  
-@@ -11632,11 +11707,11 @@ function handleJog(delta) {
+@@ -11659,11 +11734,11 @@ function handleJog(delta) {
              } else {
                  /* Navigate chain components (-1 = preset selection, like instrument slots)
                   * Preset picker is only accessible via click, not scroll */
@@ -508,7 +508,7 @@ index 6e9bd6e5..152c66f7 100644
                      const compKey = comp.key;
                      const moduleName = masterFxConfig?.[compKey]?.module || "Empty";
                      announceMenuItem(comp.label, moduleName);
-@@ -11646,9 +11721,6 @@ function handleJog(delta) {
+@@ -11673,9 +11748,6 @@ function handleJog(delta) {
          case VIEWS.SLOT_SETTINGS:
              handleSlotSettingsJog(delta);
              break;
@@ -518,7 +518,7 @@ index 6e9bd6e5..152c66f7 100644
          case VIEWS.FX_BUS_PICKER:
              fxBusPickerIndex = Math.max(0, Math.min(2, fxBusPickerIndex + delta));
              break;
-@@ -12101,7 +12173,7 @@ function handleSelect() {
+@@ -12128,7 +12200,7 @@ function handleSelect() {
                  /* Preset selected - enter preset picker */
                  enterMasterPresetPicker();
              } else {
@@ -527,7 +527,7 @@ index 6e9bd6e5..152c66f7 100644
                  if (selectedComp.key === "settings") {
                      /* Enter settings submenu */
                      inMasterFxSettingsMenu = true;
-@@ -12113,15 +12185,15 @@ function handleSelect() {
+@@ -12140,15 +12212,15 @@ function handleSelect() {
                      if (items.length > 0) {
                          const item = items[0];
                          const value = getMasterFxSettingValue(item);
@@ -546,7 +546,7 @@ index 6e9bd6e5..152c66f7 100644
                          const cur = parseInt(shadow_get_param(0, fullKey) || "0", 10);
                          const next = cur ? 0 : 1;
                          shadow_set_param(0, fullKey, String(next));
-@@ -12131,13 +12203,18 @@ function handleSelect() {
+@@ -12158,13 +12230,18 @@ function handleSelect() {
                      }
  
                      if (moduleData && moduleData.module) {
@@ -571,7 +571,7 @@ index 6e9bd6e5..152c66f7 100644
                          }
                      } else {
                          /* No module loaded - enter module selection */
-@@ -12149,14 +12226,11 @@ function handleSelect() {
+@@ -12176,14 +12253,11 @@ function handleSelect() {
          case VIEWS.SLOT_SETTINGS:
              handleSlotSettingsSelect();
              break;
@@ -588,7 +588,7 @@ index 6e9bd6e5..152c66f7 100644
              }
              break;
          case VIEWS.PATCHES:
-@@ -13016,9 +13090,6 @@ function handleBack() {
+@@ -13043,9 +13117,6 @@ function handleBack() {
          case VIEWS.COMPONENT_PARAMS:
              handleComponentParamsBack();
              break;
@@ -598,7 +598,7 @@ index 6e9bd6e5..152c66f7 100644
          case VIEWS.FX_BUS_PICKER:
              if (coRunChainEditSlot >= 0) {
                  view = VIEWS.CHAIN_EDIT;
-@@ -13032,17 +13103,17 @@ function handleBack() {
+@@ -13059,17 +13130,17 @@ function handleBack() {
                  /* Cancel name preview */
                  masterShowingNamePreview = false;
                  needsRedraw = true;
@@ -619,7 +619,7 @@ index 6e9bd6e5..152c66f7 100644
              } else if (helpDetailScrollState) {
                  helpDetailScrollState = null;
                  needsRedraw = true;
-@@ -13058,23 +13129,23 @@ function handleBack() {
+@@ -13085,23 +13156,23 @@ function handleBack() {
                      helpReturnView = null;
                      enterGlobalSettings();
                  } else {
@@ -647,7 +647,7 @@ index 6e9bd6e5..152c66f7 100644
              } else {
                  enterFxBusPicker();
              }
-@@ -13228,7 +13299,7 @@ function handleBack() {
+@@ -13255,7 +13326,7 @@ function handleBack() {
                  const wasMasterFx = hierEditorIsMasterFx;
                  const returnView = hierEditorReturnView;
                  exitHierarchyEditor();
@@ -656,7 +656,7 @@ index 6e9bd6e5..152c66f7 100644
              }
              break;
          }
-@@ -14142,7 +14213,6 @@ function drawHelpDetail() {
+@@ -14169,7 +14240,6 @@ function drawHelpDetail() {
      Object.defineProperty(_ctx, 'MASTER_FX_OPTIONS', {
          get() { return MASTER_FX_OPTIONS; }, set(v) { MASTER_FX_OPTIONS = v; }, enumerable: true
      });
@@ -664,7 +664,7 @@ index 6e9bd6e5..152c66f7 100644
      Object.defineProperty(_ctx, 'selectedMasterFxComponent', {
          get() { return selectedMasterFxComponent; }, set(v) { selectedMasterFxComponent = v; }, enumerable: true
      });
-@@ -14197,7 +14267,14 @@ function drawHelpDetail() {
+@@ -14224,7 +14294,14 @@ function drawHelpDetail() {
          get() { return masterConfirmIndex; }, enumerable: true
      });
  
@@ -680,7 +680,7 @@ index 6e9bd6e5..152c66f7 100644
  
      /* Utility functions */
      _ctx.setView = setView;
-@@ -14393,7 +14470,7 @@ function drawHelpDetail() {
+@@ -14420,7 +14497,7 @@ function drawHelpDetail() {
      _ctx.enterChainEdit = (...args) => enterChainEdit(...args);
      _ctx.enterPatchBrowser = (...args) => _enterPatchBrowser(...args);
      _ctx.enterMasterFxSettings = (...args) => enterMasterFxSettings(...args);
@@ -689,7 +689,7 @@ index 6e9bd6e5..152c66f7 100644
      _ctx.enterFxBusPicker = () => enterFxBusPicker();
      _ctx.enterSendFxHierarchyEditor = (...args) => enterSendFxHierarchyEditor(...args);
      _ctx.enterSlotSettings = (...args) => _enterSlotSettings(...args);
-@@ -14413,8 +14490,13 @@ function applyPatchSelection() { _applyPatchSelection(); }
+@@ -14440,8 +14517,13 @@ function applyPatchSelection() { _applyPatchSelection(); }
  function drawMasterFx() { _drawMasterFx(); }
  function getMasterFxDisplayName() { return _getMasterFxDisplayName(); }
  function enterMasterFxSettings() { _enterMasterFxSettings(); }
@@ -705,7 +705,7 @@ index 6e9bd6e5..152c66f7 100644
  
  let fxBusPickerIndex = 0;
  function enterFxBusPicker() {
-@@ -15061,7 +15143,6 @@ function dispatchCoRunDraw() {
+@@ -15088,7 +15170,6 @@ function dispatchCoRunDraw() {
              break;
          case VIEWS.FILEPATH_BROWSER:     drawFilepathBrowser(); break;
          case VIEWS.FX_BUS_PICKER:        drawFxBusPicker(); break;
@@ -713,7 +713,7 @@ index 6e9bd6e5..152c66f7 100644
          case VIEWS.MASTER_FX:            drawMasterFx(); break;
          default:
              /* Unknown view in co-run — render slot list as a recoverable
-@@ -15854,9 +15935,6 @@ globalThis.tick = function() {
+@@ -15881,9 +15962,6 @@ globalThis.tick = function() {
          case VIEWS.MASTER_FX:
              drawMasterFx();
              break;
@@ -723,7 +723,7 @@ index 6e9bd6e5..152c66f7 100644
          case VIEWS.FX_BUS_PICKER:
              drawFxBusPicker();
              break;
-@@ -16307,7 +16385,7 @@ globalThis.onMidiMessageInternal = function(data) {
+@@ -16334,7 +16412,7 @@ globalThis.onMidiMessageInternal = function(data) {
                  runCoRunChainEdit(function() {
                      if (hostShiftHeld && view === VIEWS.CHAIN_EDIT && selectedChainComponent >= 0) {
                          handleShiftSelect();
@@ -732,7 +732,7 @@ index 6e9bd6e5..152c66f7 100644
                          enterMasterFxModuleSelect(selectedMasterFxComponent);
                      } else {
                          handleSelect();
-@@ -16482,8 +16560,8 @@ globalThis.onMidiMessageInternal = function(data) {
+@@ -16509,8 +16587,8 @@ globalThis.onMidiMessageInternal = function(data) {
              /* Shift+Click in chain edit enters component edit mode */
              if (isShiftHeld() && view === VIEWS.CHAIN_EDIT && selectedChainComponent >= 0) {
                  handleShiftSelect();
