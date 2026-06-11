@@ -12344,7 +12344,13 @@ function handleJog(delta) {
             handleSlotSettingsJog(delta);
             break;
         case VIEWS.FX_BUS_PICKER:
-            fxBusPickerIndex = Math.max(0, Math.min(2 + fxPickerVisibleMoveSlots.length, fxBusPickerIndex + delta));
+            if (pendingMoveFxRouteConfirm >= 0) {
+                moveFxRouteConfirmSel = moveFxRouteConfirmSel === 0 ? 1 : 0;
+                announce(moveFxRouteConfirmSel === 0 ? "No" : "Yes");
+                needsRedraw = true;
+            } else {
+                fxBusPickerIndex = Math.max(0, Math.min(2 + MOVE_FX_SLOTS_JS, fxBusPickerIndex + delta));
+            }
             break;
         case VIEWS.PATCHES:
             handlePatchesJog(delta);
@@ -12866,14 +12872,32 @@ function handleSelect() {
             handleSlotSettingsSelect();
             break;
         case VIEWS.FX_BUS_PICKER:
-            if (fxBusPickerIndex === 0) {
+            if (pendingMoveFxRouteConfirm >= 0) {
+                /* Commit the route confirm. */
+                const cs = pendingMoveFxRouteConfirm;
+                pendingMoveFxRouteConfirm = -1;
+                if (moveFxRouteConfirmSel === 1) {
+                    /* Yes: peel the track to its own Move FX bus (persists per-set),
+                     * then open it. Single write → co-run-safe. */
+                    setSlotParam(cs, "slot:move_to_slot", "0");
+                    enterFxBusEditor("moveFx" + (cs + 1));
+                } else {
+                    needsRedraw = true;  /* No: dismiss, stay in picker. */
+                }
+            } else if (fxBusPickerIndex === 0) {
                 enterFxBusEditor("master");
             } else if (fxBusPickerIndex === 1 || fxBusPickerIndex === 2) {
                 enterFxBusEditor(fxBusPickerIndex === 1 ? "sendA" : "sendB");
             } else {
-                /* 3.. → visible Move FX rows (tracks peeled to their own bus) */
-                const s = fxPickerVisibleMoveSlots[fxBusPickerIndex - 3];
-                if (s !== undefined) enterFxBusEditor("moveFx" + (s + 1));
+                /* 3..(2+MOVE_FX_SLOTS_JS) → Move FX 1..N */
+                const ms = fxBusPickerIndex - 3;   /* 0-based Move slot/track */
+                if (moveFxRouted[ms]) {
+                    pendingMoveFxRouteConfirm = ms;   /* routed → confirm before peel */
+                    moveFxRouteConfirmSel = 0;
+                    needsRedraw = true;
+                } else {
+                    enterFxBusEditor("moveFx" + (ms + 1));   /* peeled → open directly */
+                }
             }
             break;
         case VIEWS.PATCHES:
@@ -13734,6 +13758,11 @@ function handleBack() {
             handleComponentParamsBack();
             break;
         case VIEWS.FX_BUS_PICKER:
+            if (pendingMoveFxRouteConfirm >= 0) {
+                pendingMoveFxRouteConfirm = -1;   /* cancel confirm, stay in picker */
+                needsRedraw = true;
+                break;
+            }
             if (coRunChainEditSlot >= 0) {
                 view = VIEWS.CHAIN_EDIT;
                 coRunView = VIEWS.CHAIN_EDIT;
@@ -15152,40 +15181,71 @@ function enterFxBusEditor(busId) {
 }
 
 let fxBusPickerIndex = 0;
-/* Slot indices (0-based) whose Move>SchwFX is Off (peeled) → their Move FX bus
- * gets a row in the FX-bus picker. Recomputed in the render path (get_param is
- * reliable there, not in input handlers); read by the jog/select handlers. */
-let fxPickerVisibleMoveSlots = [];
-function refreshFxPickerVisibleMoveSlots() {
-    fxPickerVisibleMoveSlots = [];
+/* Per Move slot: true if its track is routed to the Schwung synth slot
+ * (slot:move_to_slot != "0" — the default). Refreshed in the render path and
+ * read by the picker's select handler to decide direct-open vs route confirm. */
+let moveFxRouted = [];
+function refreshMoveFxRouted() {
+    moveFxRouted = [];
     for (let s = 0; s < MOVE_FX_SLOTS_JS; s++) {
-        if (getSlotParam(s, "slot:move_to_slot") === "0") {
-            fxPickerVisibleMoveSlots.push(s);
-        }
+        moveFxRouted.push(getSlotParam(s, "slot:move_to_slot") !== "0");
     }
 }
+/* Route-to-chain confirm: -1 = none pending; else the 0-based slot/track index
+ * whose Move FX the user is trying to open while still routed. */
+let pendingMoveFxRouteConfirm = -1;
+let moveFxRouteConfirmSel = 0;   /* 0 = No (default), 1 = Yes */
 function enterFxBusPicker() {
     fxBusPickerIndex = 0;
-    refreshFxPickerVisibleMoveSlots();
+    pendingMoveFxRouteConfirm = -1;
+    refreshMoveFxRouted();
     view = VIEWS.FX_BUS_PICKER;
     if (coRunChainEditSlot >= 0) coRunView = VIEWS.FX_BUS_PICKER;
     needsRedraw = true;
 }
 function drawFxBusPicker() {
     clear_screen();
+    /* Route-to-chain confirm overlay. Highlighted No/Yes buttons (filled =
+     * selected, outlined = not) in the davebox dialog style; no footer. */
+    if (pendingMoveFxRouteConfirm >= 0) {
+        const n = pendingMoveFxRouteConfirm + 1;
+        const lines = wrapText("Move track " + n + " routed to Schwung slot " + n + ".", 21)
+            .concat(wrapText("Route to this chain instead?", 21));
+        let y = 4;
+        for (let i = 0; i < lines.length && y <= 40; i++) { print(2, y, lines[i], 1); y += 9; }
+        const noX = 6, yesX = 74, btnY = 44, btnW = 46, btnH = 13;
+        if (moveFxRouteConfirmSel === 0) {
+            fill_rect(noX, btnY, btnW, btnH, 1);
+            print(noX + 17, btnY + 3, "No", 0);
+        } else {
+            fill_rect(noX, btnY, btnW, 1, 1);
+            fill_rect(noX, btnY + btnH - 1, btnW, 1, 1);
+            fill_rect(noX, btnY, 1, btnH, 1);
+            fill_rect(noX + btnW - 1, btnY, 1, btnH, 1);
+            print(noX + 17, btnY + 3, "No", 1);
+        }
+        if (moveFxRouteConfirmSel === 1) {
+            fill_rect(yesX, btnY, btnW, btnH, 1);
+            print(yesX + 14, btnY + 3, "Yes", 0);
+        } else {
+            fill_rect(yesX, btnY, btnW, 1, 1);
+            fill_rect(yesX, btnY + btnH - 1, btnW, 1, 1);
+            fill_rect(yesX, btnY, 1, btnH, 1);
+            fill_rect(yesX + btnW - 1, btnY, 1, btnH, 1);
+            print(yesX + 14, btnY + 3, "Yes", 1);
+        }
+        return;
+    }
     drawHeader("FX Buses");
-    refreshFxPickerVisibleMoveSlots();
+    refreshMoveFxRouted();
     const items = [
         { label: "Master FX", value: getMasterFxDisplayName() },
         { label: "Send FX A", value: "" },
         { label: "Send FX B", value: "" },
     ];
-    for (const s of fxPickerVisibleMoveSlots) {
-        items.push({ label: "Move " + (s + 1) + " FX", value: "" });
+    for (let mv = 1; mv <= MOVE_FX_SLOTS_JS; mv++) {
+        items.push({ label: "Move " + mv + " FX", value: "" });
     }
-    /* List shrank (a track was set back to On) → keep selection in range. */
-    const maxIdx = 2 + fxPickerVisibleMoveSlots.length;
-    if (fxBusPickerIndex > maxIdx) fxBusPickerIndex = maxIdx;
     drawMenuList({
         items,
         selectedIndex: fxBusPickerIndex,
