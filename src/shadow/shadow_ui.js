@@ -1342,12 +1342,18 @@ function getMasterFxSettingsItems() {
     if (activeFxBus.settingsItems) {
         return activeFxBus.settingsItems;
     }
+    /* Sends have no LFOs (hasLfo:false) — drop the dead LFO menu items so they
+     * aren't presented as editable. Master (hasLfo:true) keeps them. */
+    let base = MASTER_FX_SETTINGS_ITEMS_BASE;
+    if (!activeFxBus.hasLfo) {
+        base = base.filter(item => item.key !== "mfx_lfo1" && item.key !== "mfx_lfo2");
+    }
     if (currentMasterPresetName) {
-        /* Existing preset: show all items */
-        return MASTER_FX_SETTINGS_ITEMS_BASE;
+        /* Existing preset: show all (remaining) items */
+        return base;
     }
     /* New/unsaved: hide Save As and Delete */
-    return MASTER_FX_SETTINGS_ITEMS_BASE.filter(item =>
+    return base.filter(item =>
         item.key !== "save_as" && item.key !== "delete"
     );
 }
