@@ -28,10 +28,14 @@ const block = extractBlock(
 function makeSandbox(overrides = {}) {
     const calls = { overlay: [], entered: [] };
     const sandbox = {
-        VIEWS: { SLOTS: 'slots', FX_BUS_PICKER: 'fxbuspicker' },
-        view: null,
+        VIEWS: { SLOTS: 'slots', FX_BUS_PICKER: 'fxbuspicker', OVERTAKE_MODULE: 'overtakemodule' },
+        view: 'overtakemodule',
+        coRunView: -1,
         needsRedraw: false,
         globalThis: {},
+        /* open() keeps the outer view at OVERTAKE_MODULE and runs the entry
+         * through runCoRunChainEdit; stub it as a plain call. */
+        runCoRunChainEdit: (fn) => fn(),
         enterChainEdit: (slot) => calls.entered.push(['chain_editor', slot]),
         enterMasterFxSettings: () => calls.entered.push(['master_fx']),
         enterGlobalSettings: () => calls.entered.push(['global_settings']),
