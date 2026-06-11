@@ -19,6 +19,7 @@ static int *host_solo_count;
 /* Per-bus send return level — defined in shadow_chain_mgmt.c (same .so).
  * Declared locally to avoid pulling in the full chain-mgmt header. */
 extern float shadow_send_return_level[2];
+extern float shadow_send_a_to_b_level;
 
 /* Fix file ownership after writing as root */
 static void chown_to_ableton(const char *path) {
@@ -246,9 +247,10 @@ void shadow_save_state(void)
             host_chain_slots[1].move_to_slot,
             host_chain_slots[2].move_to_slot,
             host_chain_slots[3].move_to_slot);
-    fprintf(f, "  \"send_return_level\": [%.3f, %.3f]\n",
+    fprintf(f, "  \"send_return_level\": [%.3f, %.3f],\n",
             shadow_send_return_level[0],
             shadow_send_return_level[1]);
+    fprintf(f, "  \"send_a_to_b\": %.3f\n", shadow_send_a_to_b_level);
     fprintf(f, "}\n");
     fclose(f);
     chown_to_ableton(SHADOW_CONFIG_PATH);
@@ -376,6 +378,18 @@ void shadow_load_state(void)
                 shadow_send_return_level[0] = r0;
                 shadow_send_return_level[1] = r1;
             }
+        }
+    }
+
+    /* Parse send_a_to_b (missing key → leaves the 0.0 default) */
+    const char *satb_key = "\"send_a_to_b\":";
+    char *satb_pos = strstr(json, satb_key);
+    if (satb_pos) {
+        float v;
+        if (sscanf(satb_pos + strlen(satb_key), " %f", &v) == 1) {
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            shadow_send_a_to_b_level = v;
         }
     }
 

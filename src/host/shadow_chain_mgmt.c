@@ -66,6 +66,9 @@ master_fx_slot_t shadow_send_fx_slots[SEND_BUS_COUNT][SEND_FX_SLOTS];
 /* Per-bus send return level (default unity) */
 float shadow_send_return_level[SEND_BUS_COUNT] = { 1.0f, 1.0f };
 
+/* Send A -> Send B routing level (0 = off). Parallel: A still returns to master. */
+float shadow_send_a_to_b_level = 0.0f;
+
 /* Move FX slots — one mini FX bus per Move track (channel) */
 master_fx_slot_t shadow_move_fx_slots[MOVE_FX_SLOTS][MOVE_FX_BLOCKS];
 move_fx_strip_t shadow_move_fx_strip[MOVE_FX_SLOTS] = {
@@ -2036,6 +2039,14 @@ void shadow_direct_set_param(uint8_t slot, const char *key, const char *value) {
             if (host.on_param_changed) host.on_param_changed(slot, key, value);
             return;
         }
+        if (strcmp(rest, "to_b") == 0) {
+            float lv = (value && value[0]) ? atof(value) : 0.0f;
+            if (lv < 0.0f) lv = 0.0f;
+            if (lv > 1.0f) lv = 1.0f;
+            if (bus == 0) shadow_send_a_to_b_level = lv;
+            if (host.on_param_changed) host.on_param_changed(slot, key, value);
+            return;
+        }
 
         int sfx_slot = -1;
         if      (strncmp(rest, "fx1:", 4) == 0) { sfx_slot = 0; rest += 4; }
@@ -3160,6 +3171,23 @@ void shadow_inprocess_handle_param_request(void) {
             } else if (req_type == 2) {  /* GET */
                 snprintf(shadow_param->value, SHADOW_PARAM_VALUE_LEN, "%.3f",
                          shadow_send_return_level[bus]);
+                shadow_param->error = 0;
+                shadow_param->result_len = strlen(shadow_param->value);
+            }
+            shadow_param_publish_response(req_id);
+            return;
+        }
+        if (strcmp(rest, "to_b") == 0) {
+            if (req_type == 1) {  /* SET */
+                float lv = (shadow_param->value[0]) ? atof(shadow_param->value) : 0.0f;
+                if (lv < 0.0f) lv = 0.0f;
+                if (lv > 1.0f) lv = 1.0f;
+                if (bus == 0) shadow_send_a_to_b_level = lv;
+                shadow_param->error = 0;
+                shadow_param->result_len = 0;
+            } else if (req_type == 2) {  /* GET */
+                snprintf(shadow_param->value, SHADOW_PARAM_VALUE_LEN, "%.3f",
+                         shadow_send_a_to_b_level);
                 shadow_param->error = 0;
                 shadow_param->result_len = strlen(shadow_param->value);
             }

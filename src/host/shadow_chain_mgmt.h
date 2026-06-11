@@ -121,6 +121,7 @@ extern master_fx_slot_t shadow_send_fx_slots[SEND_BUS_COUNT][SEND_FX_SLOTS];
 /* Per-bus send return level (0..1+, default 1.0) applied to the bus's
  * FX-processed return before it is summed into the mix. */
 extern float shadow_send_return_level[SEND_BUS_COUNT];
+extern float shadow_send_a_to_b_level;
 
 /* Move FX slots — one mini FX bus per Move track (channel), each with up to
  * MOVE_FX_BLOCKS insert FX in series. Fed by the channel's Move track when the

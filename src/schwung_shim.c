@@ -2480,6 +2480,16 @@ skip_la_rebuild:
                 mailbox_audio[i] = (int16_t)mixed;
             }
         }
+
+        /* Send A -> Send B (post-fader): tap A's return-scaled output into B's
+         * accumulator, so A->B follows A's return level (like Ableton return-track
+         * sends). Bus order (A=0 then B=1) is feedback-safe: B is built/processed
+         * after this and A is already done, so B can never reach back into A. */
+        if (b == 0 && shadow_send_a_to_b_level > 0.0f) {
+            for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+                send_accum[1][i] += (int32_t)lroundf((float)send_buf[i] * rl * shadow_send_a_to_b_level);
+            }
+        }
     }
 
     /* Mix overtake DSP buffer into ME bus unconditionally. Under rebuild_from_la,

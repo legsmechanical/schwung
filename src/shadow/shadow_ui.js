@@ -1348,14 +1348,18 @@ function getMasterFxSettingsItems() {
     if (!activeFxBus.hasLfo) {
         base = base.filter(item => item.key !== "mfx_lfo1" && item.key !== "mfx_lfo2");
     }
-    if (currentMasterPresetName) {
-        /* Existing preset: show all (remaining) items */
-        return base;
-    }
     /* New/unsaved: hide Save As and Delete */
-    return base.filter(item =>
-        item.key !== "save_as" && item.key !== "delete"
-    );
+    if (!currentMasterPresetName) {
+        base = base.filter(item => item.key !== "save_as" && item.key !== "delete");
+    }
+    /* Send A gets a "-> Send B" routing level, shown right after its return level
+     * (the "Volume" item). param-backed → rendered as % and adjusted generically. */
+    if (activeFxBus.id === "sendA") {
+        base = base.slice();
+        base.splice(1, 0, { key: "send_a_to_b", label: "-> Send B", type: "float",
+                            min: 0, max: 1, step: 0.05, param: "send_fx:a:to_b" });
+    }
+    return base;
 }
 
 let selectedMasterFxSetting = 0;
@@ -6977,11 +6981,13 @@ function saveSendFxChainConfig() {
                 host_write_file(filePath, JSON.stringify(slotConfig, null, 2) + "\n");
             }
         }
-        /* Per-set send return levels. */
+        /* Per-set send return levels + Send A->B routing level. */
         const rlA = parseFloat(shadow_get_param(0, "send_fx:a:return_level") || "1.0");
         const rlB = parseFloat(shadow_get_param(0, "send_fx:b:return_level") || "1.0");
+        const atob = parseFloat(shadow_get_param(0, "send_fx:a:to_b") || "0");
         host_write_file(activeSlotStateDir + "/send_fx_meta.json",
-            JSON.stringify({ return_level: { a: isNaN(rlA) ? 1.0 : rlA, b: isNaN(rlB) ? 1.0 : rlB } }, null, 2) + "\n");
+            JSON.stringify({ return_level: { a: isNaN(rlA) ? 1.0 : rlA, b: isNaN(rlB) ? 1.0 : rlB },
+                             send_a_to_b: isNaN(atob) ? 0 : atob }, null, 2) + "\n");
     } catch (e) {
         debugLog("saveSendFxChainConfig error: " + e);
     }
@@ -7018,8 +7024,11 @@ function restoreSendFxFromFiles() {
                 if (data.bypassed) shadow_set_param(0, key + ":bypassed", "1");
             }
         }
-        /* Restore per-set send return levels (missing → leave shim default). */
+        /* Restore per-set send return levels (missing → leave shim default) +
+         * Send A->B routing level. send_a_to_b is ALWAYS pushed (default 0) so a set
+         * without it resets to off instead of inheriting the previous set's value. */
         try {
+            let atobVal = 0;  /* per-set default: 0% (off) */
             const raw = host_read_file(activeSlotStateDir + "/send_fx_meta.json");
             if (raw) {
                 const meta = JSON.parse(raw);
@@ -7029,7 +7038,9 @@ function restoreSendFxFromFiles() {
                     if (typeof meta.return_level.b === "number")
                         shadow_set_param(0, "send_fx:b:return_level", meta.return_level.b.toFixed(3));
                 }
+                if (meta && typeof meta.send_a_to_b === "number") atobVal = meta.send_a_to_b;
             }
+            shadow_set_param(0, "send_fx:a:to_b", atobVal.toFixed(3));
         } catch (e) {}
     } catch (e) {
         debugLog("restoreSendFxFromFiles error: " + e);
