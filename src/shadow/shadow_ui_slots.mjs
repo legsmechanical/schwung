@@ -221,7 +221,7 @@ export function drawSlots() {
         { label: " Send FX A", value: getSendFxDisplayName(0), isSlot: false },
         { label: " Send FX B", value: getSendFxDisplayName(1), isSlot: false },
         ...Array.from({ length: MOVE_FX_SLOT_ROWS }, (_, i) => ({
-            label: " Move FX " + (i + 1), value: getMoveFxDisplayName(i), isSlot: false
+            label: " Move " + (i + 1) + " FX", value: getMoveFxDisplayName(i), isSlot: false
         }))
     ];
 

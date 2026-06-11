@@ -1025,7 +1025,7 @@ for (let mvSlot = 1; mvSlot <= MOVE_FX_SLOTS_JS; mvSlot++) {
     }
     comps.push({ key: "settings", label: "Settings", position: MOVE_FX_BLOCKS_JS, paramPrefix: "" });
     FX_BUS["moveFx" + mvSlot] = {
-        id: "moveFx" + mvSlot, title: "Move FX " + mvSlot, paramPrefix: prefix,
+        id: "moveFx" + mvSlot, title: "Move " + mvSlot + " FX", paramPrefix: prefix,
         slotCount: MOVE_FX_BLOCKS_JS, hasLfo: false, persistConfig: false,
         isMoveFx: true, moveSlot: mvSlot - 1,
         volumeKey: prefix + "volume", components: comps,
@@ -9057,7 +9057,7 @@ function enterSendFxHierarchyEditor(bus, fxSlot) {
 function enterMoveFxHierarchyEditor(moveSlot, fxSlot) {
     if (moveSlot < 0 || moveSlot >= MOVE_FX_SLOTS_JS) return;
     if (fxSlot < 0 || fxSlot >= MOVE_FX_BLOCKS_JS) return;
-    const busLabel = "Move FX " + (moveSlot + 1);
+    const busLabel = "Move " + (moveSlot + 1) + " FX";
     const compKey = `move_fx:${moveSlot + 1}:fx${fxSlot + 1}`;
 
     const hierJson = shadow_get_param(0, `${compKey}:ui_hierarchy`);
@@ -15131,7 +15131,7 @@ function drawFxBusPicker() {
         { label: "Send FX B", value: "" },
     ];
     for (let mv = 1; mv <= MOVE_FX_SLOTS_JS; mv++) {
-        items.push({ label: "Move FX " + mv, value: "" });
+        items.push({ label: "Move " + mv + " FX", value: "" });
     }
     drawMenuList({
         items,
