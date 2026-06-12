@@ -1015,8 +1015,9 @@ const FX_BUS = {
 };
 /* Move FX buses — one per Move track (channel). Audio-FX-only mini-buses with
  * MOVE_FX_BLOCKS_JS insert slots, surfaced in the FX bus picker beside the
- * sends. No presets/LFO; the settings page exposes volume + Send A/B. Built
- * programmatically so raising MOVE_FX_BLOCKS_JS needs no further edits here. */
+ * sends. No LFO; the settings page exposes volume + Send A/B + the shared Move
+ * FX preset actions. Built programmatically so raising MOVE_FX_BLOCKS_JS needs
+ * no further edits here. */
 for (let mvSlot = 1; mvSlot <= MOVE_FX_SLOTS_JS; mvSlot++) {
     const prefix = "move_fx:" + mvSlot + ":";
     const comps = [];
@@ -1029,6 +1030,17 @@ for (let mvSlot = 1; mvSlot <= MOVE_FX_SLOTS_JS; mvSlot++) {
         slotCount: MOVE_FX_BLOCKS_JS, hasLfo: false, persistConfig: false,
         isMoveFx: true, moveSlot: mvSlot - 1,
         volumeKey: prefix + "volume", components: comps,
+        /* Shared Move FX preset store — identical keys on all 4 buses, so one
+         * list saved/loaded from any bus. Wraps the bus's MOVE_FX_BLOCKS insert
+         * FX (not volume/sends). Mirrors the master/send descriptor preset config. */
+        presetPickerTitle: "Move FX Presets",
+        presetJsonRoot: "move_fx",
+        presetCountKey: "move_preset_count",
+        presetNamePrefix: "move_preset_name_",
+        presetJsonPrefix: "move_preset_json_",
+        presetSaveKey: "save_move_preset",
+        presetUpdateKey: "update_move_preset",
+        presetDeleteKey: "delete_move_preset",
         settingsItems: [
             { key: "move_volume", label: "Volume", type: "float", min: 0, max: 4, step: 0.05, param: prefix + "volume" },
             { key: "move_send_a", label: "Send A", type: "float", min: 0, max: 1, step: 0.05, param: prefix + "send_a" },
@@ -1043,7 +1055,7 @@ let activeFxBus = FX_BUS.master;
 /* Per-bus loaded-preset name, so the preset name/overwrite target doesn't leak
  * across buses (e.g. a master "SPECTRA" preselecting overwrite on a send save).
  * Stashed/restored on bus switch in enterFxBusEditor. */
-let fxBusPresetName = { master: "", sendA: "", sendB: "" };
+let fxBusPresetName = { master: "", sendA: "", sendB: "", moveFx1: "", moveFx2: "", moveFx3: "", moveFx4: "" };
 
 /* Build a slot param key for the active bus, e.g.
  *   master: master_fx:fx2:bypassed   sendA: send_fx:a:fx2:bypassed */
@@ -1338,9 +1350,19 @@ function parseResampleBridgeMode(raw) {
 
 /* Get dynamic settings items based on whether preset is loaded */
 function getMasterFxSettingsItems() {
-    /* Move FX buses define their own settings (volume + Send A/B, no presets/LFO). */
+    /* Move FX buses define their own settings (volume + Send A/B, no LFO). If the
+     * bus has a shared preset store, append the preset actions (Save / Save As /
+     * Delete), gating Save As + Delete on a loaded preset — same rule as the
+     * master path. The action handlers are generic (keyed on activeFxBus.preset*Key). */
     if (activeFxBus.settingsItems) {
-        return activeFxBus.settingsItems;
+        if (!activeFxBus.presetCountKey) return activeFxBus.settingsItems;
+        const items = activeFxBus.settingsItems.slice();
+        items.push({ key: "save", label: "[Save Preset]", type: "action" });
+        if (currentMasterPresetName) {
+            items.push({ key: "save_as", label: "[Save As]", type: "action" });
+            items.push({ key: "delete", label: "[Delete]", type: "action" });
+        }
+        return items;
     }
     /* Sends have no LFOs (hasLfo:false) — drop the dead LFO menu items so they
      * aren't presented as editable. Master (hasLfo:true) keeps them. */
@@ -12327,8 +12349,8 @@ function handleJog(delta) {
             } else {
                 /* Navigate chain components (-1 = preset selection, like instrument slots)
                  * Preset picker is only accessible via click, not scroll.
-                 * Move FX buses have no presets, so their list starts at 0. */
-                const minComp = activeFxBus.isMoveFx ? 0 : -1;
+                 * Buses with a preset store (master + Move FX) reach the -1 column. */
+                const minComp = activeFxBus.presetCountKey ? -1 : 0;
                 selectedMasterFxComponent = Math.max(minComp, Math.min(activeFxBus.components.length - 1, selectedMasterFxComponent + delta));
                 if (selectedMasterFxComponent === -1) {
                     announce("Preset Selection");
