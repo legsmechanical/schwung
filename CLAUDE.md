@@ -342,7 +342,8 @@ Each of the 4 slots has:
 ### Module Presets
 
 **Shift+Click any loaded chain component (synth / audio FX / MIDI FX) → the module
-picker → `[<abbr> User Presets]`** (the first row, e.g. `[OBXd User Presets]`) opens
+picker → `[User Presets]`** (an indented row tucked directly beneath the
+loaded module; the cursor defaults to it on entry) opens
 a *per-component, per-module* preset browser (`src/shadow/shadow_ui_presets.mjs`).
 It rides the picker's existing synthetic-row pattern (`__user_presets__`, mirroring
 `__get_more__`) and is only shown for a loaded module. Distinct from chain
