@@ -332,6 +332,27 @@ Each of the 4 slots has:
 
 **MPE controllers** (LinnStrument, Roli, Sensel): set Receive=All, Forward=THRU, enable MPE in the synth. Otherwise channel remap destroys per-note bend/pressure/slide.
 
+### Module Presets
+
+**Shift+Click any loaded chain component (synth / audio FX / MIDI FX) → the module
+picker → `[<abbr> User Presets]`** (the first row, e.g. `[OBXd User Presets]`) opens
+a *per-component, per-module* preset browser (`src/shadow/shadow_ui_presets.mjs`).
+It rides the picker's existing synthetic-row pattern (`__user_presets__`, mirroring
+`__get_more__`) and is only shown for a loaded module. Distinct from chain
+**patches** (`[Save]/[Save As]/[Delete]`, whole-chain, global `patches/`): a module
+preset captures only that one component's `<prefix>:state` blob (`synth`,
+`fx1`..`fx4`, `midi_fx1` — the same opaque state the host reads for slot autosave),
+so it is generic across every component/module with no per-module code.
+
+- Stored at `/data/UserData/schwung/presets/<module-id>/<name>.json`
+  (`{name, module, version, state}`). The per-module folder makes the browser
+  filtered to the component's current module for free.
+- Recall sets `<prefix>:state` (the verified slot-load restore path), which marks
+  the slot dirty so the next autosave persists it.
+- Save never overwrites — a name collision auto-appends a number (`Fat Brass 2`).
+  Delete (`os.remove`) lives in the per-preset detail screen with a confirm.
+- Naming uses the shared on-screen keyboard (`text_entry.mjs`).
+
 ### MIDI Cable Filtering
 
 MIDI_IN (offset 2048): cable 0 = Move hw controls, cable 2 = external USB MIDI.
