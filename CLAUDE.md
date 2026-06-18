@@ -357,6 +357,10 @@ so it is generic across every component/module with no per-module code.
   filtered to the component's current module for free.
 - Recall sets `<prefix>:state` (the verified slot-load restore path), which marks
   the slot dirty so the next autosave persists it.
+- Live audition: scrolling the list applies the highlighted preset (debounced via
+  `tickPresetPreview`, driven from the global tick) so it's heard before committing.
+  The slot's original `:state` is captured on entry; **Back reverts** to it, the
+  detail screen's **Load commits**. Disabled if the original can't be captured.
 - Save never overwrites — a name collision auto-appends a number (`Fat Brass 2`).
   Delete (`os.remove`) lives in the per-preset detail screen with a confirm.
 - Naming uses the shared on-screen keyboard (`text_entry.mjs`).
