@@ -528,21 +528,6 @@ void shadow_inject_ui_midi_out(void)
  * Copies USB-MIDI packets from SHM into empty slots in shadow_mailbox+MIDI_IN_OFFSET,
  * making Move process them as if they came from physical hardware.
  * Rate-limited to 16 packets per tick to avoid flooding. */
-/* #11 davebox co-run knob-desync diagnostic (TEMPORARY, RT-safe counters).
- * Confirms the hypothesis that a coalesced knob CC sitting in MIDI_IN during a
- * spin makes this drain defer every frame, starving db's Move-track note injects
- * (the audible "drops out, catches up at a different place"). Read by the shim's
- * spi_timing_logger_thread via shadow_drain_inject_kd_stats(). */
-static uint32_t s_kd_defer_occupied = 0; /* frames the drain bailed on MIDI_IN occupancy */
-static uint32_t s_kd_defer_starved  = 0; /* of those, frames where a packet was WAITING (real starvation) */
-static uint32_t s_kd_drained_pkts   = 0; /* packets actually injected into MIDI_IN */
-void shadow_drain_inject_kd_stats(uint32_t *defer_occupied, uint32_t *defer_starved, uint32_t *drained)
-{
-    if (defer_occupied) *defer_occupied = s_kd_defer_occupied;
-    if (defer_starved)  *defer_starved  = s_kd_defer_starved;
-    if (drained)        *drained        = s_kd_drained_pkts;
-}
-
 void shadow_drain_midi_inject(void)
 {
     shadow_midi_inject_t *inject_shm = *host_shadow_midi_inject_shm;
@@ -610,11 +595,6 @@ void shadow_drain_midi_inject(void)
         if (midi_in_scan[j] != 0) { hw_cable_active = 1; break; }
     if (hw_cable_active) {
         defer_counter = 0;
-        /* #11: this defer is a starvation event if a packet is waiting in the
-         * ring — db's Move-track notes can't reach Move while MIDI_IN is busy
-         * (e.g. a coalesced knob CC during a spin). Peek is read-only. */
-        s_kd_defer_occupied++;
-        { uint8_t _pk[4]; if (shadow_midi_inject_peek(inject_shm, _pk)) s_kd_defer_starved++; }
         return;
     }
     if (defer_counter < DEFER_FRAMES) {
@@ -665,7 +645,6 @@ void shadow_drain_midi_inject(void)
         shadow_midi_inject_pop(inject_shm);   /* consume only after a successful inject */
         injected++;
     }
-    s_kd_drained_pkts += (uint32_t)injected;   /* #11 */
 
     if (host_log && injected > 0) {
         char dbg[128];
