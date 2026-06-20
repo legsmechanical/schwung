@@ -147,6 +147,10 @@ void shadow_drain_ui_midi_dsp(void);
 /* Drain MIDI inject buffer into Move's MIDI_IN (post-ioctl). */
 void shadow_drain_midi_inject(void);
 
+/* #11 davebox co-run knob-desync diagnostic (TEMPORARY): inject-drain defer/
+ * starvation/drain tallies, read by the shim's spi_timing logger. */
+void shadow_drain_inject_kd_stats(uint32_t *defer_occupied, uint32_t *defer_starved, uint32_t *drained);
+
 /* Queue a 4-byte USB-MIDI packet for MIDI_IN injection (Pre-mode MIDI FX).
  * The cable nibble in msg[0] is preserved by the drain. Callers choose:
  *   cable 0 → internal hardware (Move treats as pad/button input)

@@ -4384,6 +4384,18 @@ static uint64_t spi_last_frame_total_us = 0;
 #define OVERRUN_THRESHOLD_US 2850  /* Start worrying at 2850µs (98% of budget) */
 #define SKIP_DSP_THRESHOLD 3       /* Skip DSP after 3 consecutive overruns */
 
+/* #11 davebox co-run knob-desync diagnostic (TEMPORARY, RT-safe: counter/max
+ * bumps only, no I/O — all reads/resets/logging happen in spi_timing_logger_thread).
+ * Pins the open question for the fix: when a hard co-run knob spin trips the
+ * audible drop-out, is the overrunning frame's cost in the shim's PRE work or in
+ * the firmware-bound IOCTL (Move processing un-coalesced knob CCs), and is the
+ * Move-native knob coalesce even active for this co-run? Reset per log window. */
+static uint32_t g_kd_skip_dsp_events = 0;   /* frames where DSP render was skipped = an audio drop */
+static uint64_t g_kd_worst_ov_total = 0;    /* worst frame >2850µs this window: total/pre/ioctl/post (µs) */
+static uint64_t g_kd_worst_ov_pre = 0, g_kd_worst_ov_ioctl = 0, g_kd_worst_ov_post = 0;
+static uint32_t g_kd_cc7178_seen_max = 0;   /* peak CC71-78 detents arriving in MIDI_IN in one frame */
+static int      g_kd_coalesce_active = -1;  /* last corun_knob_coalesce seen (1=on, 0=off, -1=loop not run) */
+
 /* ============================================================================
  * SPI PRE-TRANSFER CALLBACK
  * ============================================================================
@@ -4671,6 +4683,7 @@ static void shim_pre_transfer(void *ctx, uint8_t *shadow, int size)
         spi_consecutive_overruns++;
         if (spi_consecutive_overruns >= SKIP_DSP_THRESHOLD) {
             spi_skip_dsp_this_frame = 1;
+            g_kd_skip_dsp_events++;   /* #11: an audio-drop frame (DSP render skipped) */
 #if SHADOW_TIMING_LOG
             static int skip_log_count = 0;
             if (skip_log_count++ < 10 || skip_log_count % 100 == 0) {
@@ -5818,6 +5831,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
             !(corun_keep_mask_eff(shadow_control->corun.keep_mask) & CORUN_GRP_KNOBS);
 
         /* Filter MIDI_IN: zero out jog/back/knobs */
+        int kd_cc7178 = 0;   /* #11: CC71-78 detents arriving this frame (spin intensity) */
         for (int j = 0; j < MIDI_BUFFER_SIZE; j += 8) {
             uint8_t cin = hw_midi[j] & 0x0F;
             uint8_t cable = (hw_midi[j] >> 4) & 0x0F;
@@ -5825,6 +5839,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
             uint8_t type = status & 0xF0;
             uint8_t d1 = hw_midi[j + 2];
             uint8_t d2 = hw_midi[j + 3];
+            if (cable == 0x00 && type == 0xB0 && d1 >= 71 && d1 <= 78) kd_cc7178++;
 
             int filter = 0;
 
@@ -5951,6 +5966,9 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
             sh_midi[j + 6] = hw_midi[j + 6];
             sh_midi[j + 7] = hw_midi[j + 7];
         }
+        /* #11: record peak knob-detent spin intensity + whether coalesce was on. */
+        if (kd_cc7178 > (int)g_kd_cc7178_seen_max) g_kd_cc7178_seen_max = (uint32_t)kd_cc7178;
+        g_kd_coalesce_active = corun_knob_coalesce;
 
         /* Move-native knob coalesce: emit ONE consolidated CC per knob whose
          * detents we suppressed above, into an empty sh_midi slot. Clamp deltas
@@ -7275,6 +7293,16 @@ post_timing:
     if (ioctl_us > spi_ioctl_max) spi_ioctl_max = ioctl_us;
     if (post_us > spi_post_max) spi_post_max = post_us;
 
+    /* #11 knob-desync: capture the worst frame above the REAL skip-DSP threshold
+     * (2850µs — distinct from the saturated >2000µs overrun_count below) so the
+     * background logger can attribute the drop to PRE (shim) vs IOCTL (firmware). */
+    if (total_us > OVERRUN_THRESHOLD_US && total_us > g_kd_worst_ov_total) {
+        g_kd_worst_ov_total = total_us;
+        g_kd_worst_ov_pre   = pre_us;
+        g_kd_worst_ov_ioctl = ioctl_us;
+        g_kd_worst_ov_post  = post_us;
+    }
+
     /* Track overruns (no I/O — just update snapshot) */
     if (total_us > 2000) {
         static uint32_t hook_overrun_count = 0;
@@ -7518,6 +7546,23 @@ static void *spi_timing_logger_thread(void *arg)
                 (unsigned long long)spi_snap.frame_post_avg, (unsigned long long)spi_snap.frame_post_max,
                 spi_snap.overrun_count);
         }
+
+        /* #11 davebox co-run knob-desync: skip-DSP drops (cumulative) + the worst
+         * >2850µs frame's section breakdown + peak knob-spin intensity this window.
+         * worst_ov pre vs ioctl says whether the drop is shim-pre or firmware-ioctl;
+         * coalesce=0 with high cc7178 means the knob coalesce wasn't collapsing them. */
+        uint32_t kd_defer_occ = 0, kd_defer_starved = 0, kd_drained = 0;
+        shadow_drain_inject_kd_stats(&kd_defer_occ, &kd_defer_starved, &kd_drained);
+        unified_log("spi_timing", LOG_LEVEL_DEBUG,
+            "#11-kd: skip_dsp_events=%u | worst_ov total=%llu pre=%llu ioctl=%llu post=%llu | cc7178_peak=%u coalesce=%d | inj_defer=%u inj_starved=%u inj_drained=%u",
+            g_kd_skip_dsp_events,
+            (unsigned long long)g_kd_worst_ov_total, (unsigned long long)g_kd_worst_ov_pre,
+            (unsigned long long)g_kd_worst_ov_ioctl, (unsigned long long)g_kd_worst_ov_post,
+            g_kd_cc7178_seen_max, g_kd_coalesce_active,
+            kd_defer_occ, kd_defer_starved, kd_drained);
+        /* Reset per-window peaks (skip_dsp_events stays cumulative for the total). */
+        g_kd_worst_ov_total = g_kd_worst_ov_pre = g_kd_worst_ov_ioctl = g_kd_worst_ov_post = 0;
+        g_kd_cc7178_seen_max = 0;
 
         if (spi_snap.granular_ready) {
             unified_log("spi_timing", LOG_LEVEL_DEBUG,
