@@ -14707,6 +14707,7 @@ function dispatchCoRunDraw() {
             drawComponentEdit();
             break;
         case VIEWS.HIERARCHY_EDITOR:     drawHierarchyEditor(); break;
+        case VIEWS.CANVAS:               drawCanvasPreview(); break;
         case VIEWS.KNOB_EDITOR:          drawKnobEditor(); break;
         case VIEWS.KNOB_PARAM_PICKER:    drawKnobParamPicker(); break;
         case VIEWS.DYNAMIC_PARAM_PICKER: drawDynamicParamPicker(); break;
@@ -15422,7 +15423,7 @@ globalThis.tick = function() {
         processPendingHierKnob();
     }
 
-    if (view === VIEWS.CANVAS) {
+    if (view === VIEWS.CANVAS || (coRunUiActive() && coRunView === VIEWS.CANVAS)) {
         tickCanvasPreview();
         canvasTickCounter = (canvasTickCounter || 0) + 1;
         if (canvasTickCounter % 3 === 0) needsRedraw = true;
