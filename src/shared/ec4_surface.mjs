@@ -460,26 +460,13 @@ export function createEc4Surface(io) {
         ], t);
     }
 
-    /* The selectors' readings: where you are, and the list you are moving
-     * along, current one centred. */
+    /* The page knob's reading: the page, and the list you are moving along,
+     * current one centred. */
     function pageReading(t) {
         const names = knobPages().map((p) => String(p.name || ""));
         showReading([headline(moduleNameFor(slot, component) || "Module", "Page"), "",
                      valueRow(pageName()), listRow(names, pageIndex)], t, NAV_HOLD_MS);
     }
-    function slotReading(t) {
-        const slots = [0, 1, 2, 3].map((s) => String(s + 1));
-        showReading([centre("[Slot]"), "", valueRow((slot + 1) + ": " + (moduleNameFor(slot, component) || "empty")),
-                     listRow(slots, slot)], t, NAV_HOLD_MS);
-    }
-    function moduleReading(t) {
-        const comps = componentsOf(slot);
-        const i = comps.findIndex((c) => c.component === component);
-        showReading([headline("Slot " + (slot + 1), "Module"), "",
-                     valueRow(moduleNameFor(slot, component) || "empty"),
-                     listRow(comps.map((c) => c.label), i)], t, NAV_HOLD_MS);
-    }
-
     function slotLevelReading(which, t) {
         const tr = mixer.tracks[slot];
         if (which === "vol") {
@@ -622,8 +609,9 @@ export function createEc4Surface(io) {
         if (enc === CELL_SLOT) {
             if (follow || !sel) return;
             const s = Math.max(0, Math.min(3, slot + step(sel)));
+            /* No overlay: the slot and module cells already show where you
+             * are, and a reading would cover them while you look. */
             if (s !== slot) enterSlot(s);
-            slotReading(t);
             return;
         }
         if (enc === CELL_MODULE) {
@@ -632,7 +620,6 @@ export function createEc4Surface(io) {
             const i = comps.findIndex((c) => c.component === component);
             const next = comps[Math.max(0, Math.min(comps.length - 1, (i < 0 ? 0 : i) + step(sel)))];
             if (next) setFocus(slot, next.component);
-            moduleReading(t);
             return;
         }
         if (!mixer) return;

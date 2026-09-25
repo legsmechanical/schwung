@@ -188,8 +188,7 @@ eq("...and its name is on the cell", row(3).slice(4, 8), "FREE");
 choose(12, 1);   /* slot 1 -> 2 */
 run(300);
 eq("turning the slot cell enters that slot at its synth", [s.slot, s.component], [1, "synth"]);
-eq("...its overlay lists the slots, no page count", [dev.total.slice(40, 60).trim(), dev.total.slice(60, 80)],
-   ["[2: dx7]", "      1 [2] 3 4     "]);
+eq("...with no overlay: the cells already say where you are", dev.overlay, false);
 eq("...named", row(3).slice(0, 8), "SL 2DX7 ");
 choose(12, -1);
 run(300);
