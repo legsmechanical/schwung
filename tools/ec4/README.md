@@ -3,6 +3,12 @@
 Probe first. Nothing in Schwung drives an EC4 yet. These tools answer the
 questions that decide whether it can, and how.
 
+Research material (the EC4 manual and firmware, Faderfox's Ableton script, the
+faderfox-editor and DrivenByMoss reference code) and the full hand-off notes
+live in the private repo `legsmechanical/schwung-ec4-research`. They are kept
+out of this public repo because the Faderfox files are not ours to
+redistribute.
+
 ## Sources, and how far each is trusted
 
 | fact | source | status |
