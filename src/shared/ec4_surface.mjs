@@ -41,7 +41,7 @@ import { buildMap } from "./e16_map.mjs";
 import { createMixer, SEND_MAX, SEND_STEP, VOLUME_MAX, LEVEL_DB_STEP, LEVEL_DB_FLOOR,
          FILTER_STEP, PAN_STEP } from "./e16_mixer.mjs";
 import { displayValue } from "./param_pages/render_page_movy.mjs";
-import { ENUM_DELTA_DIV, knobInit, knobStep, KNOB_TYPE_FLOAT } from "./knob_engine.mjs";
+import { ENUM_DELTA_DIV, knobInit, knobStep, KNOB_TYPE_FLOAT, detentsPerStep } from "./knob_engine.mjs";
 import * as ec4 from "./ec4_protocol.mjs";
 
 /* Setup 13, 0-based as the device reports it. Slots 15 and 16 hold the
@@ -188,23 +188,29 @@ const MIXER_REFRESH_MS = 250;
  * ONE FEEL FOR EVERY KNOB: the EC4's pulses are scaled to Move's detents
  * before anything sees them.
  *
- * Firmware 2.0 doubled the EC4 to ~72 pulses a rotation (its update history),
- * so an EC4 turn sends several of Move's detents' worth. Everything downstream
- * already speaks in Move detents -- page knobs go through the same knob engine
- * as Move's own encoders (onKnobTurn, one call a detent, timed), the Mixer
- * steps 0.5 dB a detent -- so the scaling happens ONCE, here, and each of
- * them keeps the response it has on Move.
+ * Measured 2026-09-25: a Move knob sends ~210 detents a rotation (213 CC 71
+ * messages of +/-1 over one turn, overtake MIDI trace). The EC4 sends ~72
+ * pulses (firmware 2.0 update history; our setup has acceleration off, so
+ * one message is one pulse). So one EC4 pulse is ~2.9 of Move's detents,
+ * and a rotation of either covers the same ground once scaled. Everything
+ * downstream speaks in Move detents -- page knobs through the knob engine
+ * (onKnobTurn, one call a detent), the Mixer through the same engine -- so
+ * the scaling happens ONCE, here.
  *
- * DEFAULT_PULSES_PER_DETENT IS AN ESTIMATE: Move's pulses per rotation are
- * not recorded anywhere in this repo. It is injected (pulsesPerDetentOf), and
- * the host reads it from a file, so the feel can be matched by hand.
+ * It is injected (pulsesPerDetentOf) and the host reads an override file,
+ * since the EC4 half is the manufacturer's figure rather than a count.
  *
- * SELECTORS STEP LIKE ENUMS: slot, module and page move one step per
- * ENUM_DELTA_DIV detents -- the knob engine's own gate for an enum or a narrow
- * int, so a choice feels the same wherever it is made, and one flick cannot
- * fly past it.
+ * CHOICES ARE NOT SCALED THAT WAY. At Move's ratio an enum steps every ~1.4
+ * EC4 pulses (ENUM_DELTA_DIV detents), ~50 choices a rotation, and a flick
+ * flies past the one you wanted. So slot, module, page and every enum or
+ * narrow-int parameter step once per SELECTOR_PULSES of the EC4's own
+ * rotation -- a fixed physical angle, like a rotary switch.
  */
-export const DEFAULT_PULSES_PER_DETENT = 3;
+export const EC4_PULSES_PER_ROTATION = 72;
+export const MOVE_DETENTS_PER_ROTATION = 210;
+export const DEFAULT_PULSES_PER_DETENT = EC4_PULSES_PER_ROTATION / MOVE_DETENTS_PER_ROTATION;
+/* One choice per 30 degrees: twelve a rotation. */
+export const SELECTOR_PULSES = 6;
 /* A pause this long drops a leftover fraction, so the next turn starts clean. */
 export const TURN_IDLE_MS = 400;
 
@@ -473,16 +479,19 @@ export function createEc4Surface(io) {
         return out;
     }
 
-    /* EC4 pulses -> Move detents. */
-    function detents(enc, pulses, t) {
-        if (t - turnedAt[enc] >= TURN_IDLE_MS) { pulseAcc[enc] = 0; stepAcc[enc] = 0; }
-        turnedAt[enc] = t;
+    /* EC4 pulses -> Move detents, for a continuous control. */
+    function detents(enc, pulses) {
         const per = Number(pulsesPerDetentOf());
         return accumulate(pulseAcc, enc, pulses, per > 0 ? per : DEFAULT_PULSES_PER_DETENT);
     }
 
-    /* Move detents -> one selector step per ENUM_DELTA_DIV. */
-    const selectorStep = (enc, d) => accumulate(stepAcc, enc, d, ENUM_DELTA_DIV);
+    /* EC4 pulses -> choices, one per SELECTOR_PULSES of rotation. */
+    const choiceStep = (enc, pulses) => accumulate(stepAcc, enc, pulses, SELECTOR_PULSES);
+
+    /* A parameter that is a CHOICE: an enum, or an int the engine already
+     * steps like one. Those get the selector's physical step. */
+    const isChoice = (meta) => !!meta && (meta.type === "enum" || meta.kind === "enum" ||
+        Array.isArray(meta.options) || detentsPerStep(meta) > 1);
 
     /* Move detents -> the Mixer's own ticks, through the knob engine (see
      * THE MIXER TURNS THROUGH THE KNOB ENGINE TOO). One engine state and one
@@ -523,18 +532,25 @@ export function createEc4Surface(io) {
     function turn(enc, pulses, t) {
         if (shiftDownAt !== null) shiftActed = true;
         const alt = shiftDownAt !== null;
-        const ticks = detents(enc, pulses, t);
-        if (!ticks) return;
+        if (t - turnedAt[enc] >= TURN_IDLE_MS) { pulseAcc[enc] = 0; stepAcc[enc] = 0; }
+        turnedAt[enc] = t;
         if (mixerOn && mixer) {
-            if (mixerTurn(enc, ticks, alt, t)) mixerReading(enc, t, alt);
+            const d = detents(enc, pulses);
+            if (d && mixerTurn(enc, d, alt, t)) mixerReading(enc, t, alt);
             return;
         }
         if (enc < PAGE_KNOBS_N) {
-            if (ctl && applyTurn(viewNow(), ctl, enc, ticks, t)) paramReading(enc, t);
+            const cell = viewNow().cells[enc];
+            if (!cell || !ctl) return;
+            /* A choice moves one option per SELECTOR_PULSES: the engine
+             * gates an option at ENUM_DELTA_DIV detents, so that many are
+             * handed over at once. */
+            const d = isChoice(cell.meta) ? choiceStep(enc, pulses) * ENUM_DELTA_DIV : detents(enc, pulses);
+            if (d && applyTurn(viewNow(), ctl, enc, d, t)) paramReading(enc, t);
             return;
         }
-        /* The selectors below step once per ENUM_DELTA_DIV detents. */
-        const sel = (enc <= CELL_MODULE) ? selectorStep(enc, ticks) : 0;
+        const sel = (enc <= CELL_MODULE) ? choiceStep(enc, pulses) : 0;
+        const ticks = enc > CELL_MODULE ? detents(enc, pulses) : 0;
         if (enc <= CELL_NEXT) { if (sel) stepPage(step(sel), t); return; }
         if (enc === CELL_SLOT) {
             if (follow || !sel) return;
@@ -553,6 +569,7 @@ export function createEc4Surface(io) {
             return;
         }
         if (!mixer) return;
+        if (!ticks) return;
         if (enc === CELL_VOL) {
             if (mixerTurn(slot, ticks, false, t)) slotLevelReading("vol", t);
             return;

@@ -23,7 +23,8 @@ cd "$(dirname "$0")/../.."
 if ! command -v node >/dev/null 2>&1; then echo "FAIL: node required" >&2; exit 1; fi
 
 node --input-type=module -e '
-import { createEc4Surface, DEFAULT_SETUP, OVERLAY_HOLD_MS, LOSS_MS, barRow, headline } from "./src/shared/ec4_surface.mjs";
+import { createEc4Surface, DEFAULT_SETUP, OVERLAY_HOLD_MS, LOSS_MS, barRow, headline, SELECTOR_PULSES,
+         DEFAULT_PULSES_PER_DETENT } from "./src/shared/ec4_surface.mjs";
 import { BLOCK } from "./src/shared/ec4_protocol.mjs";
 import { ENUM_DELTA_DIV } from "./src/shared/knob_engine.mjs";
 import { PAGE_KNOBS } from "./src/shared/param_pages/page_plan.mjs";
@@ -117,9 +118,12 @@ const row = (r) => dev.names.slice(r * 16, r * 16 + 16);
 const CC = (enc, v) => [0xB0, enc + 1, v];
 const NOTE = (enc) => [0x90, enc, 0x7F];
 /* The EC4 sends PULSES; the surface scales them to Move detents
- * (PULSES_PER_DETENT) and selectors step once per ENUM_DELTA_DIV detents. */
-const P = 3, SEL = ENUM_DELTA_DIV;
-const spin = (enc, detents) => { for (let i = 0; i < Math.abs(detents) * P; i++) s.feedMidi(CC(enc, detents > 0 ? 1 : 127)); };
+ * (pulsesPerDetentOf, 3 here); selectors and enums step by rotation. */
+const P = 3;
+const pulses = (enc, n) => { for (let i = 0; i < Math.abs(n); i++) s.feedMidi(CC(enc, n > 0 ? 1 : 127)); };
+const spin = (enc, detents) => pulses(enc, detents * P);
+/* Selectors and enums step by ROTATION, not detents: one per SELECTOR_PULSES. */
+const choose = (enc, steps) => pulses(enc, steps * SELECTOR_PULSES);
 
 run(500);
 eq("off: nothing is sent", dev.msgs.length, 0);
@@ -162,27 +166,27 @@ s.feedMidi(NOTE(11));   /* PG> */
 run(300);
 eq("PG> steps ONE page", row(0), "ATTADECA        ");
 eq("...and the count follows", row(2), "<PG ENV 2/3 PG> ");
-spin(9, SEL - 1);
-eq("a page selector does not move before ENUM_DELTA_DIV detents", row(0).slice(0, 4), "ATTA");
-spin(9, 1);   /* turning the page name scrolls */
+pulses(9, SELECTOR_PULSES - 1);
+eq("a page selector does not move before SELECTOR_PULSES", row(0).slice(0, 4), "ATTA");
+pulses(9, 1);   /* turning the page name scrolls */
 run(300);
 eq("turning a page cell scrolls pages", row(0).slice(0, 4), "RATE");
 s.feedMidi(NOTE(8)); s.feedMidi(NOTE(8));
 run(300);
 eq("<PG steps back", row(0).slice(0, 8), "CUTORESO");
-spin(8, -SEL);
+choose(8, -1);
 run(300);
 eq("...and stops at the first page", row(0).slice(0, 8), "CUTORESO");
 
-spin(13, SEL);   /* module: synth -> fx1 */
+choose(13, 1);   /* module: synth -> fx1 */
 run(300);
 eq("turning the module cell moves along the slot", [s.slot, s.component], [0, "fx1"]);
 eq("...and its name is on the cell", row(3).slice(4, 8), "FREE");
-spin(12, SEL);   /* slot 1 -> 2 */
+choose(12, 1);   /* slot 1 -> 2 */
 run(300);
 eq("turning the slot cell enters that slot at its synth", [s.slot, s.component], [1, "synth"]);
 eq("...named", row(3).slice(0, 8), "SL 2DX7 ");
-spin(12, -SEL);
+choose(12, -1);
 run(300);
 eq("going back to a slot returns to the module left there", [s.slot, s.component], [0, "fx1"]);
 
@@ -217,6 +221,17 @@ s.feedMidi(key(1, true)); s.feedMidi(key(1, false));
 run(300);
 eq("another tap goes back to MODULE", [s.mixerOn, row(3).slice(0, 4)], [false, "SL 1"]);
 
+/* An ENUM parameter is a choice: it steps by rotation like a selector, and
+ * each step hands the engine the ENUM_DELTA_DIV detents it gates an option at. */
+ctl.metaIndex = { getOrGuess: (k) => (k === "reso" ? { type: "enum", options: ["a", "b", "c"], label: "reso" } : null) };
+writes.length = 0;
+pulses(1, SELECTOR_PULSES - 1);
+eq("an enum does not move before SELECTOR_PULSES", writes.length, 0);
+pulses(1, 1);
+eq("...then moves exactly one option (ENUM_DELTA_DIV detents to the engine)",
+   writes, new Array(ENUM_DELTA_DIV).fill(["Main", 1, 1]));
+delete ctl.metaIndex;
+
 toSetup(10);
 run(300);
 eq("leaving for another setup: inactive", s.present, false);
@@ -250,6 +265,8 @@ eq("headline: the abbreviation when it fits", headline("Amp", "Gain", "GAIN"), "
 eq("headline: then the page shortens", headline("Oscillators", "Waveform", "WAVE"), " [OSCI] >> Waveform");
 eq("headline: the name is cut last", headline("Oscillators", "Oscillator 2 Waveform", "OSC2"), "[OSCI] >> Oscillator");
 
+eq("default scale: 72 EC4 pulses cover the 210 detents of a Move rotation",
+   Math.round(72 / DEFAULT_PULSES_PER_DETENT), 210);
 console.log(fails ? "FAILED " + fails : "PASS");
 process.exit(fails ? 1 : 0);
 '

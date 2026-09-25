@@ -10833,11 +10833,12 @@ function ec4Setup() {
 }
 
 /*
- * How many EC4 pulses make one of Move's detents -- the one number behind
- * every knob's feel on the EC4 (see ec4_surface.mjs). The default is an
- * estimate; match it to Move's own knobs by hand, no rebuild:
- *   ssh ableton@move.local "echo 4 > /data/UserData/schwung/ec4_knob_scale"
- * Fractions are fine (2.5). Read ~1 Hz.
+ * How many EC4 pulses make one of Move's detents -- the ratio behind every
+ * continuous knob's feel on the EC4 (see ec4_surface.mjs). The default is
+ * 72/210, measured on Move and taken from Faderfox for the EC4; override it
+ * without a rebuild (a fraction, bigger = slower):
+ *   ssh ableton@move.local "echo 0.4 > /data/UserData/schwung/ec4_knob_scale"
+ * Read ~1 Hz.
  */
 let ec4ScaleCheckedAt = 0;
 let ec4ScaleValue = EC4_DEFAULT_PULSES;
