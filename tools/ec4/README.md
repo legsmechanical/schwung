@@ -29,6 +29,42 @@ The wire format is written up in the header of `src/shared/ec4_protocol.mjs`,
 and `tests/host/test_ec4_protocol.sh` pins it to vectors copied from both
 references.
 
+## Installing the Schwung setup on an EC4
+
+The repo ships no `.syx` (assets are never tracked; `test_no_bundled_assets.sh`),
+so make the file once, from Faderfox's factory dump in the MIT-licensed
+[faderfox-editor](https://github.com/privatepublic-de/faderfox-editor):
+
+```bash
+curl -sLO https://raw.githubusercontent.com/privatepublic-de/faderfox-editor/master/ec4-v2/EC4-setup-all-factory-V20.syx
+python3 tools/ec4/ec4_setup.py EC4-setup-all-factory-V20.syx schwung-setup-13.syx --slot 13
+```
+
+That puts the Schwung setup ("SCHW") in **setup 13**, the slot the surface
+looks for by default, beside 15 factory setups. Sending it as it stands would
+overwrite all 16, so merge just setup 13 with the web editor at
+<https://www.privatepublic.de/faderfox-editor/ec4-v2/> (Chrome; Web MIDI):
+
+1. Connect the EC4 to the computer and pick it as the editor's input and output.
+2. **Receive from EC4**, then on the EC4 hold FUNC and push encoder 4 (setup
+   mode) and push encoder 10 (send all setups). In the dialog that follows,
+   select all and **Import selected**: the editor now holds your setups.
+3. **Load file** -> `schwung-setup-13.syx`. The same dialog opens: select only
+   setup 13 ("SCHW") and **Import selected**. Import is by position, so
+   nothing else changes.
+4. To use another slot: select setup 13, **Copy Setup**, select the slot you
+   want, **Paste Setup**, and tell the Move which one it is
+   (`echo <1-16> > /data/UserData/schwung/ec4_setup`).
+5. **Send to EC4**, with the EC4 in receive mode (setup mode, push encoder 14).
+
+Then on the Move, Global Settings -> System -> **Ext Surface = EC4**, put the
+EC4 on that setup, and press SHIFT + NAME once on the EC4 (see below).
+
+The editor steps are read from its source (`ec4.js`: a file load and a device
+receive both open the same merge dialog, and a merge copies setups to the same
+position); the Schwung setup itself is verified on hardware (loaded into
+slot 12 from a computer). The editor route as a whole has not been run yet.
+
 ## ec4_setup.py
 
 Writes a "Schwung" setup into an all-setups dump and leaves the other 15
