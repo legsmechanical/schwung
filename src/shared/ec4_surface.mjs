@@ -171,6 +171,24 @@ function centre(s) {
     return " ".repeat(left) + t;
 }
 
+/*
+ * A CHOICE AS A LIST: the options in a row, the current one centred in
+ * brackets, its neighbours running off either edge -- so turning right brings
+ * the next option in from the right. Replaces the bar for anything that is a
+ * choice rather than an amount (enums, toggles, the selectors).
+ */
+export function listRow(items, index) {
+    const W = ec4.TOTAL_COLS;
+    const list = (items || []).map((x) => ascii(x));
+    if (!list.length || index < 0 || index >= list.length) return "";
+    const sel = ("[" + list[index] + "]").slice(0, W);
+    const at = Math.max(0, Math.floor((W - sel.length) / 2));
+    let left = "", right = "";
+    for (let i = index - 1; i >= 0 && left.length < at; i--) left = list[i] + " " + left;
+    for (let i = index + 1; i < list.length && right.length < W; i++) right += " " + list[i];
+    return (left.slice(-at).padStart(at) + sel + right).slice(0, W).padEnd(W);
+}
+
 /* The value, centred in brackets; empty stays empty. */
 const valueRow = (v) => (v === "" || v == null ? "" : centre("[" + ascii(v) + "]"));
 
@@ -211,6 +229,12 @@ export const MOVE_DETENTS_PER_ROTATION = 210;
 export const DEFAULT_PULSES_PER_DETENT = EC4_PULSES_PER_ROTATION / MOVE_DETENTS_PER_ROTATION;
 /* One choice per 30 degrees: twelve a rotation. */
 export const SELECTOR_PULSES = 6;
+/* A slot is a bigger move than an option -- the whole surface changes under
+ * the hand -- so it takes twice the turn: six a rotation. */
+export const SLOT_PULSES = 12;
+/* Shift released this soon, with nothing touched, is a TAP (switch view).
+ * Any longer is a hold, even if nothing was touched under it. */
+export const SHIFT_TAP_MS = 250;
 /* A pause this long drops a leftover fraction, so the next turn starts clean. */
 export const TURN_IDLE_MS = 400;
 
@@ -376,8 +400,11 @@ export function createEc4Surface(io) {
         cells[CELL_SLOT] = "SL " + (slot + 1);
         cells[CELL_MODULE] = here ? abbrev4(here.label) : "EMPT";
         const t = mixer ? mixer.tracks[slot] : null;
+        /* Names of what the knob DOES; a state that changes what it does
+         * (mute) is the only exception. A pan position is a value, and a
+         * value is for the overlay. */
         cells[CELL_VOL] = t && t.muted ? "MUTE" : "VOL";
-        cells[CELL_PAN] = panLabel(t ? t.pan : null);
+        cells[CELL_PAN] = "PAN";
         return cells;
     }
 
@@ -391,7 +418,15 @@ export function createEc4Surface(io) {
         const cells = new Array(ENCODERS).fill("");
         for (let e = 0; e < ENCODERS; e++) {
             const row = Math.floor(e / 4), col = e % 4;
-            if (!shiftHeld) { cells[e] = mixer.cell(e).label || ""; continue; }
+            if (!shiftHeld) {
+                /* The E16 Mixer's own label puts a panned track's position
+                 * ("L 26") where its level's name goes; ours does not. */
+                if (row === 0) {
+                    const tr = mixer.tracks[col];
+                    cells[e] = tr.soloed ? "SOLO" : tr.muted ? "MUTE" : "VOL";
+                } else cells[e] = mixer.cell(e).label || "";
+                continue;
+            }
             if (row === 0) cells[e] = "PAN";
             else if (row === 1 || row === 2) cells[e] = "100%";
             else cells[e] = col < 2 ? "100%" : "";
@@ -400,7 +435,7 @@ export function createEc4Surface(io) {
     }
 
     function namesNow() {
-        const cells = (mixerOn && mixer) ? mixerNames(shiftDownAt !== null) : moduleNames();
+        const cells = (mixerOn && mixer) ? mixerNames(shiftHeldNow()) : moduleNames();
         return cells.map((c) => pad(ascii(c), 4)).join("");
     }
 
@@ -415,22 +450,34 @@ export function createEc4Surface(io) {
         /* A bar only for a value that has one: an enum or a text value has
          * no position between min and max to fill to. */
         const numeric = isFinite(Number(c.value)) && c.max > c.min;
+        let last = numeric ? barRow(ringAmount(c) / RING_MAX, c.bipolar) : "";
+        if (isChoice(c.meta)) { const l = choiceList(c); last = listRow(l.items, l.index); }
         showReading([
             headline(pageName(), String(c.label || c.key), abbrev4(c.label || c.key)),
             "",
             valueRow(displayValue(c.value, metaOf(c.key) || {})),
-            numeric ? barRow(ringAmount(c) / RING_MAX, c.bipolar) : "",
+            last,
         ], t);
     }
 
-    function navReading(t) {
-        const n = knobPages().length;
-        showReading([
-            headline("Slot " + (slot + 1), moduleNameFor(slot, component) || "empty"),
-            "",
-            n ? valueRow(pageName() + " " + (pageIndex + 1) + "/" + n) : "",
-            "",
-        ], t, NAV_HOLD_MS);
+    /* The selectors' readings: where you are, and the list you are moving
+     * along, current one centred. */
+    function pageReading(t) {
+        const names = knobPages().map((p) => String(p.name || ""));
+        showReading([headline(moduleNameFor(slot, component) || "Module", "Page"), "",
+                     valueRow(pageName()), listRow(names, pageIndex)], t, NAV_HOLD_MS);
+    }
+    function slotReading(t) {
+        const slots = [0, 1, 2, 3].map((s) => String(s + 1));
+        showReading([centre("[Slot]"), "", valueRow((slot + 1) + ": " + (moduleNameFor(slot, component) || "empty")),
+                     listRow(slots, slot)], t, NAV_HOLD_MS);
+    }
+    function moduleReading(t) {
+        const comps = componentsOf(slot);
+        const i = comps.findIndex((c) => c.component === component);
+        showReading([headline("Slot " + (slot + 1), "Module"), "",
+                     valueRow(moduleNameFor(slot, component) || "empty"),
+                     listRow(comps.map((c) => c.label), i)], t, NAV_HOLD_MS);
     }
 
     function slotLevelReading(which, t) {
@@ -455,7 +502,8 @@ export function createEc4Surface(io) {
                          barRow((p + 1) / 2, true)], t);
             return;
         }
-        showReading([headline(track, c.label || ""), "",
+        /* Row 1 is the LEVEL, whatever the E16 label says (it shows pan). */
+        showReading([headline(track, enc < 4 ? "Volume" : (c.label || "")), "",
                      valueRow((c.value || "") + (c.off ? " (off)" : "")),
                      barRow(r.amount / RING_MAX, r.bipolar)], t);
     }
@@ -486,12 +534,30 @@ export function createEc4Surface(io) {
     }
 
     /* EC4 pulses -> choices, one per SELECTOR_PULSES of rotation. */
-    const choiceStep = (enc, pulses) => accumulate(stepAcc, enc, pulses, SELECTOR_PULSES);
+    const choiceStep = (enc, pulses, per) => accumulate(stepAcc, enc, pulses, per || SELECTOR_PULSES);
 
     /* A parameter that is a CHOICE: an enum, or an int the engine already
      * steps like one. Those get the selector's physical step. */
     const isChoice = (meta) => !!meta && (meta.type === "enum" || meta.kind === "enum" ||
-        Array.isArray(meta.options) || detentsPerStep(meta) > 1);
+        meta.type === "bool" || Array.isArray(meta.options) || detentsPerStep(meta) > 1 ||
+        (meta.type === "int" && meta.max - meta.min === 1));
+
+    /* A choice's options and which one is current, for listRow. */
+    function choiceList(cell) {
+        const meta = cell.meta || {};
+        const v = cell.value;
+        if (Array.isArray(meta.options) && meta.options.length) {
+            const opts = meta.options.map(String);
+            let i = opts.findIndex((x) => x.toLowerCase() === String(v).toLowerCase());
+            if (i < 0 && isFinite(Number(v))) i = Number(v) - (typeof meta.min === "number" ? meta.min : 0);
+            return { items: opts, index: i };
+        }
+        const lo = typeof meta.min === "number" ? meta.min : 0, hi = typeof meta.max === "number" ? meta.max : 1;
+        if (hi - lo === 1 && lo === 0) return { items: ["Off", "On"], index: Number(v) > 0 ? 1 : 0 };
+        const items = [];
+        for (let x = lo; x <= hi && items.length < 128; x++) items.push(String(x));
+        return { items, index: Math.round(Number(v)) - lo };
+    }
 
     /* Move detents -> the Mixer's own ticks, through the knob engine (see
      * THE MIXER TURNS THROUGH THE KNOB ENGINE TOO). One engine state and one
@@ -522,11 +588,12 @@ export function createEc4Surface(io) {
 
     const step = (ticks) => (ticks > 0 ? 1 : -1);
 
-    function stepPage(d, t) {
+    /* The <PG / PG> buttons step quietly; the page KNOB shows the list. */
+    function stepPage(d, t, quiet) {
         const n = knobPages().length;
         const next = Math.max(0, Math.min(n - 1, pageIndex + d));
         if (n && next !== pageIndex) { pageIndex = next; }
-        navReading(t);
+        if (!quiet) pageReading(t);
     }
 
     function turn(enc, pulses, t) {
@@ -549,14 +616,14 @@ export function createEc4Surface(io) {
             if (d && applyTurn(viewNow(), ctl, enc, d, t)) paramReading(enc, t);
             return;
         }
-        const sel = (enc <= CELL_MODULE) ? choiceStep(enc, pulses) : 0;
+        const sel = (enc <= CELL_MODULE) ? choiceStep(enc, pulses, enc === CELL_SLOT ? SLOT_PULSES : SELECTOR_PULSES) : 0;
         const ticks = enc > CELL_MODULE ? detents(enc, pulses) : 0;
         if (enc <= CELL_NEXT) { if (sel) stepPage(step(sel), t); return; }
         if (enc === CELL_SLOT) {
             if (follow || !sel) return;
             const s = Math.max(0, Math.min(3, slot + step(sel)));
             if (s !== slot) enterSlot(s);
-            navReading(t);
+            slotReading(t);
             return;
         }
         if (enc === CELL_MODULE) {
@@ -565,7 +632,7 @@ export function createEc4Surface(io) {
             const i = comps.findIndex((c) => c.component === component);
             const next = comps[Math.max(0, Math.min(comps.length - 1, (i < 0 ? 0 : i) + step(sel)))];
             if (next) setFocus(slot, next.component);
-            navReading(t);
+            moduleReading(t);
             return;
         }
         if (!mixer) return;
@@ -593,8 +660,8 @@ export function createEc4Surface(io) {
             if (hit) paramReading(enc, t);
             return;
         }
-        if (enc === CELL_PREV) { stepPage(-1, t); return; }
-        if (enc === CELL_NEXT) { stepPage(1, t); return; }
+        if (enc === CELL_PREV) { stepPage(-1, t, true); return; }
+        if (enc === CELL_NEXT) { stepPage(1, t, true); return; }
         if (!mixer) return;
         if (enc === CELL_VOL) { if (mixer.push(slot, false)) slotLevelReading("vol", t); return; }
         if (enc === CELL_PAN) {
@@ -604,9 +671,16 @@ export function createEc4Surface(io) {
         }
     }
 
+    /* Is Shift a HOLD yet? Once it has been down SHIFT_TAP_MS, or anything
+     * was done under it -- before that it may still be a tap, so the names
+     * do not flash the alternate layer on every view switch. */
+    function shiftHeldNow() {
+        return shiftDownAt !== null && (shiftActed || now() - shiftDownAt >= SHIFT_TAP_MS);
+    }
+
     function shift(down, t) {
         if (down) { shiftDownAt = t; shiftActed = false; return; }
-        const tap = shiftDownAt !== null && !shiftActed;
+        const tap = shiftDownAt !== null && !shiftActed && t - shiftDownAt < SHIFT_TAP_MS;
         shiftDownAt = null;
         if (!tap) return;
         mixerOn = !mixerOn && !!mixer;

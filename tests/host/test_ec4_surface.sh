@@ -24,6 +24,7 @@ if ! command -v node >/dev/null 2>&1; then echo "FAIL: node required" >&2; exit 
 
 node --input-type=module -e '
 import { createEc4Surface, DEFAULT_SETUP, OVERLAY_HOLD_MS, LOSS_MS, barRow, headline, SELECTOR_PULSES,
+         SLOT_PULSES, SHIFT_TAP_MS, listRow,
          DEFAULT_PULSES_PER_DETENT } from "./src/shared/ec4_surface.mjs";
 import { BLOCK } from "./src/shared/ec4_protocol.mjs";
 import { ENUM_DELTA_DIV } from "./src/shared/knob_engine.mjs";
@@ -123,7 +124,7 @@ const P = 3;
 const pulses = (enc, n) => { for (let i = 0; i < Math.abs(n); i++) s.feedMidi(CC(enc, n > 0 ? 1 : 127)); };
 const spin = (enc, detents) => pulses(enc, detents * P);
 /* Selectors and enums step by ROTATION, not detents: one per SELECTOR_PULSES. */
-const choose = (enc, steps) => pulses(enc, steps * SELECTOR_PULSES);
+const choose = (enc, steps) => pulses(enc, steps * (enc === 12 ? SLOT_PULSES : SELECTOR_PULSES));
 
 run(500);
 eq("off: nothing is sent", dev.msgs.length, 0);
@@ -165,12 +166,14 @@ eq("the overlay goes after the hold", dev.overlay, false);
 s.feedMidi(NOTE(11));   /* PG> */
 run(300);
 eq("PG> steps ONE page", row(0), "ATTADECA        ");
+eq("...quietly: the page buttons raise no overlay", dev.overlay, false);
 eq("...and the count follows", row(2), "<PG ENV 2/3 PG> ");
 pulses(9, SELECTOR_PULSES - 1);
 eq("a page selector does not move before SELECTOR_PULSES", row(0).slice(0, 4), "ATTA");
 pulses(9, 1);   /* turning the page name scrolls */
 run(300);
 eq("turning a page cell scrolls pages", row(0).slice(0, 4), "RATE");
+eq("...and lists the pages, current one centred", dev.total.slice(60, 80), "in Env [Mod]        ");
 s.feedMidi(NOTE(8)); s.feedMidi(NOTE(8));
 run(300);
 eq("<PG steps back", row(0).slice(0, 8), "CUTORESO");
@@ -185,6 +188,8 @@ eq("...and its name is on the cell", row(3).slice(4, 8), "FREE");
 choose(12, 1);   /* slot 1 -> 2 */
 run(300);
 eq("turning the slot cell enters that slot at its synth", [s.slot, s.component], [1, "synth"]);
+eq("...its overlay lists the slots, no page count", [dev.total.slice(40, 60).trim(), dev.total.slice(60, 80)],
+   ["[2: dx7]", "      1 [2] 3 4     "]);
 eq("...named", row(3).slice(0, 8), "SL 2DX7 ");
 choose(12, -1);
 run(300);
@@ -199,7 +204,7 @@ run(300);
 eq("VOL push mutes, and the cell says so", [slotParams["0:slot:muted"], row(3).slice(8, 12)], ["1", "MUTE"]);
 spin(15, 2);   /* PAN: 0.5% of -1..1 a detent, so two detents are one 0.02 tick */
 run(300);
-eq("PAN turns this slot pan and labels it", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.02", "R2  "]);
+eq("PAN turns this slot pan, and its cell still says PAN", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.02", "PAN "]);
 s.feedMidi(NOTE(15));
 run(300);
 eq("PAN push centres", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.00", "PAN "]);
@@ -209,7 +214,9 @@ run(300);
 eq("a Shift tap switches to the MIXER", [s.mixerOn, row(1)], [true, "SndASndASndASndA"]);
 s.feedMidi(key(1, true));
 run(100);
-eq("holding Shift shows the alternate layer", row(0), "PAN PAN PAN PAN ");
+eq("inside the tap window the names do not flash the alternate layer (slot 1 is muted)", row(0), "MUTEVOL VOL VOL ");
+run(SHIFT_TAP_MS + 100);
+eq("held past the tap window: the alternate layer", row(0), "PAN PAN PAN PAN ");
 spin(1, 2);   /* Shift + turn track 2 level = pan */
 s.feedMidi(key(1, false));
 run(300);
@@ -217,6 +224,10 @@ eq("Shift + turn is the alternate (pan), and is not a tap", [slotParams["1:slot:
 eq("letting go restores the names", row(1), "SndASndASndASndA");
 s.feedMidi(key(1, true)); s.feedMidi(shiftedPush(2, true)); s.feedMidi(shiftedPush(2, false)); s.feedMidi(key(1, false));
 eq("Shift + push (SysEx) is the alternate (solo)", slotParams["2:slot:soloed"], "1");
+s.feedMidi(key(1, true)); run(SHIFT_TAP_MS + 200); s.feedMidi(key(1, false));
+run(300);
+eq("a HOLD with nothing touched does not switch view", s.mixerOn, true);
+eq("a panned track still reads VOL on the Mixer", row(0).slice(4, 8), "VOL ");
 s.feedMidi(key(1, true)); s.feedMidi(key(1, false));
 run(300);
 eq("another tap goes back to MODULE", [s.mixerOn, row(3).slice(0, 4)], [false, "SL 1"]);
@@ -230,6 +241,8 @@ eq("an enum does not move before SELECTOR_PULSES", writes.length, 0);
 pulses(1, 1);
 eq("...then moves exactly one option (ENUM_DELTA_DIV detents to the engine)",
    writes, new Array(ENUM_DELTA_DIV).fill(["Main", 1, 1]));
+run(100);
+eq("...and its overlay shows the options, not a bar", dev.total.slice(60, 80).includes("\x1F"), false);
 delete ctl.metaIndex;
 
 toSetup(10);
@@ -267,6 +280,10 @@ eq("headline: the name is cut last", headline("Oscillators", "Oscillator 2 Wavef
 
 eq("default scale: 72 EC4 pulses cover the 210 detents of a Move rotation",
    Math.round(72 / DEFAULT_PULSES_PER_DETENT), 210);
+eq("list: current centred in brackets", listRow(["a", "b", "c"], 1), "      a [b] c       ");
+eq("list: neighbours run off the edges", listRow(["alpha", "beta", "gamma", "delta", "epsilon"], 2),
+   " beta [gamma] delta ");
+eq("list: nothing to the left of the first", listRow(["Off", "On"], 0), "       [Off] On     ");
 console.log(fails ? "FAILED " + fails : "PASS");
 process.exit(fails ? 1 : 0);
 '
