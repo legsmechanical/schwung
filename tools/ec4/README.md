@@ -14,10 +14,12 @@ redistribute.
 | fact | source | status |
 |---|---|---|
 | setup dump format (addresses, 3-byte nibble encoding, page CRC, padding) | `privatepublic-de/faderfox-editor`, `doc/faderfox sysex data format EC4 V2.txt` | verified: `ec4_setup.py` round-trips the factory dump byte for byte, and parses DrivenByMoss's shipped setup |
-| live SysEx: text pages, overlay show/hide, setup/group request, key reports | Faderfox_Universal_2 (Faderfox's Ableton script) **and** DrivenByMoss (`controller/faderfox/ec4`) | two independent implementations agree byte for byte; **not yet seen on hardware** |
+| live SysEx: text pages, overlay show/hide, setup/group request, key reports | Faderfox_Universal_2 (Faderfox's Ableton script) **and** DrivenByMoss (`controller/faderfox/ec4`) | two independent implementations agree byte for byte. **Verified on hardware from a Mac (2026-09-25, firmware 2.00):** setup/group request and reply, unprompted setup/group reports, Shift and user keys 1–4, one-cell and 16-name writes (including a 206-byte single message), overlay show/hide. Shift + push: not yet seen |
 | host text shows only where the stored encoder name is `----` | EC4 Manual V03, "Ableton Live Setups" | documented |
-| text works outside setups 13–16 | DrivenByMoss uses setup 1 by default | the 13–16 gate in Faderfox's script is the script's own (`DEVICE_DISPLAY_SETUPS`); **untested** |
+| text works outside setups 13–16 | DrivenByMoss uses setup 1 by default | **verified:** names and overlay display on setup 11. The 13–16 gate is only in Faderfox's script (`DEVICE_DISPLAY_SETUPS`) |
 | incoming MIDI updates encoder values and the display | manual, "Controller mode" | documented; whether it applies to relative types is **untested** |
+| every live message is acknowledged | bench, not in either reference | the EC4 answers each host message with a bare header, `F0 00 00 00 4E 2C 1B F7`, within ~10–90 ms. A driver can use it to confirm each write arrived |
+| USB enumeration | macOS System Information, `ec4_probe.py` | **one** USB-MIDI port each way (VID 0x2256, PID 0x2010), which is the case that can carry SysEx over Move's USB-A |
 | SysEx both ways over Move's USB-A | — | **unknown**; see `docs/E16_REMOTE.md`, "The USB-A limitation" |
 
 The wire format is written up in the header of `src/shared/ec4_protocol.mjs`,
