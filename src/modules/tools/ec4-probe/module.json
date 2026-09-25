@@ -1,0 +1,17 @@
+{
+    "id": "ec4-probe",
+    "name": "EC4 Probe",
+    "version": "0.1.0",
+    "author": "Schwung",
+    "description": "Bench probe for a Faderfox EC4 on Move's USB-A. Pads send the EC4's live SysEx (setup/group request, encoder-name text, the 4x20 overlay) and the tool decodes whatever comes back: SysEx replies, group/Shift/user-key reports, and the CCs and notes the encoders send. Answers whether SysEx crosses the USB-A port in each direction before any surface code depends on it.",
+    "component_type": "tool",
+    "tool_config": {
+        "interactive": true,
+        "skip_file_browser": true,
+        "overtake": true
+    },
+    "capabilities": {
+        "midi_out": true,
+        "suspend_keeps_js": true
+    }
+}

@@ -940,7 +940,8 @@ rm -rf \
 # The SysEx test rig ships only when explicitly asked for. sysex-test is JS and
 # is copied by the generic module loop above rather than compiled, so a build
 # gate alone cannot keep it out -- it has to be scrubbed here. Both go together:
-# they are the two halves of one measurement (docs/SYSEX.md).
+# they are the two halves of one measurement (docs/SYSEX.md). ec4-probe is the
+# same kind of bench rig, for a Faderfox EC4 on USB-A (tools/ec4/README.md).
 #
 # voice-poc is here for a third reason: it is a CONSUMER, not a feature. It
 # exists because a contract nobody has implemented is a contract nobody has
@@ -959,6 +960,7 @@ rm -rf \
 if [ -z "${SCHWUNG_BUILD_TEST_MODULES:-}" ]; then
     rm -rf \
         ./build/modules/tools/sysex-test \
+        ./build/modules/tools/ec4-probe \
         ./build/modules/midi_fx/sysex_probe \
         ./build/modules/audio_fx/widget-test \
         ./build/modules/audio_fx/gesture-test \

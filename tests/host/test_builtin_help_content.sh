@@ -65,7 +65,7 @@ import("./tools/param-pages/harness.mjs").then((H) => {
 
   /* Source-only test fixtures never reach a device. Their module.json is the
      only thing distinguishing them, so match the names the build excludes. */
-  const SOURCE_ONLY = /-test$|^config-test$|^text-test$|^controller$|^store$|^sysex_probe$/;
+  const SOURCE_ONLY = /-test$|^config-test$|^text-test$|^controller$|^store$|^sysex_probe$|^ec4-probe$/;
 
   let checked = 0;
   for (const [id, dir] of found) {

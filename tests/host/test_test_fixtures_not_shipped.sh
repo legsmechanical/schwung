@@ -50,6 +50,13 @@ for m in widget-test gesture-test; do
      "$m is SCRUBBED when the gate is off (a gated build is not a gated module)"
 done
 
+# JS-only bench rigs have no .so to gate, so the scrub is the only thing that
+# keeps them out of every user's Tools menu.
+for m in sysex-test ec4-probe; do
+  scrubbed=$(printf '%s' "$scrub_block" | grep -c "build/modules/tools/${m}" || true)
+  ok "$([ "$scrubbed" -gt 0 ] && echo 1 || echo 0)" "tools/$m is scrubbed when the gate is off"
+done
+
 # The POC must be a real module, not a module.json with no DSP -- that is the
 # combination that wedges a chain slot across reboots.
 ok "$([ -f src/modules/audio_fx/widget-test/widget_test.c ] && echo 1 || echo 0)" \
