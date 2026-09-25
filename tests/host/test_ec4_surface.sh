@@ -12,8 +12,10 @@
 #     a longer one is spliced by Move's own MIDI and lands damaged
 #   - leaving Schwung's setup and coming back rewrites the screen, since the
 #     device redrew its own names while we were away
-#   - Shift is SysEx on the EC4, and Shift + push is too; both reach the
-#     E16 navigator as its own events
+#   - one page at a time, navigated by labelled knobs (pages, slot, module),
+#     with VOL and PAN for the focused slot
+#   - Shift is SysEx on the EC4: a TAP switches Module <-> Mixer, a HOLD is
+#     the alternate layer, and Shift + push arrives as its own report
 #   - turning the setting off gives the device its "----" names back
 # No apostrophes in this file (the node program is single-quoted).
 set -euo pipefail
@@ -21,10 +23,9 @@ cd "$(dirname "$0")/../.."
 if ! command -v node >/dev/null 2>&1; then echo "FAIL: node required" >&2; exit 1; fi
 
 node --input-type=module -e '
-import { createEc4Surface, DEFAULT_SETUP, OVERLAY_HOLD_MS, LOSS_MS, barRow } from "./src/shared/ec4_surface.mjs";
+import { createEc4Surface, DEFAULT_SETUP, OVERLAY_HOLD_MS, LOSS_MS, barRow, headline } from "./src/shared/ec4_surface.mjs";
 import { BLOCK } from "./src/shared/ec4_protocol.mjs";
 import { PAGE_KNOBS } from "./src/shared/param_pages/page_plan.mjs";
-import { MAP_SHOW_DELAY_MS } from "./src/shared/e16_surface.mjs";
 
 let fails = 0;
 const eq = (n, g, w) => { const a = JSON.stringify(g), b = JSON.stringify(w);
@@ -32,10 +33,20 @@ const eq = (n, g, w) => { const a = JSON.stringify(g), b = JSON.stringify(w);
 const ok = (n, c) => eq(n, !!c, true);
 
 /* ---- the emulated EC4 ---- */
-const dev = { names: "----".repeat(16), total: " ".repeat(80), overlay: false, queries: 0, msgs: [], maxPackets: 0 };
+/* Like the real one (tools/ec4/README.md): it answers a request with its
+ * setup, and acknowledges every other message with a bare header. Replies
+ * are queued and delivered by run(), never inside the send that caused them. */
+const dev = { names: "----".repeat(16), total: " ".repeat(80), overlay: false, queries: 0, msgs: [], maxPackets: 0,
+              setup: null, replies: [] };
+const ROM_TO_ASCII = { 0xFA: "[", 0xFB: "\\", 0xFC: "]", 0xFE: "|" };
 function devMessage(m) {
   dev.msgs.push(m);
-  if (m.length === 8 && m[4] === 0x4E && m[5] === 0x20) { dev.queries++; return; }
+  if (m.length === 8 && m[4] === 0x4E && m[5] === 0x20) {
+    dev.queries++;
+    if (dev.setup !== null) dev.replies.push(report(dev.setup, 0));
+    return;
+  }
+  if (dev.setup !== null) dev.replies.push(HDR.concat([0xF7]));
   let page = 0, off = 0;
   for (let i = 7; i + 2 < m.length; i += 3) {
     const cmd = m[i], v = ((m[i + 1] & 0x0F) << 4) | (m[i + 2] & 0x0F);
@@ -45,7 +56,7 @@ function devMessage(m) {
       if (f <= 3) page = f; else if (f === 4) dev.overlay = true; else if (f === 5) dev.overlay = false;
     } else if (cmd === 0x4A) off = v;
     else if (cmd === 0x4D) {
-      const ch = String.fromCharCode(v);
+      const ch = ROM_TO_ASCII[v] || String.fromCharCode(v);
       if (page === 0) { dev.names = dev.names.slice(0, off) + ch + dev.names.slice(off + 1); off++; }
       if (page === 3) { dev.total = dev.total.slice(0, off) + ch + dev.total.slice(off + 1); off++; }
     }
@@ -76,16 +87,34 @@ const ctl = {
   pages: [page("Main", ["cutoff", "reso"]), page("Env", ["attack", "decay"]), page("Mod", ["rate"])],
   pageIndex: 0,
   state: { values: { cutoff: "0.5", reso: "0.1", attack: "0.2", decay: "0.3", rate: "0.4" } },
-  load() {}, tick() {},
+  load(f) { this.loaded = f; }, tick() {},
   goToPage(i) { this.pageIndex = i; },
   onKnobTurn(slot, dir) { writes.push([this.pages[this.pageIndex].name, slot, dir]); },
+};
+/* ---- fake slot params for the Mixer model ---- */
+const slotParams = {};
+const mixerIo = {
+  getSlot: (s, k) => (slotParams[s + ":" + k] !== undefined ? slotParams[s + ":" + k]
+                     : ({ "slot:volume": "1", "slot:muted": "0", "slot:soloed": "0", "slot:pan": "0",
+                          "buses:main_send1": "0", "buses:main_send2": "0" })[k]),
+  setSlot: (s, k, v) => { slotParams[s + ":" + k] = v; return true; },
+  getGlobal: () => "0", setGlobal: () => true, skipback: () => true,
+  nameOf: (s) => "Track " + (s + 1),
 };
 
 let t = 1000;
 const s = createEc4Surface({ now: () => t, send,
-  chainOf: () => ({ slots: [{ synth: "obxd", fx: ["freeverb"] }, {}, {}, {}] }),
-  makeController: () => ctl });
-const run = (ms) => { for (let i = 0; i < ms / 16; i++) { t += 16; s.tick(); } };
+  chainOf: () => ({ slots: [{ synth: "obxd", fx: ["freeverb"] }, { synth: "dx7" }, {}, {}] }),
+  makeController: () => ctl, mixer: mixerIo });
+const run = (ms) => { for (let i = 0; i < ms / 16; i++) {
+  t += 16; s.tick();
+  const r = dev.replies; dev.replies = []; for (const m of r) s.feedMidi(m);
+} };
+/* The user switches the EC4 to a setup: it reports it unasked. */
+const toSetup = (n) => { dev.setup = n; s.feedMidi(report(n, 0)); };
+const row = (r) => dev.names.slice(r * 16, r * 16 + 16);
+const CC = (enc, v) => [0xB0, enc + 1, v];
+const NOTE = (enc) => [0x90, enc, 0x7F];
 
 run(500);
 eq("off: nothing is sent", dev.msgs.length, 0);
@@ -95,59 +124,103 @@ run(2500);
 ok("on, unanswered: it asks which setup", dev.queries >= 2);
 eq("on, unanswered: no text is written", dev.names, "----".repeat(16));
 
-s.feedMidi(report(10, 0));   /* setup 11, the user one */
+toSetup(10);   /* setup 11, the user one */
 run(1000);
 eq("a setup that is not ours is never written", dev.names, "----".repeat(16));
 eq("...and is not active", s.present, false);
-s.feedMidi([0xB0, 0x01, 0x01]);
+s.feedMidi(CC(0, 1));
 eq("...and its encoders are ignored", writes.length, 0);
 
-s.feedMidi(report(DEFAULT_SETUP, 0));
+toSetup(DEFAULT_SETUP);
 run(1000);
 eq("setup 13: active", s.present, true);
-eq("setup 13: the knob page is on the names", dev.names.slice(0, 16), "CUTORESO        ");
-eq("...the page below it on the second half", dev.names.slice(32, 40), "ATTADECA");
+eq("MODULE view, row 1: the page knobs (ONE page)", row(0), "CUTORESO        ");
+eq("...row 2: the rest of that page, not the next page", row(1), " ".repeat(16));
+eq("...row 3: page navigation", row(2), "<PG MAIN1/3 PG> ");
+eq("...row 4: slot, module, volume, pan", row(3), "SL 1OBXDVOL PAN ");
 ok("every message fits one SPI frame (12 packets)", dev.maxPackets <= 12);
 
-s.feedMidi([0xB0, 0x01, 0x01]);   /* encoder 1, one detent clockwise */
-eq("a turn reaches the controller", writes, [["Main", 0, 1]]);
+s.feedMidi(CC(0, 1));   /* encoder 1, one detent clockwise */
+eq("a page knob reaches the controller", writes, [["Main", 0, 1]]);
 run(200);
-eq("...and puts the reading on the overlay", dev.overlay, true);
-eq("...naming the module and page, then the parameter", [dev.total.slice(0, 20).trim(), dev.total.slice(20, 40).trim()], ["obxd / Main", "cutoff"]);
-eq("...with a value bar of full blocks (0x1F) on the last row: 0.5 is ten of twenty",
-   dev.total.slice(60, 80), "\x1F".repeat(10) + " ".repeat(10));
+eq("...and raises the overlay", dev.overlay, true);
+eq("...row 1: [page] >> parameter, centred", dev.total.slice(0, 20), "  [Main] >> cutoff  ");
+eq("...row 2 blank", dev.total.slice(20, 40), " ".repeat(20));
+eq("...row 3: the value in brackets", dev.total.slice(40, 60).trim().startsWith("["), true);
+eq("...row 4: a value bar, 0.5 is ten of twenty", dev.total.slice(60, 80), "\x1F".repeat(10) + " ".repeat(10));
 run(OVERLAY_HOLD_MS + 500);
 eq("the overlay goes after the hold", dev.overlay, false);
 
-s.feedMidi(key(1, true));          /* Shift down, as SysEx */
-s.feedMidi([0xB0, 0x02, 0x01]);    /* Shift + turn pages */
+s.feedMidi(NOTE(11));   /* PG> */
+run(300);
+eq("PG> steps ONE page", row(0), "ATTADECA        ");
+eq("...and the count follows", row(2), "<PG ENV 2/3 PG> ");
+s.feedMidi(CC(9, 1));   /* turning the page name scrolls */
+run(300);
+eq("turning a page cell scrolls pages", row(0).slice(0, 4), "RATE");
+s.feedMidi(NOTE(8)); s.feedMidi(NOTE(8));
+run(300);
+eq("<PG steps back", row(0).slice(0, 8), "CUTORESO");
+s.feedMidi(CC(8, 127));
+run(300);
+eq("...and stops at the first page", row(0).slice(0, 8), "CUTORESO");
+
+s.feedMidi(CC(13, 1));   /* module: synth -> fx1 */
+run(300);
+eq("turning the module cell moves along the slot", [s.slot, s.component], [0, "fx1"]);
+eq("...and its name is on the cell", row(3).slice(4, 8), "FREE");
+s.feedMidi(CC(12, 1));   /* slot 1 -> 2 */
+run(300);
+eq("turning the slot cell enters that slot at its synth", [s.slot, s.component], [1, "synth"]);
+eq("...named", row(3).slice(0, 8), "SL 2DX7 ");
+s.feedMidi(CC(12, 127));
+run(300);
+eq("going back to a slot returns to the module left there", [s.slot, s.component], [0, "fx1"]);
+
+s.feedMidi(CC(14, 1));   /* VOL */
+ok("VOL writes this slot level", slotParams["0:slot:volume"] !== undefined);
+s.feedMidi(NOTE(14));
+run(300);
+eq("VOL push mutes, and the cell says so", [slotParams["0:slot:muted"], row(3).slice(8, 12)], ["1", "MUTE"]);
+s.feedMidi(CC(15, 1));   /* PAN */
+run(300);
+eq("PAN turns this slot pan and labels it", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.02", "R2  "]);
+s.feedMidi(NOTE(15));
+run(300);
+eq("PAN push centres", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.00", "PAN "]);
+
+s.feedMidi(key(1, true)); s.feedMidi(key(1, false));   /* a Shift TAP */
+run(300);
+eq("a Shift tap switches to the MIXER", [s.mixerOn, row(1)], [true, "SndASndASndASndA"]);
+s.feedMidi(key(1, true));
+run(100);
+eq("holding Shift shows the alternate layer", row(0), "PAN PAN PAN PAN ");
+s.feedMidi(CC(1, 1));   /* Shift + turn track 2 level = pan */
 s.feedMidi(key(1, false));
 run(300);
-eq("Shift (SysEx) + turn steps the page pair (by two, as the E16)", dev.names.slice(0, 16), "RATE            ");
+eq("Shift + turn is the alternate (pan), and is not a tap", [slotParams["1:slot:pan"], s.mixerOn], ["0.02", true]);
+eq("letting go restores the names", row(1), "SndASndASndASndA");
+s.feedMidi(key(1, true)); s.feedMidi(shiftedPush(2, true)); s.feedMidi(shiftedPush(2, false)); s.feedMidi(key(1, false));
+eq("Shift + push (SysEx) is the alternate (solo)", slotParams["2:slot:soloed"], "1");
+s.feedMidi(key(1, true)); s.feedMidi(key(1, false));
+run(300);
+eq("another tap goes back to MODULE", [s.mixerOn, row(3).slice(0, 4)], [false, "SL 1"]);
 
-s.feedMidi(key(1, true));
-run(MAP_SHOW_DELAY_MS + 200);
-eq("holding Shift shows the map on the names", dev.names.slice(0, 16), ">1  2   3   4   ");
-eq("...with the slot components below", dev.names.slice(16, 24), "OBXDFREE");
-s.feedMidi(shiftedPush(5, true));  /* Shift + push encoder 6: freeverb */
-s.feedMidi(shiftedPush(5, false));
-s.feedMidi(key(1, false));
-eq("Shift + push (SysEx) picks from the map", [s.nav.slot, s.nav.component], [0, "fx1"]);
-
-s.feedMidi(report(10, 0));
+toSetup(10);
 run(300);
 eq("leaving for another setup: inactive", s.present, false);
 const before = dev.msgs.length;
 run(1000);
 ok("...and only queries go out", dev.msgs.slice(before).every((m) => m.length === 8));
 dev.names = "----".repeat(16);    /* the device redrew its own setup */
-s.feedMidi(report(DEFAULT_SETUP, 0));
+toSetup(DEFAULT_SETUP);
 run(1000);
 ok("coming back rewrites the screen", dev.names !== "----".repeat(16));
 
+const was = dev.setup; dev.setup = null;   /* unplugged: nothing answers */
 run(LOSS_MS + 500);
 eq("silent for LOSS_MS: gone", s.present, false);
-s.feedMidi(report(DEFAULT_SETUP, 0));
+toSetup(was);
 run(500);
 eq("...and back on the next answer", s.present, true);
 
@@ -161,6 +234,11 @@ eq("bar: empty, full", [barRow(0, false), barRow(1, false)], [" ".repeat(20), BL
 eq("bar: bipolar fills from the centre", [barRow(0.75, true), barRow(0.25, true)],
    [" ".repeat(10) + BLOCK.repeat(5) + " ".repeat(5), " ".repeat(5) + BLOCK.repeat(5) + " ".repeat(10)]);
 eq("bar: bipolar at the centre is marked, not empty", barRow(0.5, true), " ".repeat(10) + "|" + " ".repeat(9));
+eq("headline: [page] >> name, centred", headline("Filter", "Cutoff", "CUTO"), " [Filter] >> Cutoff");
+eq("headline: the abbreviation when it fits", headline("Amp", "Gain", "GAIN"), "[Amp] >> Gain (GAIN)");
+eq("headline: then the page shortens", headline("Oscillators", "Waveform", "WAVE"), " [OSCI] >> Waveform");
+eq("headline: the name is cut last", headline("Oscillators", "Oscillator 2 Waveform", "OSC2"), "[OSCI] >> Oscillator");
+
 console.log(fails ? "FAILED " + fails : "PASS");
 process.exit(fails ? 1 : 0);
 '
