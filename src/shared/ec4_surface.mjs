@@ -40,6 +40,7 @@ import { buildView, labelsFor, applyTurn, applyClick, pageHasKnobs, abbrev4, ENC
 import { buildMap } from "./e16_map.mjs";
 import { createMixer } from "./e16_mixer.mjs";
 import { displayValue } from "./param_pages/render_page_movy.mjs";
+import { ENUM_DELTA_DIV } from "./knob_engine.mjs";
 import * as ec4 from "./ec4_protocol.mjs";
 
 /* Setup 13, 0-based as the device reports it. Slots 15 and 16 hold the
@@ -181,7 +182,30 @@ const PAGE_KNOBS_N = 8;
 export const NAV_HOLD_MS = 800;
 /* One Mixer value re-read this often, to notice changes made elsewhere. */
 const MIXER_REFRESH_MS = 250;
-const PAN_STEP = 0.02;
+
+/*
+ * ONE FEEL FOR EVERY KNOB: the EC4's pulses are scaled to Move's detents
+ * before anything sees them.
+ *
+ * Firmware 2.0 doubled the EC4 to ~72 pulses a rotation (its update history),
+ * so an EC4 turn sends several of Move's detents' worth. Everything downstream
+ * already speaks in Move detents -- page knobs go through the same knob engine
+ * as Move's own encoders (onKnobTurn, one call a detent, timed), the Mixer
+ * steps 0.5 dB a detent -- so the scaling happens ONCE, here, and each of
+ * them keeps the response it has on Move.
+ *
+ * DEFAULT_PULSES_PER_DETENT IS AN ESTIMATE: Move's pulses per rotation are
+ * not recorded anywhere in this repo. It is injected (pulsesPerDetentOf), and
+ * the host reads it from a file, so the feel can be matched by hand.
+ *
+ * SELECTORS STEP LIKE ENUMS: slot, module and page move one step per
+ * ENUM_DELTA_DIV detents -- the knob engine's own gate for an enum or a narrow
+ * int, so a choice feels the same wherever it is made, and one flick cannot
+ * fly past it.
+ */
+export const DEFAULT_PULSES_PER_DETENT = 3;
+/* A pause this long drops a leftover fraction, so the next turn starts clean. */
+export const TURN_IDLE_MS = 400;
 
 export function createEc4Surface(io) {
     const o = io || {};
@@ -191,6 +215,7 @@ export function createEc4Surface(io) {
     const followFocusOf = o.followFocusOf || (() => null);
     const makeController = o.makeController || null;
     const setupOf = o.setupOf || (() => DEFAULT_SETUP);
+    const pulsesPerDetentOf = o.pulsesPerDetentOf || (() => DEFAULT_PULSES_PER_DETENT);
     const log = o.log || (() => {});
 
     let enabled = false;
@@ -403,6 +428,32 @@ export function createEc4Surface(io) {
 
     /* ---- input ---- */
 
+    /* Leftover fractions per encoder: pulses toward a detent, and detents
+     * toward a selector step. A reversal or a pause starts either over --
+     * half a detent the other way is not a reason to move. */
+    const pulseAcc = new Array(ENCODERS).fill(0);
+    const stepAcc = new Array(ENCODERS).fill(0);
+    const turnedAt = new Array(ENCODERS).fill(-Infinity);
+
+    function accumulate(acc, enc, amount, per) {
+        if (Math.sign(acc[enc]) !== Math.sign(amount)) acc[enc] = 0;
+        acc[enc] += amount;
+        const out = Math.trunc(acc[enc] / per);
+        acc[enc] -= out * per;
+        return out;
+    }
+
+    /* EC4 pulses -> Move detents. */
+    function detents(enc, pulses, t) {
+        if (t - turnedAt[enc] >= TURN_IDLE_MS) { pulseAcc[enc] = 0; stepAcc[enc] = 0; }
+        turnedAt[enc] = t;
+        const per = Number(pulsesPerDetentOf());
+        return accumulate(pulseAcc, enc, pulses, per > 0 ? per : DEFAULT_PULSES_PER_DETENT);
+    }
+
+    /* Move detents -> one selector step per ENUM_DELTA_DIV. */
+    const selectorStep = (enc, d) => accumulate(stepAcc, enc, d, ENUM_DELTA_DIV);
+
     const step = (ticks) => (ticks > 0 ? 1 : -1);
 
     function stepPage(d, t) {
@@ -412,9 +463,11 @@ export function createEc4Surface(io) {
         navReading(t);
     }
 
-    function turn(enc, ticks, t) {
+    function turn(enc, pulses, t) {
         if (shiftDownAt !== null) shiftActed = true;
         const alt = shiftDownAt !== null;
+        const ticks = detents(enc, pulses, t);
+        if (!ticks) return;
         if (mixerOn && mixer) {
             if (mixer.turn(enc, ticks, alt)) mixerReading(enc, t, alt);
             return;
@@ -423,19 +476,21 @@ export function createEc4Surface(io) {
             if (ctl && applyTurn(viewNow(), ctl, enc, ticks, t)) paramReading(enc, t);
             return;
         }
-        if (enc <= CELL_NEXT) { stepPage(step(ticks), t); return; }
+        /* The selectors below step once per ENUM_DELTA_DIV detents. */
+        const sel = (enc <= CELL_MODULE) ? selectorStep(enc, ticks) : 0;
+        if (enc <= CELL_NEXT) { if (sel) stepPage(step(sel), t); return; }
         if (enc === CELL_SLOT) {
-            if (follow) return;
-            const s = Math.max(0, Math.min(3, slot + step(ticks)));
+            if (follow || !sel) return;
+            const s = Math.max(0, Math.min(3, slot + step(sel)));
             if (s !== slot) enterSlot(s);
             navReading(t);
             return;
         }
         if (enc === CELL_MODULE) {
-            if (follow) return;
+            if (follow || !sel) return;
             const comps = componentsOf(slot);
             const i = comps.findIndex((c) => c.component === component);
-            const next = comps[Math.max(0, Math.min(comps.length - 1, (i < 0 ? 0 : i) + step(ticks)))];
+            const next = comps[Math.max(0, Math.min(comps.length - 1, (i < 0 ? 0 : i) + step(sel)))];
             if (next) setFocus(slot, next.component);
             navReading(t);
             return;

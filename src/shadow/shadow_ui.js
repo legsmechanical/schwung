@@ -137,7 +137,8 @@ import { parseSlotSnapshot, parseMasterFxSnapshot, planRestore, recallMessage }
 import { drawSnapshotToast } from '/data/UserData/schwung/shared/snapshot_toast.mjs';
 import { createSurface as createE16Surface }
     from '/data/UserData/schwung/shared/e16_surface.mjs';
-import { createEc4Surface, DEFAULT_SETUP as EC4_DEFAULT_SETUP }
+import { createEc4Surface, DEFAULT_SETUP as EC4_DEFAULT_SETUP,
+         DEFAULT_PULSES_PER_DETENT as EC4_DEFAULT_PULSES }
     from '/data/UserData/schwung/shared/ec4_surface.mjs';
 import { createController as createPageController }
     from '/data/UserData/schwung/shared/param_pages/page_controller.mjs';
@@ -10831,12 +10832,37 @@ function ec4Setup() {
     return ec4SetupValue;
 }
 
+/*
+ * How many EC4 pulses make one of Move's detents -- the one number behind
+ * every knob's feel on the EC4 (see ec4_surface.mjs). The default is an
+ * estimate; match it to Move's own knobs by hand, no rebuild:
+ *   ssh ableton@move.local "echo 4 > /data/UserData/schwung/ec4_knob_scale"
+ * Fractions are fine (2.5). Read ~1 Hz.
+ */
+let ec4ScaleCheckedAt = 0;
+let ec4ScaleValue = EC4_DEFAULT_PULSES;
+function ec4KnobScale() {
+    const now = Date.now();
+    if (now - ec4ScaleCheckedAt < 1000) return ec4ScaleValue;
+    ec4ScaleCheckedAt = now;
+    ec4ScaleValue = EC4_DEFAULT_PULSES;
+    try {
+        const path = "/data/UserData/schwung/ec4_knob_scale";
+        if (typeof host_file_exists === "function" && host_file_exists(path)) {
+            const n = parseFloat(String(host_read_file(path) || "").trim());
+            if (n > 0 && n <= 32) ec4ScaleValue = n;
+        }
+    } catch (e) {}
+    return ec4ScaleValue;
+}
+
 const ec4Surface = createEc4Surface({
     now: () => Date.now(),
     send: e16Send,
     chainOf: e16ChainShape,
     followFocusOf: e16FollowFocus,
     setupOf: ec4Setup,
+    pulsesPerDetentOf: ec4KnobScale,
     log: (line) => console.log(line),
     makeController: (focus) => createPageController({
         getParam: (key) => getSlotParam(focus.slot, key),

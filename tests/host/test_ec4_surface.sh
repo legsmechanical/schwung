@@ -25,6 +25,7 @@ if ! command -v node >/dev/null 2>&1; then echo "FAIL: node required" >&2; exit 
 node --input-type=module -e '
 import { createEc4Surface, DEFAULT_SETUP, OVERLAY_HOLD_MS, LOSS_MS, barRow, headline } from "./src/shared/ec4_surface.mjs";
 import { BLOCK } from "./src/shared/ec4_protocol.mjs";
+import { ENUM_DELTA_DIV } from "./src/shared/knob_engine.mjs";
 import { PAGE_KNOBS } from "./src/shared/param_pages/page_plan.mjs";
 
 let fails = 0;
@@ -105,7 +106,7 @@ const mixerIo = {
 let t = 1000;
 const s = createEc4Surface({ now: () => t, send,
   chainOf: () => ({ slots: [{ synth: "obxd", fx: ["freeverb"] }, { synth: "dx7" }, {}, {}] }),
-  makeController: () => ctl, mixer: mixerIo });
+  makeController: () => ctl, mixer: mixerIo, pulsesPerDetentOf: () => 3 });
 const run = (ms) => { for (let i = 0; i < ms / 16; i++) {
   t += 16; s.tick();
   const r = dev.replies; dev.replies = []; for (const m of r) s.feedMidi(m);
@@ -115,6 +116,10 @@ const toSetup = (n) => { dev.setup = n; s.feedMidi(report(n, 0)); };
 const row = (r) => dev.names.slice(r * 16, r * 16 + 16);
 const CC = (enc, v) => [0xB0, enc + 1, v];
 const NOTE = (enc) => [0x90, enc, 0x7F];
+/* The EC4 sends PULSES; the surface scales them to Move detents
+ * (PULSES_PER_DETENT) and selectors step once per ENUM_DELTA_DIV detents. */
+const P = 3, SEL = ENUM_DELTA_DIV;
+const spin = (enc, detents) => { for (let i = 0; i < Math.abs(detents) * P; i++) s.feedMidi(CC(enc, detents > 0 ? 1 : 127)); };
 
 run(500);
 eq("off: nothing is sent", dev.msgs.length, 0);
@@ -140,8 +145,10 @@ eq("...row 3: page navigation", row(2), "<PG MAIN1/3 PG> ");
 eq("...row 4: slot, module, volume, pan", row(3), "SL 1OBXDVOL PAN ");
 ok("every message fits one SPI frame (12 packets)", dev.maxPackets <= 12);
 
-s.feedMidi(CC(0, 1));   /* encoder 1, one detent clockwise */
-eq("a page knob reaches the controller", writes, [["Main", 0, 1]]);
+s.feedMidi(CC(0, 1)); s.feedMidi(CC(0, 1));
+eq("two pulses are less than a detent: nothing moves", writes, []);
+s.feedMidi(CC(0, 1));   /* the third pulse is one Move detent */
+eq("a page knob reaches the controller, one detent per three pulses", writes, [["Main", 0, 1]]);
 run(200);
 eq("...and raises the overlay", dev.overlay, true);
 eq("...row 1: [page] >> parameter, centred", dev.total.slice(0, 20), "  [Main] >> cutoff  ");
@@ -155,34 +162,36 @@ s.feedMidi(NOTE(11));   /* PG> */
 run(300);
 eq("PG> steps ONE page", row(0), "ATTADECA        ");
 eq("...and the count follows", row(2), "<PG ENV 2/3 PG> ");
-s.feedMidi(CC(9, 1));   /* turning the page name scrolls */
+spin(9, SEL - 1);
+eq("a page selector does not move before ENUM_DELTA_DIV detents", row(0).slice(0, 4), "ATTA");
+spin(9, 1);   /* turning the page name scrolls */
 run(300);
 eq("turning a page cell scrolls pages", row(0).slice(0, 4), "RATE");
 s.feedMidi(NOTE(8)); s.feedMidi(NOTE(8));
 run(300);
 eq("<PG steps back", row(0).slice(0, 8), "CUTORESO");
-s.feedMidi(CC(8, 127));
+spin(8, -SEL);
 run(300);
 eq("...and stops at the first page", row(0).slice(0, 8), "CUTORESO");
 
-s.feedMidi(CC(13, 1));   /* module: synth -> fx1 */
+spin(13, SEL);   /* module: synth -> fx1 */
 run(300);
 eq("turning the module cell moves along the slot", [s.slot, s.component], [0, "fx1"]);
 eq("...and its name is on the cell", row(3).slice(4, 8), "FREE");
-s.feedMidi(CC(12, 1));   /* slot 1 -> 2 */
+spin(12, SEL);   /* slot 1 -> 2 */
 run(300);
 eq("turning the slot cell enters that slot at its synth", [s.slot, s.component], [1, "synth"]);
 eq("...named", row(3).slice(0, 8), "SL 2DX7 ");
-s.feedMidi(CC(12, 127));
+spin(12, -SEL);
 run(300);
 eq("going back to a slot returns to the module left there", [s.slot, s.component], [0, "fx1"]);
 
-s.feedMidi(CC(14, 1));   /* VOL */
+spin(14, 1);   /* VOL */
 ok("VOL writes this slot level", slotParams["0:slot:volume"] !== undefined);
 s.feedMidi(NOTE(14));
 run(300);
 eq("VOL push mutes, and the cell says so", [slotParams["0:slot:muted"], row(3).slice(8, 12)], ["1", "MUTE"]);
-s.feedMidi(CC(15, 1));   /* PAN */
+spin(15, 1);   /* PAN */
 run(300);
 eq("PAN turns this slot pan and labels it", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.02", "R2  "]);
 s.feedMidi(NOTE(15));
@@ -195,7 +204,7 @@ eq("a Shift tap switches to the MIXER", [s.mixerOn, row(1)], [true, "SndASndASnd
 s.feedMidi(key(1, true));
 run(100);
 eq("holding Shift shows the alternate layer", row(0), "PAN PAN PAN PAN ");
-s.feedMidi(CC(1, 1));   /* Shift + turn track 2 level = pan */
+spin(1, 1);   /* Shift + turn track 2 level = pan */
 s.feedMidi(key(1, false));
 run(300);
 eq("Shift + turn is the alternate (pan), and is not a tap", [slotParams["1:slot:pan"], s.mixerOn], ["0.02", true]);
