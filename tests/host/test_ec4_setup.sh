@@ -72,6 +72,9 @@ for g in (0, 15):
         check(edited[base + 16 + e] == e + 1, 'g%d e%d sends CC %d' % (g, e, e + 1))
         check(edited[base + 112 + e] == 0x10, 'g%d push %d is a note on channel 1' % (g, e))
         check(edited[k1 + e] == e, 'g%d push %d is momentary note %d' % (g, e, e))
+        # manual V03: a named encoder is not host-writable, '----' is
+        n = base + 128 + e * 4
+        check(bytes(edited[n:n + 4]) == b'----', 'g%d e%d name is ----' % (g, e))
 
 try:
     m.name4('A_B')

@@ -15,20 +15,27 @@ It edits a dump rather than building one from nothing, so the other fifteen
 setups on the device survive: dump yours first, or start from the factory
 file in faderfox-editor (ec4-v2/EC4-setup-all-factory-V20.syx).
 
-    python3 ec4_setup.py IN.syx OUT.syx --slot 16            # write the setup
-    python3 ec4_setup.py IN.syx OUT.syx --slot 16 --channel 1
-    python3 ec4_setup.py IN.syx --show 16                    # print a setup
+    python3 ec4_setup.py IN.syx OUT.syx --slot 13            # write the setup
+    python3 ec4_setup.py IN.syx OUT.syx --slot 13 --channel 1
+    python3 ec4_setup.py IN.syx --show 13                    # print a setup
 
 The Schwung setup, per group, mirrors the E16's remote-mode map so the E16
 decoder reads it unchanged:
 
     encoder 1-16   CC 1-16, relative mode 1 (1 / 127), no acceleration
     push 1-16      note 0-15, momentary
-    all 16 groups  identical; group names G01..G16, encoder names E1..E16
+    all 16 groups  identical; group names G01..G16, encoder names '----'
 
-Identical groups means the group a CC came from is NOT in the CC. Whether the
-EC4 reports group changes on its own (SysEx) is one of the bench questions;
-this setup is the probe for it, not the final layout.
+The encoder names are '----' on purpose. The EC4 manual (V03, Ableton Live
+Setups) says of Faderfox's own script: "You can use this script with setups
+13...16. Set encoder names to '----' else the script can't write the names."
+So a named encoder is not host-writable; use --slot 13 or 14 (15 and 16 hold
+the factory Ableton setups).
+
+Identical groups means the group a CC came from is NOT in the CC. The manual
+says group and setup selects are reported as SysEx ("Special fixed commands"),
+which is what would tell the host the page; the bytes are not documented
+there, so this setup is the probe for them, not the final layout.
 
 Sending the result writes all 16 setups. Send it with the faderfox-editor web
 app or any SysEx tool; slow send rates are safer (the device flashes each page).
@@ -206,7 +213,7 @@ def write_schwung_setup(image, setup, channel, name='SCHW'):
             image[base + 96 + e] = 0                        # lower/upper MSBs
             image[base + 112 + e] = (PB_NOTE << 4) | ch     # push: note, channel
             n = base + 128 + e * 4
-            image[n:n + 4] = name4('E%d' % (e + 1))
+            image[n:n + 4] = name4('----')                  # host-writable, see below
             image[k1 + e] = e                               # key mode 0, note 0-15
             image[k2 + e] = 0                               # no display, lower 0
             image[k2 + 16 + e] = 127                        # no link, upper 127
