@@ -20,7 +20,8 @@ redistribute.
 | incoming MIDI updates encoder values and the display | manual, "Controller mode" | documented; whether it applies to relative types is **untested** |
 | every live message is acknowledged | bench, not in either reference | the EC4 answers each host message with a bare header, `F0 00 00 00 4E 2C 1B F7`, within ~10–90 ms. A driver can use it to confirm each write arrived |
 | USB enumeration | macOS System Information, `ec4_probe.py` | **one** USB-MIDI port each way (VID 0x2256, PID 0x2010), which is the case that can carry SysEx over Move's USB-A |
-| SysEx both ways over Move's USB-A | — | **unknown**; see `docs/E16_REMOTE.md`, "The USB-A limitation" |
+| SysEx both ways over Move's USB-A | EC4 Probe on Move (stock 1.4.0 host), 2026-09-25 | **verified.** Outbound: every message acknowledged; names and overlay display. Inbound: request reply, unprompted group reports, Shift, user key 1 and encoder CCs all arrive whole |
+| long outbound messages are damaged through Move | same bench | the 206-byte all-names message arrived with cells 12–14 wrong (still acknowledged, so the frame survived and the middle did not); the same message is clean from a computer. 26-byte one-cell writes were clean. **Write one cell per message**, as `docs/E16_REMOTE.md` predicts for Move's interleave |
 
 The wire format is written up in the header of `src/shared/ec4_protocol.mjs`,
 and `tests/host/test_ec4_protocol.sh` pins it to vectors copied from both
