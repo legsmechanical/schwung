@@ -204,7 +204,7 @@ run(300);
 eq("VOL push mutes, and the cell says so", [slotParams["0:slot:muted"], row(3).slice(8, 12)], ["1", "MUTE"]);
 spin(15, 2);   /* PAN: 0.5% of -1..1 a detent, so two detents are one 0.02 tick */
 run(300);
-eq("PAN turns this slot pan, and its cell still says PAN", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.02", "PAN "]);
+eq("PAN turns this slot pan, and its cell shows the position", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.02", "R2  "]);
 s.feedMidi(NOTE(15));
 run(300);
 eq("PAN push centres", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.00", "PAN "]);
