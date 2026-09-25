@@ -186,12 +186,14 @@ spin(12, -SEL);
 run(300);
 eq("going back to a slot returns to the module left there", [s.slot, s.component], [0, "fx1"]);
 
-spin(14, 1);   /* VOL */
+spin(14, 1);   /* VOL: one detent is 0.33 dB -- under one Mixer tick */
+eq("VOL turns through the knob engine: one detent is less than a Mixer tick", slotParams["0:slot:volume"], undefined);
+spin(14, 1);
 ok("VOL writes this slot level", slotParams["0:slot:volume"] !== undefined);
 s.feedMidi(NOTE(14));
 run(300);
 eq("VOL push mutes, and the cell says so", [slotParams["0:slot:muted"], row(3).slice(8, 12)], ["1", "MUTE"]);
-spin(15, 1);   /* PAN */
+spin(15, 2);   /* PAN: 0.5% of -1..1 a detent, so two detents are one 0.02 tick */
 run(300);
 eq("PAN turns this slot pan and labels it", [slotParams["0:slot:pan"], row(3).slice(12, 16)], ["0.02", "R2  "]);
 s.feedMidi(NOTE(15));
@@ -204,7 +206,7 @@ eq("a Shift tap switches to the MIXER", [s.mixerOn, row(1)], [true, "SndASndASnd
 s.feedMidi(key(1, true));
 run(100);
 eq("holding Shift shows the alternate layer", row(0), "PAN PAN PAN PAN ");
-spin(1, 1);   /* Shift + turn track 2 level = pan */
+spin(1, 2);   /* Shift + turn track 2 level = pan */
 s.feedMidi(key(1, false));
 run(300);
 eq("Shift + turn is the alternate (pan), and is not a tap", [slotParams["1:slot:pan"], s.mixerOn], ["0.02", true]);

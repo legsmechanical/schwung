@@ -38,9 +38,10 @@ import { decode } from "./e16_input.mjs";
 import { buildView, labelsFor, applyTurn, applyClick, pageHasKnobs, abbrev4, ENCODERS,
          ringAmount, RING_MAX } from "./e16_view.mjs";
 import { buildMap } from "./e16_map.mjs";
-import { createMixer } from "./e16_mixer.mjs";
+import { createMixer, SEND_MAX, SEND_STEP, VOLUME_MAX, LEVEL_DB_STEP, LEVEL_DB_FLOOR,
+         FILTER_STEP, PAN_STEP } from "./e16_mixer.mjs";
 import { displayValue } from "./param_pages/render_page_movy.mjs";
-import { ENUM_DELTA_DIV } from "./knob_engine.mjs";
+import { ENUM_DELTA_DIV, knobInit, knobStep, KNOB_TYPE_FLOAT } from "./knob_engine.mjs";
 import * as ec4 from "./ec4_protocol.mjs";
 
 /* Setup 13, 0-based as the device reports it. Slots 15 and 16 hold the
@@ -206,6 +207,35 @@ const MIXER_REFRESH_MS = 250;
 export const DEFAULT_PULSES_PER_DETENT = 3;
 /* A pause this long drops a leftover fraction, so the next turn starts clean. */
 export const TURN_IDLE_MS = 400;
+
+/*
+ * THE MIXER TURNS THROUGH THE KNOB ENGINE TOO.
+ *
+ * The Mixer model steps in fixed units -- 0.5 dB, 2/127, 0.02 of pan -- with
+ * no acceleration, so its knobs felt nothing like a module's. It is not
+ * changed (its mute, off-and-back memory and solo are its own); the engine
+ * goes in FRONT of it. Each control is treated as a Schwung float knob over
+ * its whole range, knobStep says how far that knob would have moved for this
+ * detent, and the distance is paid out as the Mixer's own
+ * ticks, with the remainder carried to the next detent.
+ *
+ * Ranges in the Mixer's units, and the size of one of its ticks.
+ */
+const LEVEL_RANGE = { span: 20 * Math.log10(VOLUME_MAX) - LEVEL_DB_FLOOR, tick: LEVEL_DB_STEP };
+const SEND_RANGE = { span: SEND_MAX, tick: SEND_STEP };
+const PAN_RANGE = { span: 2, tick: PAN_STEP };
+const FILTER_RANGE = { span: 2, tick: FILTER_STEP };
+const ENGINE_META = { type: KNOB_TYPE_FLOAT, min: 0, max: 1 };
+
+/* Which range a Mixer encoder moves: row 1 level (alt: pan), rows 2-3 sends,
+ * row 4 returns, capture (no travel) and the filter. */
+export function mixerRange(enc, alt) {
+    const row = Math.floor(enc / 4), col = enc % 4;
+    if (row === 0) return alt ? PAN_RANGE : LEVEL_RANGE;
+    if (row === 1 || row === 2) return SEND_RANGE;
+    if (col < 2) return SEND_RANGE;
+    return col === 3 ? FILTER_RANGE : null;
+}
 
 export function createEc4Surface(io) {
     const o = io || {};
@@ -454,6 +484,33 @@ export function createEc4Surface(io) {
     /* Move detents -> one selector step per ENUM_DELTA_DIV. */
     const selectorStep = (enc, d) => accumulate(stepAcc, enc, d, ENUM_DELTA_DIV);
 
+    /* Move detents -> the Mixer's own ticks, through the knob engine (see
+     * THE MIXER TURNS THROUGH THE KNOB ENGINE TOO). One engine state and one
+     * carry per control, keyed so a range change (alt) starts clean. */
+    const engine = new Map();
+    function engineTicks(key, range, d, t) {
+        let e = engine.get(key);
+        if (!e) { e = { st: knobInit(0.5), carry: 0 }; engine.set(key, e); }
+        if (Math.sign(e.carry) !== Math.sign(d)) e.carry = 0;
+        const dir = d > 0 ? 1 : -1;
+        for (let i = 0; i < Math.abs(d); i++) {
+            /* Re-centred each detent: the engine only measures the move, and
+             * the real value lives in the Mixer, which does its own clamping. */
+            e.st.value = 0.5;
+            const moved = knobStep(e.st, ENGINE_META, dir, t) - 0.5;
+            e.carry += moved * range.span / range.tick;
+        }
+        const out = Math.trunc(e.carry);
+        e.carry -= out;
+        return out;
+    }
+    function mixerTurn(enc, d, alt, t) {
+        const range = mixerRange(enc, alt);
+        if (!range) return false;
+        const ticks = engineTicks(enc + (alt ? ":alt" : ""), range, d, t);
+        return ticks ? mixer.turn(enc, ticks, alt) : false;
+    }
+
     const step = (ticks) => (ticks > 0 ? 1 : -1);
 
     function stepPage(d, t) {
@@ -469,7 +526,7 @@ export function createEc4Surface(io) {
         const ticks = detents(enc, pulses, t);
         if (!ticks) return;
         if (mixerOn && mixer) {
-            if (mixer.turn(enc, ticks, alt)) mixerReading(enc, t, alt);
+            if (mixerTurn(enc, ticks, alt, t)) mixerReading(enc, t, alt);
             return;
         }
         if (enc < PAGE_KNOBS_N) {
@@ -497,12 +554,12 @@ export function createEc4Surface(io) {
         }
         if (!mixer) return;
         if (enc === CELL_VOL) {
-            if (mixer.turn(slot, ticks, false)) slotLevelReading("vol", t);
+            if (mixerTurn(slot, ticks, false, t)) slotLevelReading("vol", t);
             return;
         }
         if (enc === CELL_PAN) {
             /* The Mixer's pan is its level knob's alternate: row 1, Shift. */
-            if (mixer.turn(slot, ticks, true)) slotLevelReading("pan", t);
+            if (mixerTurn(slot, ticks, true, t)) slotLevelReading("pan", t);
         }
     }
 
