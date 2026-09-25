@@ -400,10 +400,11 @@ export function createEc4Surface(io) {
         cells[CELL_SLOT] = "SL " + (slot + 1);
         cells[CELL_MODULE] = here ? abbrev4(here.label) : "EMPT";
         const t = mixer ? mixer.tracks[slot] : null;
-        /* Row 4 shows what is SELECTED, like the slot, module and page cells:
-         * PAN shows its position ("L26", or PAN at centre). */
+        /* Names of what the knob DOES; a state that changes what it does
+         * (mute) is the only exception. A pan position is a value, and a
+         * value is for the overlay. */
         cells[CELL_VOL] = t && t.muted ? "MUTE" : "VOL";
-        cells[CELL_PAN] = panLabel(t ? t.pan : null);
+        cells[CELL_PAN] = "PAN";
         return cells;
     }
 
