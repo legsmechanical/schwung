@@ -137,6 +137,8 @@ import { parseSlotSnapshot, parseMasterFxSnapshot, planRestore, recallMessage }
 import { drawSnapshotToast } from '/data/UserData/schwung/shared/snapshot_toast.mjs';
 import { createSurface as createE16Surface }
     from '/data/UserData/schwung/shared/e16_surface.mjs';
+import { createEc4Surface, DEFAULT_SETUP as EC4_DEFAULT_SETUP }
+    from '/data/UserData/schwung/shared/ec4_surface.mjs';
 import { createController as createPageController }
     from '/data/UserData/schwung/shared/param_pages/page_controller.mjs';
 import {
@@ -7566,6 +7568,7 @@ function setSlotParam(slot, key, value) {
         /* Tell the E16 surface at once -- see noteParamWrite. A const declared
          * later in this file is in its TDZ during early init: caught. */
         try { e16Surface.noteParamWrite(slot, key, value); } catch (e) {}
+        try { ec4Surface.noteParamWrite(slot, key, value); } catch (e) {}
 
         /* Re-check MIDI FX warnings immediately after sync/module changes. */
         if (key === "midi_fx1:module") {
@@ -10797,6 +10800,73 @@ const e16Surface = createE16Surface({
     },
 });
 
+/*
+ * THE FADERFOX EC4 (Ext Surface = EC4). The E16's navigator, pages and Mixer
+ * on a device whose screen is text -- see src/shared/ec4_surface.mjs. Same
+ * seams as the E16 above, plus one: which EC4 setup holds Schwung's map.
+ *
+ * That is setup 13 unless /data/UserData/schwung/ec4_setup names another
+ * (1-16) -- whichever slot tools/ec4/ec4_setup.py was told to write:
+ *   ssh ableton@move.local "echo 14 > /data/UserData/schwung/ec4_setup"
+ * Read ~1 Hz, like the E16's other armed files.
+ */
+let ec4SetupCheckedAt = 0;
+let ec4SetupValue = EC4_DEFAULT_SETUP;
+function ec4Setup() {
+    const now = Date.now();
+    if (now - ec4SetupCheckedAt < 1000) return ec4SetupValue;
+    ec4SetupCheckedAt = now;
+    ec4SetupValue = EC4_DEFAULT_SETUP;
+    try {
+        const path = "/data/UserData/schwung/ec4_setup";
+        if (typeof host_file_exists === "function" && host_file_exists(path)) {
+            const n = parseInt(String(host_read_file(path) || "").trim(), 10);
+            if (n >= 1 && n <= 16) ec4SetupValue = n - 1;
+        }
+    } catch (e) {}
+    return ec4SetupValue;
+}
+
+const ec4Surface = createEc4Surface({
+    now: () => Date.now(),
+    send: e16Send,
+    chainOf: e16ChainShape,
+    followFocusOf: e16FollowFocus,
+    setupOf: ec4Setup,
+    log: (line) => console.log(line),
+    makeController: (focus) => createPageController({
+        getParam: (key) => getSlotParam(focus.slot, key),
+        setParam: (key, value) => setSlotParam(focus.slot, key, value),
+    }),
+    mixer: {
+        getSlot: (slot, key) => getSlotParam(slot, key),
+        setSlot: (slot, key, value) => {
+            const ok = setSlotParam(slot, key, value);
+            if (ok && String(key).startsWith("buses:")) sendLevelsDirty = true;
+            return ok;
+        },
+        getGlobal: (key) => {
+            try { return typeof shadow_get_param === "function" ? shadow_get_param(0, key) : null; }
+            catch (e) { return null; }
+        },
+        setGlobal: (key, value) => {
+            let ok = false;
+            try { ok = typeof shadow_set_param === "function" && shadow_set_param(0, key, String(value)); }
+            catch (e) { ok = false; }
+            if (ok && String(key).endsWith(":return")) sendLevelsDirty = true;
+            return ok;
+        },
+        skipback: () => {
+            try { return typeof shadow_set_param === "function" && shadow_set_param(0, "master_fx:skipback_save", "1"); }
+            catch (e) { return false; }
+        },
+        nameOf: (slot) => {
+            const sl = (e16ChainShape().slots || [])[slot] || {};
+            return sl.synth ? String(sl.synth) : ("Slot " + (slot + 1));
+        },
+    },
+});
+
 function setExternalSurfaceFollow(v) {
     const mode = (parseInt(v, 10) || 0) ? 1 : 0;
     if (mode === externalSurfaceFollow) return;
@@ -10804,6 +10874,7 @@ function setExternalSurfaceFollow(v) {
     /* The surface parks its own focus on the OFF->ON edge and restores it on
      * the way back, so it must see the EDGE, not poll the setting. */
     e16Surface.setFollow(mode === 1);
+    ec4Surface.setFollow(mode === 1);
 }
 
 /*
@@ -10824,13 +10895,16 @@ function e16FollowFocus() {
 }
 
 function setExternalSurfaceMode(v) {
-    const mode = (v === 1) ? 1 : 0;
+    /* 1 = OXI E16, 2 = Faderfox EC4. One device at a time: both are read
+     * from the same claimed CCs (src/host/e16_claim.h). */
+    const mode = (v === 1 || v === 2) ? v : 0;
     if (mode === externalSurfaceMode) return;
     externalSurfaceMode = mode;
     /* EXIT is sent from here, once, or the device is left blank with the
      * feature switched off. An EXIT the buffer refuses is owed and drained by
      * externalSurfaceTick(). */
     e16Surface.setEnabled(mode === 1);
+    ec4Surface.setEnabled(mode === 2);
 }
 
 function saveExternalSurfaceConfig() {
@@ -10865,6 +10939,7 @@ function loadExternalSurfaceConfig() {
  * nothing is owed, this is two comparisons. */
 function externalSurfaceTick() {
     e16Surface.tick();
+    ec4Surface.tick();
 }
 
 /* Cable-2 bytes, three at a time with the CIN already stripped. Fed
@@ -10874,6 +10949,7 @@ function externalSurfaceTick() {
  * the assembler is gated on the setting inside the surface. */
 function externalSurfaceMidi(data) {
     e16Surface.feedMidi(data);
+    ec4Surface.feedMidi(data);
 }
 
 let speakerEqMode = 0;                 /* 0 auto, 1 off, 2 on */

@@ -621,7 +621,7 @@ export const SYSTEM_PARAMS = [
     /* Both options already fit the enum square, so there is no short form to
      * declare -- a second list to keep in step for nothing. */
     { key: "external_surface", name: "Ext Surface", type: "enum",
-      options: ["Off", "E16"], default: 0 },
+      options: ["Off", "E16", "EC4"], default: 0 },
     /*
      * Does the surface mirror Move's screen, or hold its own focus?
      *
