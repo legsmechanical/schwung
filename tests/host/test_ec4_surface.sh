@@ -21,7 +21,8 @@ cd "$(dirname "$0")/../.."
 if ! command -v node >/dev/null 2>&1; then echo "FAIL: node required" >&2; exit 1; fi
 
 node --input-type=module -e '
-import { createEc4Surface, DEFAULT_SETUP, OVERLAY_HOLD_MS, LOSS_MS } from "./src/shared/ec4_surface.mjs";
+import { createEc4Surface, DEFAULT_SETUP, OVERLAY_HOLD_MS, LOSS_MS, barRow } from "./src/shared/ec4_surface.mjs";
+import { BLOCK } from "./src/shared/ec4_protocol.mjs";
 import { PAGE_KNOBS } from "./src/shared/param_pages/page_plan.mjs";
 import { MAP_SHOW_DELAY_MS } from "./src/shared/e16_surface.mjs";
 
@@ -112,7 +113,9 @@ s.feedMidi([0xB0, 0x01, 0x01]);   /* encoder 1, one detent clockwise */
 eq("a turn reaches the controller", writes, [["Main", 0, 1]]);
 run(200);
 eq("...and puts the reading on the overlay", dev.overlay, true);
-eq("...naming the module and the parameter", [dev.total.slice(0, 20).trim(), dev.total.slice(40, 60).trim()], ["obxd", "cutoff"]);
+eq("...naming the module and page, then the parameter", [dev.total.slice(0, 20).trim(), dev.total.slice(20, 40).trim()], ["obxd / Main", "cutoff"]);
+eq("...with a value bar of full blocks (0x1F) on the last row: 0.5 is ten of twenty",
+   dev.total.slice(60, 80), "\x1F".repeat(10) + " ".repeat(10));
 run(OVERLAY_HOLD_MS + 500);
 eq("the overlay goes after the hold", dev.overlay, false);
 
@@ -154,6 +157,10 @@ eq("off: the device gets its ---- names back", dev.names, "----".repeat(16));
 eq("...and no overlay", dev.overlay, false);
 ok("no message was ever longer than one frame", dev.maxPackets <= 12);
 
+eq("bar: empty, full", [barRow(0, false), barRow(1, false)], [" ".repeat(20), BLOCK.repeat(20)]);
+eq("bar: bipolar fills from the centre", [barRow(0.75, true), barRow(0.25, true)],
+   [" ".repeat(10) + BLOCK.repeat(5) + " ".repeat(5), " ".repeat(5) + BLOCK.repeat(5) + " ".repeat(10)]);
+eq("bar: bipolar at the centre is marked, not empty", barRow(0.5, true), " ".repeat(10) + "|" + " ".repeat(9));
 console.log(fails ? "FAILED " + fails : "PASS");
 process.exit(fails ? 1 : 0);
 '

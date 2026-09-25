@@ -109,6 +109,11 @@ const ROM = [
 const CODE = new Map();
 for (let i = ROM.length - 1; i >= 0; i--) if (ROM[i] !== ' ') CODE.set(ROM[i], i);
 CODE.set(' ', 0x20);
+/* The full block, 0x1F: a whole bar cell. Photographed on firmware 2.00
+ * (every code 0x00-0xFF written to the overlay); Faderfox's script maps no
+ * character to it and uses the code only as its "unknown" glyph. */
+export const BLOCK = '\u2588';
+CODE.set(BLOCK, 0x1F);
 export const UNKNOWN_CHAR = 0x1F;
 
 export function charCode(ch) {

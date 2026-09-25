@@ -36,8 +36,8 @@
  */
 import { createNav, createSysexAssembler } from "./e16_surface.mjs";
 import { decode } from "./e16_input.mjs";
-import { buildView, labelsFor, applyTurn, applyClick, pageHasKnobs, abbrev4, ENCODERS }
-    from "./e16_view.mjs";
+import { buildView, labelsFor, applyTurn, applyClick, pageHasKnobs, abbrev4, ENCODERS,
+         ringAmount, RING_MAX } from "./e16_view.mjs";
 import { buildMap } from "./e16_map.mjs";
 import { createMixer } from "./e16_mixer.mjs";
 import { displayValue } from "./param_pages/render_page_movy.mjs";
@@ -72,12 +72,35 @@ const NAMES_LEN = ec4.NAMES_CHARS;
 const TOTAL_LEN = ec4.TOTAL_CHARS;
 const pad = (s, n) => (String(s == null ? "" : s) + " ".repeat(n)).slice(0, n);
 
-/* 7-bit ASCII the EC4's character ROM can show: accents folded, the rest
- * dropped. (ec4.charCode maps anything it does not know to a block glyph.) */
+/* 7-bit ASCII the EC4's character ROM can show, plus the bar's block:
+ * accents folded, the rest dropped. */
 function ascii(s) {
     return String(s == null ? "" : s)
         .normalize("NFD").replace(/[̀-ͯ]/g, "")
-        .replace(/[^\x20-\x7E]/g, "");
+        .replace(/[^\x20-\x7E█]/g, "");
+}
+
+/*
+ * A VALUE BAR, one overlay row of whole blocks: 20 cells, so 5% a step.
+ *
+ * Whole blocks only. The ROM does hold partial-width bar glyphs (0xD0-0xD4
+ * short, 0xD6-0xD9 tall), but in two heights that line up neither with each
+ * other nor with the full block, so a bar ending in one read as ragged rather
+ * than finer. A bipolar value fills from the centre, which is marked when the
+ * value sits on it -- an empty row would read as "no value".
+ */
+export function barRow(frac, bipolar, width) {
+    const w = width || ec4.TOTAL_COLS;
+    const f = Math.max(0, Math.min(1, Number(frac) || 0));
+    const pos = Math.round(f * w);
+    if (!bipolar) return ec4.BLOCK.repeat(pos) + " ".repeat(w - pos);
+    const mid = w / 2;
+    let out = "";
+    for (let i = 0; i < w; i++) {
+        out += (i >= Math.min(mid, pos) && i < Math.max(mid, pos)) ? ec4.BLOCK : " ";
+    }
+    if (pos === mid) out = out.slice(0, mid) + "|" + out.slice(mid + 1);
+    return out;
 }
 
 /*
@@ -236,11 +259,15 @@ export function createEc4Surface(io) {
         const c = view.cells[enc];
         if (!c) return;
         const h = view.headers[c.half];
+        const page = h ? String(h.name || "") : "";
+        /* A bar only for a value that has one: an enum or a text value has
+         * no position between min and max to fill to. */
+        const numeric = isFinite(Number(c.value)) && c.max > c.min;
         showReading([
-            moduleNameFor(nav.slot, nav.component),
-            h ? String(h.name || "") : "",
+            moduleNameFor(nav.slot, nav.component) + (page ? " / " + page : ""),
             String(c.label || c.key),
             displayValue(c.value, metaOf(c.key) || {}),
+            numeric ? barRow(ringAmount(c) / RING_MAX, c.bipolar) : "",
         ], t);
     }
 
@@ -254,7 +281,10 @@ export function createEc4Surface(io) {
 
     function mixerReading(enc, t) {
         const c = mixer.cell(enc);
-        showReading(["Mixer", mixer.nameOf(enc % 4), c.label || "", (c.value || "") + (c.off ? " (off)" : "")], t);
+        const r = mixer.ringFor(enc);
+        showReading(["Mixer: " + mixer.nameOf(enc % 4), c.label || "",
+                     (c.value || "") + (c.off ? " (off)" : ""),
+                     barRow(r.amount / RING_MAX, r.bipolar)], t);
     }
 
     function overlayNow(t) {
